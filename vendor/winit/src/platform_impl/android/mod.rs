@@ -1192,8 +1192,26 @@ fn touchpad_gesture(
     window_event: &mut dyn FnMut(event::WindowEvent),
 ) -> bool {
     use android_activity::input::ToolType;
+    // Only drags without a button held: a touchpad reports its pointer moves, hovering, clicks
+    // and click-drags with a finger tool type too, and those stay the mouse's.
+    let action = motion_event.action();
+    if !matches!(
+        action,
+        MotionAction::Down | MotionAction::Move | MotionAction::Up | MotionAction::Cancel | MotionAction::PointerDown | MotionAction::PointerUp
+    ) {
+        return false;
+    }
+    let buttons = motion_event.button_state();
+    let in_gesture = TOUCHPAD_GESTURE.with(|g| g.get()).is_some();
+    if (buttons.primary() || buttons.secondary()) && !in_gesture {
+        return false;
+    }
     let n = motion_event.pointer_count();
     if n == 0 || !motion_event.pointers().all(|p| p.tool_type() == ToolType::Finger) {
+        return false;
+    }
+    // A move or lift with no gesture started is an ordinary pointer event.
+    if !in_gesture && !matches!(action, MotionAction::Down | MotionAction::PointerDown) {
         return false;
     }
     let (mut x, mut y) = (0.0f32, 0.0f32);
@@ -1208,7 +1226,6 @@ fn touchpad_gesture(
     } else {
         0.0
     };
-    let action = motion_event.action();
     let last = TOUCHPAD_GESTURE.with(|g| g.get());
     match action {
         MotionAction::Down => {
