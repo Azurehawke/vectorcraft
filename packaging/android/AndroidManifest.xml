@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- VectorCraft for Android: a NativeActivity (no Java) that loads libvectorcraft_android.so
+     (apps/vectorcraft-android). Built by build-apk.sh. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="ai.storyteller.vectorcraft">
+
+    <!-- The in-app file picker browses shared storage by path (apps/vectorcraft-android/src/picker.rs); granted
+         once in Settings ▸ Apps ▸ ⋮ ▸ Special access ▸ All files access (the picker opens it). -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+    <application
+        android:label="VectorCraft"
+        android:icon="@mipmap/ic_launcher"
+        android:hasCode="false"
+        android:extractNativeLibs="true"
+        android:resizeableActivity="true"
+        android:appCategory="image">
+
+        <!-- configChanges: attaching the keyboard cover, rotating, or resizing in split screen
+             must not recreate the activity (that would restart the app and its event loop). -->
+        <activity
+            android:name="android.app.NativeActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:theme="@android:style/Theme.Material.NoActionBar"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|density|uiMode|fontScale|locale|layoutDirection">
+            <meta-data android:name="android.app.lib_name" android:value="vectorcraft_android" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

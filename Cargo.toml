@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/*", "xtask"]
+exclude = ["vendor"]
 default-members = ["crates/*", "apps/vectorcraft", "apps/vectorcraft-cli", "xtask"]
 
 [workspace.package]
@@ -105,3 +106,9 @@ opt-level = 1
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# winit 0.30.13 with patches (vendor/README.md): on Android a mouse is a mouse (cursor, buttons,
+# wheel), a hovering stylus moves the cursor, and each touch says which tool it is (finger, S Pen,
+# palm). Carried from PdfCraft's vendor/winit, whose other patches it keeps.
+[patch.crates-io]
+winit = { path = "vendor/winit" }

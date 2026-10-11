@@ -1,0 +1,43 @@
+[package]
+name = "vectorcraft-android"
+description = "VectorCraft on Android tablets (NativeActivity; build with packaging/android/build-apk.sh)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+# Loaded by Android's NativeActivity as libvectorcraft_android.so.
+crate-type = ["cdylib"]
+
+# Not the workspace lints: Android needs a few unsafe-attributed items here (the exported
+# `android_main`, `set_var` before any thread starts, JNI handles). Clippy's rules stay.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "warn"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+
+[target.'cfg(target_os = "android")'.dependencies]
+vectorcraft-engine = { workspace = true }
+vectorcraft-ui-egui = { workspace = true }
+vectorcraft-text = { workspace = true }
+eframe = { workspace = true, features = ["default_fonts", "wgpu", "android-native-activity"] }
+egui = { workspace = true }
+# The AndroidApp handle (resolves to vendor/winit, like eframe's own).
+winit = { version = "0.30", default-features = false, features = ["android-native-activity"] }
+serde_json = { workspace = true }
+log = { workspace = true }
+android_logger = "0.15"
+# All files access: check it and open its Settings screen (file_access.rs).
+jni = "0.21"
+ndk-context = "0.1"
+# Whether a hardware keyboard is attached (tablet.rs).
+ndk = { version = "0.9", default-features = false }
+webbrowser = { workspace = true }

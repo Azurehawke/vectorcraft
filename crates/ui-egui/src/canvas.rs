@@ -533,6 +533,8 @@ fn handle_input(app: &mut VectorcraftApp, ui: &Ui, resp: &egui::Response, rect: 
     app.hover_doc = hover.map(|p| xf.to_doc(p));
     let view = app.view_info();
     touch_gestures(app, ui, rect, view);
+    // Where the canvas is this frame, for hosts that route touches by where they land.
+    ui.data_mut(|d| d.insert_temp(canvas_place_id(), (rect, ui.layer_id(), ui.ctx().cumulative_frame_nr())));
     let drag: Option<Drag> = ui.data(|d| d.get_temp(drag_id()));
     // A modifier pressed or released over the canvas re-hovers the tool, so what it changes shows
     // without moving the mouse (Alt switches the Shape Builder to erase mode).
@@ -1931,6 +1933,17 @@ fn pixel_region(xf: &Xf) -> Option<[i64; 4]> {
     // A document pixel is bigger than a screen pixel here, so the region is about canvas-sized.
     let ok = [x0, y0, x1, y1].iter().all(|c| c.is_finite() && c.abs() < 1e9) && x1 > x0 && y1 > y0 && x1 - x0 <= 16384.0 && y1 - y0 <= 16384.0;
     ok.then_some([x0 as i64, y0 as i64, x1 as i64, y1 as i64])
+}
+
+fn canvas_place_id() -> egui::Id {
+    egui::Id::new("canvas-place")
+}
+
+/// The canvas's area and the layer it is drawn on, if it was drawn in the last frame or this one
+/// (the Android shell lets a finger on the canvas scroll it, and only the pen or a mouse draw).
+pub fn canvas_place(ctx: &egui::Context) -> Option<(egui::Rect, egui::LayerId)> {
+    let (rect, layer, frame): (egui::Rect, egui::LayerId, u64) = ctx.data(|d| d.get_temp(canvas_place_id()))?;
+    (frame + 1 >= ctx.cumulative_frame_nr()).then_some((rect, layer))
 }
 
 /// The Contextual Task Bar's area.
