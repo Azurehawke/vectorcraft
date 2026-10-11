@@ -6,7 +6,7 @@
 //! stopping while the app was in front), both are combined into `Download/VectorCraft crash
 //! report.txt` and the app says so once.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
