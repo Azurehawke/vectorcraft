@@ -1176,6 +1176,89 @@ fn is_mouse(motion_event: &android_activity::input::MotionEvent<'_>) -> bool {
             && motion_event.pointer_at_index(0).tool_type() == android_activity::input::ToolType::Mouse)
 }
 
+thread_local! {
+    /// PdfCraft patch: the touchpad gesture in progress: its fake fingers' centre and spread.
+    static TOUCHPAD_GESTURE: Cell<Option<(f32, f32, f32)>> = const { Cell::new(None) };
+}
+
+/// PdfCraft patch: a touchpad's two-finger swipe and pinch. Android reports them from the mouse
+/// as fake fingers (tool type finger, source mouse; Android 13+ classifies them
+/// `TWO_FINGER_SWIPE` and `PINCH`): one finger dragged for a swipe, two for a pinch. A swipe
+/// becomes `MouseWheel` pixel deltas (the content follows the fingers, as on the touch screen),
+/// a pinch `PinchGesture`. Returns whether the event was one.
+fn touchpad_gesture(
+    motion_event: &android_activity::input::MotionEvent<'_>,
+    device_id: event::DeviceId,
+    window_event: &mut dyn FnMut(event::WindowEvent),
+) -> bool {
+    use android_activity::input::ToolType;
+    let n = motion_event.pointer_count();
+    if n == 0 || !motion_event.pointers().all(|p| p.tool_type() == ToolType::Finger) {
+        return false;
+    }
+    let (mut x, mut y) = (0.0f32, 0.0f32);
+    for p in motion_event.pointers() {
+        x += p.x();
+        y += p.y();
+    }
+    let (x, y) = (x / n as f32, y / n as f32);
+    let spread = if n >= 2 {
+        let (a, b) = (motion_event.pointer_at_index(0), motion_event.pointer_at_index(1));
+        (a.x() - b.x()).hypot(a.y() - b.y())
+    } else {
+        0.0
+    };
+    let action = motion_event.action();
+    let last = TOUCHPAD_GESTURE.with(|g| g.get());
+    match action {
+        MotionAction::Down => {
+            TOUCHPAD_GESTURE.with(|g| g.set(Some((x, y, spread))));
+            if n == 1 {
+                window_event(event::WindowEvent::MouseWheel {
+                    device_id,
+                    delta: event::MouseScrollDelta::PixelDelta(PhysicalPosition { x: 0.0, y: 0.0 }),
+                    phase: event::TouchPhase::Started,
+                });
+            }
+        },
+        // The second fake finger of a pinch: start measuring its spread.
+        MotionAction::PointerDown => TOUCHPAD_GESTURE.with(|g| g.set(Some((x, y, spread)))),
+        MotionAction::Move => {
+            if let Some((lx, ly, ls)) = last {
+                if n == 1 {
+                    let (dx, dy) = (x - lx, y - ly);
+                    if dx.is_finite() && dy.is_finite() && (dx != 0.0 || dy != 0.0) {
+                        window_event(event::WindowEvent::MouseWheel {
+                            device_id,
+                            delta: event::MouseScrollDelta::PixelDelta(PhysicalPosition { x: dx as f64, y: dy as f64 }),
+                            phase: event::TouchPhase::Moved,
+                        });
+                    }
+                } else if ls > 1.0 && spread > 1.0 {
+                    let delta = f64::from(spread / ls) - 1.0;
+                    if delta.is_finite() && delta != 0.0 {
+                        window_event(event::WindowEvent::PinchGesture { device_id, delta, phase: event::TouchPhase::Moved });
+                    }
+                }
+            }
+            TOUCHPAD_GESTURE.with(|g| g.set(Some((x, y, spread))));
+        },
+        MotionAction::Up | MotionAction::Cancel => {
+            TOUCHPAD_GESTURE.with(|g| g.set(None));
+            if n == 1 {
+                window_event(event::WindowEvent::MouseWheel {
+                    device_id,
+                    delta: event::MouseScrollDelta::PixelDelta(PhysicalPosition { x: 0.0, y: 0.0 }),
+                    phase: event::TouchPhase::Ended,
+                });
+            }
+        },
+        MotionAction::PointerUp => TOUCHPAD_GESTURE.with(|g| g.set(None)),
+        _ => {},
+    }
+    true
+}
+
 /// PdfCraft patch: deliver a mouse's motion events as cursor, button and wheel events, and a
 /// hovering stylus's as cursor moves. Returns whether it handled the event (otherwise it is a
 /// touch).
@@ -1192,6 +1275,9 @@ fn mouse_event<T>(
         return false;
     }
     let mut window_event = |event: event::WindowEvent| send(event::Event::WindowEvent { window_id, event });
+    if touchpad_gesture(motion_event, device_id, &mut window_event) {
+        return true;
+    }
     let pointer = motion_event.pointer_at_index(0);
     let position = PhysicalPosition { x: pointer.x() as f64, y: pointer.y() as f64 };
     let moved = |w: &mut dyn FnMut(event::WindowEvent)| w(event::WindowEvent::CursorMoved { device_id, position });
