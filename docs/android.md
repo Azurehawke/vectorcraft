@@ -23,5 +23,8 @@ Android 11 or later, and published as the `android-latest` prerelease (`vectorcr
 - **Keyboard:** with a keyboard attached, text fields don't bring up the on-screen keyboard.
 - Preferences, fonts you add, libraries and Data Recovery live in the app's private folder;
   uninstalling removes them. The tablet's own fonts are available.
+- **Crash reports:** if VectorCraft stops unexpectedly, the next start says so and saves
+  `VectorCraft crash report.txt` in Download (the end of the app's log, and any panic or stack
+  overflow message), to send with a bug report.
 - **Not on Android:** the system clipboard for artwork (copy and paste work inside VectorCraft),
   printing, Show in Folder, and the control channel.

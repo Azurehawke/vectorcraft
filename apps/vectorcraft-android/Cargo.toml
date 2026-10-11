@@ -35,6 +35,8 @@ winit = { version = "0.30", default-features = false, features = ["android-nativ
 serde_json = { workspace = true }
 log = { workspace = true }
 android_logger = "0.15"
+# Crash reports: stderr into a file (crash_log.rs).
+libc = "0.2"
 # All files access: check it and open its Settings screen (file_access.rs).
 jni = "0.21"
 ndk-context = "0.1"

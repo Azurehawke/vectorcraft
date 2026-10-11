@@ -8,11 +8,14 @@
 //!   private folder (`HOME` below), under `.config/vectorcraft` as on Linux.
 //! - Input (`tablet`): a mouse is a mouse, the S Pen draws with pressure, palms are ignored, one
 //!   finger on the canvas scrolls it.
+//! - Crash reports (`crash_log`): the log and stderr go to files, and a run that ended badly
+//!   leaves a report in Download.
 //! - No system clipboard for images, no printing, no control channel.
 //!
 //! Elsewhere the crate is empty, so `cargo build --workspace` on a desktop still works.
 #![cfg(target_os = "android")]
 
+mod crash_log;
 mod file_access;
 mod picker;
 mod tablet;
@@ -67,17 +70,20 @@ fn services(picker: picker::Shared) -> Services {
 #[allow(unsafe_code)] // Exported by name: android-activity looks this symbol up.
 #[unsafe(no_mangle)]
 fn android_main(android: AndroidApp) {
-    android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("VectorCraft"));
+    let data_dir = android.internal_data_path();
+    // Logging first, with the previous run's crash report if it ended badly.
+    let previous = crash_log::start(data_dir.as_deref());
     std::panic::set_hook(Box::new(|info| {
         let trace = std::backtrace::Backtrace::force_capture();
-        log::error!("internal error: {info}\n{trace}");
+        log::error!("{} {info}\n{trace}", crash_log::PANIC);
+        crash_log::flush();
     }));
-    if let Some(dir) = android.internal_data_path() {
+    if let Some(dir) = &data_dir {
         // Preferences and recovery derive from HOME, which Android doesn't set.
         #[allow(unsafe_code)]
         // SAFETY: called before eframe or the app start any thread that could read the environment.
         unsafe {
-            std::env::set_var("HOME", &dir);
+            std::env::set_var("HOME", dir);
         }
         log::info!("VectorCraft {} data folder {}", env!("CARGO_PKG_VERSION"), dir.display());
     }
@@ -111,10 +117,12 @@ fn android_main(android: AndroidApp) {
                 log::info!("rendering with {summary}");
                 app.graphics_adapter = Some(summary);
             }
-            Ok(Box::new(tablet::TabletApp::new(app, shell_android, picker)))
+            Ok(Box::new(tablet::TabletApp::new(app, shell_android, picker, previous)))
         }),
     );
     if let Err(e) = result {
         log::error!("VectorCraft stopped: {e}");
     }
+    log::info!("{}", crash_log::EXIT);
+    crash_log::flush();
 }

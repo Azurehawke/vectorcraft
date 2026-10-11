@@ -112,3 +112,5 @@ codegen-units = 1
 # palm). Carried from PdfCraft's vendor/winit, whose other patches it keeps.
 [patch.crates-io]
 winit = { path = "vendor/winit" }
+# Android: a 64 MiB stack for the thread the app runs on (vendor/README.md).
+android-activity = { path = "vendor/android-activity" }

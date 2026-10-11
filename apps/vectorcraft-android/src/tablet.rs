@@ -24,11 +24,35 @@ pub struct TabletApp {
     touches: TouchRouter,
     insets: egui::epaint::MarginF32,
     focused: bool,
+    /// The previous run's crash report, announced once.
+    previous: Option<crate::crash_log::Previous>,
 }
 
 impl TabletApp {
-    pub fn new(app: VectorcraftApp, android: AndroidApp, picker: crate::picker::Shared) -> Self {
-        Self { app, android, picker, touches: TouchRouter::default(), insets: egui::epaint::MarginF32::default(), focused: true }
+    pub fn new(app: VectorcraftApp, android: AndroidApp, picker: crate::picker::Shared, previous: Option<crate::crash_log::Previous>) -> Self {
+        log::info!("{}", crate::crash_log::FOREGROUND);
+        Self { app, android, picker, touches: TouchRouter::default(), insets: egui::epaint::MarginF32::default(), focused: true, previous }
+    }
+
+    /// Say once that the last run ended badly and where its report is.
+    fn crash_notice(&mut self, ctx: &egui::Context) {
+        let Some(previous) = &self.previous else { return };
+        let mut open = true;
+        let mut ok = false;
+        egui::Window::new("VectorCraft closed unexpectedly")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("The last time VectorCraft ran, it stopped unexpectedly. A crash report was saved to:");
+                ui.strong(&previous.saved_to);
+                ui.label("Sending it along with what you were doing helps get it fixed.");
+                ok = ui.button("OK").clicked();
+            });
+        if !open || ok {
+            self.previous = None;
+        }
     }
 
     fn system_bar_insets(&self, ctx: &egui::Context, raw: &egui::RawInput) -> Option<egui::epaint::MarginF32> {
@@ -73,6 +97,10 @@ impl eframe::App for TabletApp {
         // are saved now.
         if self.focused && !raw.focused {
             crate::save_prefs(&self.app);
+            log::info!("{}", crate::crash_log::BACKGROUND);
+            crate::crash_log::flush();
+        } else if !self.focused && raw.focused {
+            log::info!("{}", crate::crash_log::FOREGROUND);
         }
         self.focused = raw.focused;
         let canvas = vectorcraft_ui_egui::canvas::canvas_place(ctx);
@@ -102,11 +130,14 @@ impl eframe::App for TabletApp {
             });
         }
         self.picker.show(ui.ctx());
+        self.crash_notice(ui.ctx());
         self.keep_soft_keyboard_away(ui.ctx());
     }
 
     fn on_exit(&mut self) {
         crate::save_prefs(&self.app);
+        log::info!("{}", crate::crash_log::EXIT);
+        crate::crash_log::flush();
     }
 }
 
