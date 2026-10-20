@@ -898,6 +898,12 @@ impl VectorcraftApp {
         i18n::Lang::from_pref(editing.unwrap_or(&self.session.prefs.interface_language))
     }
 
+    /// Whether the app's fonts (its named families, such as the semibold one titles use) are in
+    /// effect: from the second frame on. Anything drawn around the app must wait for it.
+    pub fn fonts_ready(&self) -> bool {
+        self.fonts_ready
+    }
+
     /// Per-frame logic before layout (control channel, shortcuts, inbox). A bug that panics costs
     /// one frame and shows an error, instead of closing the app with unsaved work.
     pub fn logic(&mut self, ctx: &egui::Context) {

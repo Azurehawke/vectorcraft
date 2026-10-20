@@ -129,8 +129,18 @@ impl eframe::App for TabletApp {
                 file_access::unconfined(|| self.app.ui(ui));
             });
         }
-        self.picker.show(ui.ctx());
-        self.crash_notice(ui.ctx());
+        // The shell's own windows use the app's fonts, which take effect on the second frame;
+        // a bug in them costs a frame, not the app.
+        if self.app.fonts_ready() {
+            let ctx = ui.ctx().clone();
+            if let Err(e) = vectorcraft_engine::guard::catch_panic(|| {
+                self.picker.show(&ctx);
+                self.crash_notice(&ctx);
+            }) {
+                self.previous = None;
+                self.app.status(format!("Internal error: {e} (please report this bug)"));
+            }
+        }
         self.keep_soft_keyboard_away(ui.ctx());
     }
 
