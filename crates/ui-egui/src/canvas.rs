@@ -534,7 +534,11 @@ fn handle_input(app: &mut VectorcraftApp, ui: &Ui, resp: &egui::Response, rect: 
     let view = app.view_info();
     touch_gestures(app, ui, rect, view);
     // Where the canvas is this frame, for hosts that route touches by where they land.
-    ui.data_mut(|d| d.insert_temp(canvas_place_id(), (rect, ui.layer_id(), ui.ctx().cumulative_frame_nr())));
+    // The frame number is read first: egui's context is locked inside `data_mut`, and reading it
+    // there waits for that lock forever (the app froze on its first canvas).
+    let frame_nr = ui.ctx().cumulative_frame_nr();
+    let layer = ui.layer_id();
+    ui.data_mut(|d| d.insert_temp(canvas_place_id(), (rect, layer, frame_nr)));
     let drag: Option<Drag> = ui.data(|d| d.get_temp(drag_id()));
     // A modifier pressed or released over the canvas re-hovers the tool, so what it changes shows
     // without moving the mouse (Alt switches the Shape Builder to erase mode).
@@ -1943,7 +1947,7 @@ fn canvas_place_id() -> egui::Id {
 /// (the Android shell lets a finger on the canvas scroll it, and only the pen or a mouse draw).
 pub fn canvas_place(ctx: &egui::Context) -> Option<(egui::Rect, egui::LayerId)> {
     let (rect, layer, frame): (egui::Rect, egui::LayerId, u64) = ctx.data(|d| d.get_temp(canvas_place_id()))?;
-    (frame + 1 >= ctx.cumulative_frame_nr()).then_some((rect, layer))
+    (frame.saturating_add(1) >= ctx.cumulative_frame_nr()).then_some((rect, layer))
 }
 
 /// The Contextual Task Bar's area.
