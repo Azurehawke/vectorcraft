@@ -240,9 +240,6 @@ pub fn watch() {
     let spawned = std::thread::Builder::new().name("freeze-watchdog".into()).spawn(move || {
         let mut reported = false;
         loop {
-            if let Some(ctx) = CTX.get() {
-                ctx.request_repaint();
-            }
             std::thread::sleep(Duration::from_secs(1));
             let since = now_ms().saturating_sub(BEAT.load(Ordering::Relaxed));
             if !FRONT.load(Ordering::Relaxed) || since < STALL.as_millis() as u64 {
@@ -271,6 +268,19 @@ pub fn watch() {
     });
     if let Err(e) = spawned {
         log::warn!("no freeze watchdog: {e}");
+    }
+    // Asking for frames takes egui's lock, which a frozen UI thread may hold: that wait happens
+    // on a thread of its own, never the watchdog's.
+    let pinger = std::thread::Builder::new().name("frame-pinger".into()).spawn(|| {
+        loop {
+            if let Some(ctx) = CTX.get() {
+                ctx.request_repaint();
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+    if let Err(e) = pinger {
+        log::warn!("no frame pinger: {e}");
     }
 }
 
