@@ -56,6 +56,13 @@ fn services(picker: picker::Shared) -> Services {
     Services {
         // Every dialog goes through the in-app browser, answering on a channel.
         start_pick: Some(Box::new(move |request| picker.start(request))),
+        // The app offers a kind of dialog (Save, Open, Place, a folder) only where the host has
+        // its in-line form. Every dialog here is the browser above, which always takes the
+        // request, so these never run; without them Save and Open did nothing.
+        pick_open: Some(Box::new(|_: &vectorcraft_ui_egui::FilePick| None)),
+        pick_open_multi: Some(Box::new(Vec::new)),
+        pick_save: Some(Box::new(|_: &vectorcraft_ui_egui::FilePick| None)),
+        pick_folder: Some(Box::new(|| None)),
         read: Some(Box::new(|p: &str| std::fs::read(p).map_err(|e| e.to_string()))),
         write: Some(Box::new(write_file)),
         write_shared: Some(std::sync::Arc::new(write_file)),
