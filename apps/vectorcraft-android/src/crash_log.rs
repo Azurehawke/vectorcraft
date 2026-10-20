@@ -4,12 +4,20 @@
 //! the process's stderr (where Rust reports a stack overflow or an abort) goes to `stderr.log`.
 //! At the next start, if the last run ended badly (a panic, anything on stderr, or the log
 //! stopping while the app was in front), both are combined into `Download/VectorCraft crash
-//! report.txt` and the app says so once.
+//! report.txt` and the app says so once. Without All files access the report waits in the
+//! private folder and is copied to Download as soon as the access is on ([`deliver_pending`]).
+//!
+//! A freeze isn't a crash: Android offers to close an app that stops responding, which ends it
+//! without a trace. So a watchdog ([`watch`]) notices when the UI thread hasn't finished a frame
+//! for a few seconds while the app is in front, logs it, and has that thread write where it is
+//! stuck (its backtrace) to stderr, which the next report includes.
 
 use std::fs::File;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 /// Written when the app comes to the front, goes to the background, and exits cleanly.
 pub const FOREGROUND: &str = "[session] in foreground";
@@ -146,13 +154,124 @@ fn previous_run(dir: &Path) -> Option<Previous> {
         if stderr.trim().is_empty() { "(empty)" } else { stderr.trim_end() },
         tail(&log, REPORT_TAIL).trim_end()
     );
-    let private: PathBuf = dir.join("crash report.txt");
-    let _ = std::fs::write(&private, &report);
-    let saved_to = match std::fs::write(SHARED_REPORT, &report) {
-        Ok(()) => "Download › VectorCraft crash report.txt".to_string(),
-        Err(_) => format!("{} (allow All files access to have it saved to Download)", private.display()),
+    let _ = std::fs::write(dir.join(PENDING), &report);
+    let saved_to = if deliver_from(dir) {
+        "Download › VectorCraft crash report.txt".to_string()
+    } else {
+        "VectorCraft's private folder for now. Turn on All files access for VectorCraft (Settings › Apps › ⋮ › Special access › All files access) and it is copied to Download › VectorCraft crash report.txt".to_string()
     };
     Some(Previous { saved_to })
+}
+
+/// A report not yet copied to Download (in the private folder).
+const PENDING: &str = "crash report.txt";
+const DELIVERED: &str = "crash report (in Download).txt";
+
+/// Copy a waiting report to Download. → whether one was copied.
+fn deliver_from(dir: &Path) -> bool {
+    let pending = dir.join(PENDING);
+    let Ok(report) = std::fs::read(&pending) else { return false };
+    if std::fs::write(SHARED_REPORT, report).is_err() {
+        return false;
+    }
+    let _ = std::fs::rename(&pending, dir.join(DELIVERED));
+    true
+}
+
+/// Copy a report that waited for All files access to Download, if there is one and the access is
+/// now on. → whether it did (the app says so).
+pub fn deliver_pending() -> bool {
+    std::env::var_os("HOME").is_some_and(|home| deliver_from(Path::new(&home)))
+}
+
+/// Milliseconds since `EPOCH` when the UI thread last finished a frame.
+static BEAT: AtomicU64 = AtomicU64::new(0);
+static FRONT: AtomicBool = AtomicBool::new(false);
+/// The UI thread (a `pthread_t`), for the watchdog's signal.
+static UI_THREAD: AtomicUsize = AtomicUsize::new(0);
+static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+/// A frame taking longer than this, in front, is a freeze.
+const STALL: Duration = Duration::from_secs(5);
+
+fn now_ms() -> u64 {
+    u64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// egui's context, so the watchdog can ask for frames: an idle egui app draws none, and only a
+/// frame asked for and not drawn is a freeze.
+static CTX: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
+
+/// The UI thread finished a frame.
+pub fn beat_with(ctx: &egui::Context) {
+    let _ = CTX.get_or_init(|| ctx.clone());
+    beat();
+}
+
+fn beat() {
+    BEAT.store(now_ms(), Ordering::Relaxed);
+}
+
+/// Whether the app is in front (a backgrounded app draws no frames, which is no freeze).
+pub fn set_front(front: bool) {
+    beat();
+    FRONT.store(front, Ordering::Relaxed);
+}
+
+/// Where a frozen UI thread is: its backtrace, written to stderr by that thread itself.
+extern "C" fn dump_backtrace(_signal: libc::c_int) {
+    // Not async-signal-safe (it allocates), which is acceptable here: the thread is stuck
+    // anyway, and at worst the dump is lost.
+    let trace = std::backtrace::Backtrace::force_capture();
+    let mut err = std::io::stderr();
+    let _ = writeln!(err, "The UI thread stopped responding here:\n{trace}");
+    let _ = err.flush();
+}
+
+/// Start the freeze watchdog. Call on the UI thread (`android_main`).
+pub fn watch() {
+    #[allow(unsafe_code)]
+    // SAFETY: pthread_self has no preconditions; installing a handler for SIGUSR2, which neither
+    // Android's runtime nor the app uses, with a plain `extern "C" fn(c_int)`.
+    let installed = unsafe {
+        UI_THREAD.store(libc::pthread_self() as usize, Ordering::Relaxed);
+        libc::signal(libc::SIGUSR2, dump_backtrace as extern "C" fn(libc::c_int) as libc::sighandler_t) != libc::SIG_ERR
+    };
+    beat();
+    let spawned = std::thread::Builder::new().name("freeze-watchdog".into()).spawn(move || {
+        let mut reported = false;
+        loop {
+            if let Some(ctx) = CTX.get() {
+                ctx.request_repaint();
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            let since = now_ms().saturating_sub(BEAT.load(Ordering::Relaxed));
+            if !FRONT.load(Ordering::Relaxed) || since < STALL.as_millis() as u64 {
+                if reported {
+                    log::warn!("the UI thread is responding again");
+                }
+                reported = false;
+                continue;
+            }
+            if reported {
+                continue;
+            }
+            reported = true;
+            log::error!("{PANIC} the UI thread hasn't finished a frame for {since} ms (frozen)");
+            flush();
+            let thread = UI_THREAD.load(Ordering::Relaxed);
+            if installed && thread != 0 {
+                #[allow(unsafe_code)]
+                // SAFETY: the UI thread runs for the whole process (android_main), so its id is
+                // valid; SIGUSR2 has the handler above.
+                unsafe {
+                    libc::pthread_kill(thread as libc::pthread_t, libc::SIGUSR2);
+                }
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        log::warn!("no freeze watchdog: {e}");
+    }
 }
 
 /// Make sure the log reaches the file (before something that may end the process).

@@ -73,6 +73,7 @@ fn android_main(android: AndroidApp) {
     let data_dir = android.internal_data_path();
     // Logging first, with the previous run's crash report if it ended badly.
     let previous = crash_log::start(data_dir.as_deref());
+    crash_log::watch();
     std::panic::set_hook(Box::new(|info| {
         let trace = std::backtrace::Backtrace::force_capture();
         log::error!("{} {info}\n{trace}", crash_log::PANIC);

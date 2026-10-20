@@ -31,6 +31,7 @@ pub struct TabletApp {
 impl TabletApp {
     pub fn new(app: VectorcraftApp, android: AndroidApp, picker: crate::picker::Shared, previous: Option<crate::crash_log::Previous>) -> Self {
         log::info!("{}", crate::crash_log::FOREGROUND);
+        crate::crash_log::set_front(true);
         Self { app, android, picker, touches: TouchRouter::default(), insets: egui::epaint::MarginF32::default(), focused: true, previous }
     }
 
@@ -101,6 +102,13 @@ impl eframe::App for TabletApp {
             crate::crash_log::flush();
         } else if !self.focused && raw.focused {
             log::info!("{}", crate::crash_log::FOREGROUND);
+            // Back from Settings with All files access on: a waiting crash report can go to Download.
+            if crate::crash_log::deliver_pending() {
+                self.app.status("The crash report was saved to Download › VectorCraft crash report.txt");
+            }
+        }
+        if self.focused != raw.focused {
+            crate::crash_log::set_front(raw.focused);
         }
         self.focused = raw.focused;
         let canvas = vectorcraft_ui_egui::canvas::canvas_place(ctx);
@@ -142,6 +150,7 @@ impl eframe::App for TabletApp {
             }
         }
         self.keep_soft_keyboard_away(ui.ctx());
+        crate::crash_log::beat_with(ui.ctx());
     }
 
     fn on_exit(&mut self) {
