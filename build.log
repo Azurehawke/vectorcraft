@@ -1,0 +1,257 @@
+== libvectorcraft_android.so
+warning: Environment variable `ANDROID_NDK_HOME = "/usr/local/lib/android/sdk/ndk/30.0.16248370"` doesn't match `ANDROID_NDK_ROOT = "/usr/local/lib/android/sdk/ndk/27.3.13750724"`
+    Building arm64-v8a (aarch64-linux-android)
+[1m[92m    Updating[0m git repository `https://github.com/storytold/craft-libs`
+[1m[92m    Updating[0m crates.io index
+[1m[92m    Updating[0m git repository `https://github.com/storytold/craft-libs`
+[1m[92m    Updating[0m git repository `https://github.com/storytold/craft-libs`
+[1m[92m     Locking[0m 19 packages to highest Rust 1.95 compatible versions
+[1m[92m      Adding[0m aho-corasick v1.1.5
+[1m[92m      Adding[0m android-activity v0.6.1 (/home/runner/work/vectorcraft/vectorcraft/vendor/android-activity)
+[1m[92m      Adding[0m android_log-sys v0.3.2
+[1m[92m      Adding[0m android_logger v0.15.1
+[1m[92m      Adding[0m cesu8 v1.1.0
+[1m[92m      Adding[0m env_filter v0.1.4
+[1m[92m      Adding[0m jni v0.21.1 [1m[33m(available: v0.22.4)[0m
+[1m[92m      Adding[0m regex v1.13.1
+[1m[92m      Adding[0m regex-automata v0.4.18
+[1m[92m      Adding[0m windows-sys v0.45.0
+[1m[92m      Adding[0m windows-targets v0.42.2
+[1m[92m      Adding[0m windows_aarch64_gnullvm v0.42.2
+[1m[92m      Adding[0m windows_aarch64_msvc v0.42.2
+[1m[92m      Adding[0m windows_i686_gnu v0.42.2
+[1m[92m      Adding[0m windows_i686_msvc v0.42.2
+[1m[92m      Adding[0m windows_x86_64_gnu v0.42.2
+[1m[92m      Adding[0m windows_x86_64_gnullvm v0.42.2
+[1m[92m      Adding[0m windows_x86_64_msvc v0.42.2
+[1m[92m      Adding[0m winit v0.30.13 (/home/runner/work/vectorcraft/vectorcraft/vendor/winit)
+[1m[92m Downloading[0m crates ...
+[1m[92m  Downloaded[0m arboard v3.7.0
+[1m[92m  Downloaded[0m cc v1.9.0
+[1m[92m  Downloaded[0m calloop v0.14.5
+[1m[92m  Downloaded[0m crc32fast v1.5.3
+[1m[92m  Downloaded[0m combine v4.6.9
+[1m[92m  Downloaded[0m either v1.19.0
+[1m[92m  Downloaded[0m equivalent v1.0.3
+[1m[92m  Downloaded[0m font-types v0.12.7
+[1m[92m  Downloaded[0m find-msvc-tools v0.1.15
+[1m[92m  Downloaded[0m icu_locale_fallback v2.3.0
+[1m[92m  Downloaded[0m icu_locale_fallback_data v2.3.0
+[1m[92m  Downloaded[0m icu_segmenter v2.3.0
+[1m[92m  Downloaded[0m icu_segmenter_data v2.3.0
+[1m[92m  Downloaded[0m libc v0.2.191
+[1m[92m  Downloaded[0m litrs v1.0.1
+[1m[92m  Downloaded[0m ruzstd v0.9.1
+[1m[92m  Downloaded[0m serde_spanned v1.1.2
+[1m[92m  Downloaded[0m serde_json v1.0.154
+[1m[92m  Downloaded[0m smallvec v1.16.3
+[1m[92m  Downloaded[0m stringprep v0.1.5
+[1m[92m  Downloaded[0m syn v3.0.9
+[1m[92m  Downloaded[0m toml_datetime v1.1.2+spec-1.1.0
+[1m[92m  Downloaded[0m toml v1.1.8+spec-1.1.0
+[1m[92m  Downloaded[0m toml_parser v1.1.5+spec-1.1.0
+[1m[92m  Downloaded[0m toml_writer v1.1.3+spec-1.1.0
+[1m[92m  Downloaded[0m toml_edit v0.25.17+spec-1.1.0
+[1m[92m  Downloaded[0m unicode-ident v1.0.27
+[1m[92m  Downloaded[0m unicode-normalization v0.1.26
+[1m[92m  Downloaded[0m uuid v1.28.0
+[1m[92m  Downloaded[0m yoke-derive v0.8.4
+[1m[92m  Downloaded[0m zerocopy v0.8.63
+[1m[92m  Downloaded[0m zerocopy-derive v0.8.63
+[1m[92m   Compiling[0m unicode-ident v1.0.27
+[1m[92m   Compiling[0m bitflags v2.13.2
+[1m[92m   Compiling[0m foldhash v0.2.0
+[1m[92m   Compiling[0m zerocopy v0.8.63
+[1m[92m   Compiling[0m proc-macro2 v1.0.107
+[1m[92m   Compiling[0m crc32fast v1.5.3
+[1m[92m   Compiling[0m zlib-rs v0.6.8
+[1m[92m   Compiling[0m quote v1.0.47
+[1m[92m   Compiling[0m syn v3.0.9
+[1m[92m   Compiling[0m syn v2.0.119
+[1m[92m   Compiling[0m libc v0.2.191
+[1m[92m   Compiling[0m hashbrown v0.17.1
+[1m[92m   Compiling[0m equivalent v1.0.3
+[1m[92m   Compiling[0m indexmap v2.14.2
+[1m[92m   Compiling[0m synstructure v0.14.0
+[1m[92m   Compiling[0m flate2 v1.1.10
+[1m[92m   Compiling[0m serde_derive v1.0.229
+[1m[92m   Compiling[0m bytemuck_derive v1.12.1
+[1m[92m   Compiling[0m thiserror-impl v2.0.21
+[1m[92m   Compiling[0m bytemuck v1.25.2
+[1m[92m   Compiling[0m zerocopy-derive v0.8.63
+[1m[92m   Compiling[0m zerofrom-derive v0.1.8
+[1m[92m   Compiling[0m thiserror v2.0.21
+[1m[92m   Compiling[0m yoke-derive v0.8.4
+[1m[92m   Compiling[0m serde v1.0.229
+[1m[92m   Compiling[0m zerofrom v0.1.8
+[1m[92m   Compiling[0m font-types v0.12.7
+[1m[92m   Compiling[0m yoke v0.8.3
+[1m[92m   Compiling[0m zerovec-derive v0.11.6
+[1m[92m   Compiling[0m smallvec v1.16.3
+[1m[92m   Compiling[0m arrayvec v0.7.8
+[1m[92m   Compiling[0m displaydoc v0.2.7
+[1m[92m   Compiling[0m polycool v0.4.0
+[1m[92m   Compiling[0m kurbo v0.13.1
+[1m[92m   Compiling[0m zerovec v0.11.8
+[1m[92m   Compiling[0m png v0.18.1
+[1m[92m   Compiling[0m writeable v0.6.4
+[1m[92m   Compiling[0m serde_json v1.0.154
+[1m[92m   Compiling[0m tinystr v0.8.4
+[1m[92m   Compiling[0m litemap v0.8.3
+[1m[92m   Compiling[0m icu_locale_core v2.3.0
+[1m[92m   Compiling[0m half v2.7.1
+[1m[92m   Compiling[0m potential_utf v0.1.6
+[1m[92m   Compiling[0m zerotrie v0.2.5
+[1m[92m   Compiling[0m tiff v0.11.3
+[1m[92m   Compiling[0m icu_provider v2.3.1
+[1m[92m   Compiling[0m icu_collections v2.3.0
+[1m[92m   Compiling[0m image v0.25.10
+[1m[92m   Compiling[0m vectorcraft-geom v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/geom)
+[1m[92m   Compiling[0m font-types v0.11.3
+[1m[92m   Compiling[0m read-fonts v0.39.2
+[1m[92m   Compiling[0m color v0.3.3
+[1m[92m   Compiling[0m jni-sys-macros v0.4.1
+[1m[92m   Compiling[0m peniko v0.6.1
+[1m[92m   Compiling[0m jni-sys v0.4.1
+[1m[92m   Compiling[0m vectorcraft-color v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/color)
+[1m[92m   Compiling[0m icu_locale_fallback_data v2.3.0
+[1m[92m   Compiling[0m toml_parser v1.1.5+spec-1.1.0
+[1m[92m   Compiling[0m toml_datetime v1.1.2+spec-1.1.0
+[1m[92m   Compiling[0m read-fonts v0.44.0
+[1m[92m   Compiling[0m skrifa v0.42.1
+[1m[92m   Compiling[0m write-fonts v0.48.1
+[1m[92m   Compiling[0m vectorcraft-doc v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/doc)
+[1m[92m   Compiling[0m icu_segmenter_data v2.3.0
+[1m[92m   Compiling[0m subsetter v0.2.6
+[1m[92m   Compiling[0m skrifa v0.47.0
+[1m[92m   Compiling[0m parking_lot_core v0.9.12
+[1m[92m   Compiling[0m either v1.19.0
+[1m[92m   Compiling[0m icu_locale_fallback v2.3.0
+[1m[92m   Compiling[0m parking_lot v0.12.5
+[1m[92m   Compiling[0m jni-sys v0.3.1
+[1m[92m   Compiling[0m wasmparser v0.228.0
+[1m[92m   Compiling[0m linesweeper v0.5.0
+[1m[92m   Compiling[0m read-fonts v0.43.3
+[1m[92m   Compiling[0m vectorcraft-text v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/text)
+[1m[92m   Compiling[0m wasmi v2.0.0
+[1m[92m   Compiling[0m harfrust v0.13.3
+[1m[92m   Compiling[0m icu_segmenter v2.3.0
+[1m[92m   Compiling[0m vectorcraft-pathops v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/pathops)
+[1m[92m   Compiling[0m vectorcraft-three-d v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/three-d)
+[1m[92m   Compiling[0m vectorcraft-plugins v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/plugins)
+[1m[92m   Compiling[0m ndk-sys v0.6.0+11769913
+[1m[92m   Compiling[0m read-fonts v0.41.0
+[1m[92m   Compiling[0m naga-types v30.0.1
+[1m[92m   Compiling[0m vectorcraft-effects v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/effects)
+[1m[92m   Compiling[0m toml_edit v0.25.17+spec-1.1.0
+[1m[92m   Compiling[0m vello_common v0.1.0
+[1m[92m   Compiling[0m emath v0.36.2
+[1m[92m   Compiling[0m combine v4.6.9
+[1m[92m   Compiling[0m unicode-normalization v0.1.26
+[1m[92m   Compiling[0m ecolor v0.36.2
+[1m[92m   Compiling[0m vello_cpu v0.1.0
+[1m[92m   Compiling[0m proc-macro-crate v3.5.0
+[1m[92m   Compiling[0m ahash v0.8.12
+[1m[92m   Compiling[0m jobserver v0.1.35
+[1m[92m   Compiling[0m skrifa v0.44.0
+[1m[92m   Compiling[0m harfrust v0.12.0
+[1m[92m   Compiling[0m vectorcraft-brush v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/brush)
+[1m[92m   Compiling[0m tiny-skia-path v0.12.0
+[1m[92m   Compiling[0m thiserror-impl v1.0.69
+[1m[92m   Compiling[0m spirv v0.4.0+sdk-1.4.341.0
+[1m[92m   Compiling[0m uuid v1.28.0
+[1m[92m   Compiling[0m find-msvc-tools v0.1.15
+[1m[92m   Compiling[0m unicode-properties v0.1.4
+[1m[92m   Compiling[0m naga v30.0.1
+[1m[92m   Compiling[0m epaint v0.36.2
+[1m[92m   Compiling[0m cc v1.9.0
+[1m[92m   Compiling[0m stringprep v0.1.5
+[1m[92m   Compiling[0m hashbrown v0.16.1
+[1m[92m   Compiling[0m accesskit v0.24.1
+[1m[92m   Compiling[0m wgpu-types v30.0.1
+[1m[92m   Compiling[0m thiserror v1.0.69
+[1m[92m   Compiling[0m num_enum_derive v0.7.6
+[1m[92m   Compiling[0m jni-macros v0.22.4
+[1m[92m   Compiling[0m phf_macros v0.13.1
+[1m[92m   Compiling[0m itertools v0.15.0
+[1m[92m   Compiling[0m hayro-jbig2 v0.3.0 (https://github.com/storytold/craft-libs?rev=ca50d63b773c99f96e75c77ce5a1d21e7c9cda0d#ca50d63b)
+[1m[92m   Compiling[0m gpu-allocator v0.28.0
+[1m[92m   Compiling[0m pdf-writer v0.15.0
+[1m[92m   Compiling[0m hayro-syntax v0.7.2 (https://github.com/storytold/craft-libs?rev=ca50d63b773c99f96e75c77ce5a1d21e7c9cda0d#ca50d63b)
+[1m[92m   Compiling[0m egui v0.36.2
+[1m[92m   Compiling[0m phf v0.13.1
+[1m[92m   Compiling[0m num_enum v0.7.6
+[1m[92m   Compiling[0m jni v0.22.4
+[1m[92m   Compiling[0m wgpu-naga-bridge v30.0.1
+[1m[92m   Compiling[0m khronos-egl v6.0.0
+[1m[92m   Compiling[0m android-activity v0.6.1 (/home/runner/work/vectorcraft/vectorcraft/vendor/android-activity)
+[1m[92m   Compiling[0m cpufeatures v0.2.17
+[1m[92m   Compiling[0m android_system_properties v0.1.6
+[1m[92m   Compiling[0m krilla v0.8.2 (https://github.com/storytold/craft-libs?rev=ca50d63b773c99f96e75c77ce5a1d21e7c9cda0d#ca50d63b)
+[1m[92m   Compiling[0m wgpu-hal v30.0.1
+[1m[92m   Compiling[0m rayon v1.12.0
+[1m[92m   Compiling[0m ndk v0.9.0
+[1m[92m   Compiling[0m hayro-interpret v0.7.0 (https://github.com/storytold/craft-libs?rev=ca50d63b773c99f96e75c77ce5a1d21e7c9cda0d#ca50d63b)
+[1m[92m   Compiling[0m tiny-skia-path v0.11.4
+[1m[92m   Compiling[0m vello_common v0.2.0
+[1m[92m   Compiling[0m winit v0.30.13 (/home/runner/work/vectorcraft/vectorcraft/vendor/winit)
+[1m[92m   Compiling[0m kurbo v0.11.3
+[1m[92m   Compiling[0m litrs v1.0.1
+[1m[92m   Compiling[0m ruzstd v0.9.1
+[1m[92m   Compiling[0m svgtypes v0.15.3
+[1m[92m   Compiling[0m png v0.17.16
+[1m[92m   Compiling[0m document-features v0.2.12
+[1m[92m   Compiling[0m vello_cpu v0.2.0
+[1m[92m   Compiling[0m icu_normalizer v2.3.0
+[1m[92m   Compiling[0m icu_properties v2.3.0
+[1m[92m   Compiling[0m craft-pdf v0.1.0 (https://github.com/storytold/craft-libs?rev=ca50d63b773c99f96e75c77ce5a1d21e7c9cda0d#ca50d63b)
+[1m[92m   Compiling[0m wgpu-core-deps-windows-linux-android v30.0.1
+[1m[92m   Compiling[0m aes v0.8.4
+[1m[92m   Compiling[0m sha2 v0.10.9
+[1m[92m   Compiling[0m svgtypes v0.16.1
+[1m[92m   Compiling[0m serde_spanned v1.1.2
+[1m[92m   Compiling[0m toml_writer v1.1.3+spec-1.1.0
+[1m[92m   Compiling[0m toml v1.1.8+spec-1.1.0
+[1m[92m   Compiling[0m usvg v0.48.1
+[1m[92m   Compiling[0m usvg v0.45.1
+[1m[92m   Compiling[0m vectorcraft-pdf v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/pdf)
+[1m[92m   Compiling[0m wgpu-core v30.0.1
+[1m[92m   Compiling[0m idna_adapter v1.2.2
+[1m[92m   Compiling[0m vectorcraft-render v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/render)
+[1m[92m   Compiling[0m tiny-skia v0.11.4
+[1m[92m   Compiling[0m vectorcraft-metafile v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/metafile)
+[1m[92m   Compiling[0m rgb v0.8.53
+[1m[92m   Compiling[0m enum-map-derive v0.17.0
+[1m[92m   Compiling[0m craft-docpath v0.1.0 (https://github.com/storytold/craft-libs?rev=82a24b006eefa036b43c09a67fb9a3fbd17ffe63#82a24b00)
+[1m[92m   Compiling[0m rustix v1.1.5
+[1m[92m   Compiling[0m vectorcraft-svg v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/svg)
+[1m[92m   Compiling[0m enum-map v2.7.3
+[1m[92m   Compiling[0m resvg v0.45.1
+[1m[92m   Compiling[0m vectorcraft-eps v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/eps)
+[1m[92m   Compiling[0m wgpu v30.0.1
+[1m[92m   Compiling[0m idna v1.1.0
+[1m[92m   Compiling[0m vectorcraft-ui-egui v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/ui-egui)
+[1m[92m   Compiling[0m vectorcraft-affinity v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/affinity)
+[1m[92m   Compiling[0m vectorcraft-cad v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/cad)
+[1m[92m   Compiling[0m vectorcraft-tools v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/tools)
+[1m[92m   Compiling[0m vectorcraft-format v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/format)
+[1m[92m   Compiling[0m vectorcraft-trace v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/trace)
+[1m[92m   Compiling[0m errno v0.3.14
+[1m[92m   Compiling[0m vectorcraft-scriptcheck v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/scriptcheck)
+[1m[92m   Compiling[0m linux-raw-sys v0.12.1
+[1m[92m   Compiling[0m vectorcraft-engine v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/crates/engine)
+[1m[92m   Compiling[0m egui-wgpu v0.36.2
+[1m[92m   Compiling[0m url v2.5.8
+[1m[92m   Compiling[0m egui_extras v0.36.2
+[1m[92m   Compiling[0m egui-winit v0.36.2
+[1m[92m   Compiling[0m craft-ui v0.1.0 (https://github.com/storytold/craft-libs?rev=5c874d51eeb3de70e735c8ce87a59a7dedd47675#5c874d51)
+[1m[92m   Compiling[0m eframe v0.36.2
+[1m[92m   Compiling[0m jni v0.21.1
+[1m[92m   Compiling[0m webbrowser v1.2.4
+[1m[92m   Compiling[0m vectorcraft-android v0.14.0 (/home/runner/work/vectorcraft/vectorcraft/apps/vectorcraft-android)
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 9m 51s
+     Copying libraries to /home/runner/work/vectorcraft/vectorcraft/target/android-apk/jniLibs
+== resources and manifest
+== native library
+== align and sign
+-rw-r--r-- 1 runner runner 42574633 Oct 21 13:25 /home/runner/work/vectorcraft/vectorcraft/target/android-apk/vectorcraft.apk
