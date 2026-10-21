@@ -287,9 +287,9 @@ impl PerspectiveGrid {
                 continue;
             }
             if let Some(n) = k.parse::<u64>().ok().and_then(|id| doc.node_mut(NodeId(id)))
-                && n.perspective.is_none()
+                && n.extras().perspective.is_none()
             {
-                n.perspective = Some(Box::new(PerspectiveAttachment::new(pl.id(), 0.0)));
+                n.extras_mut().perspective = Some(Box::new(PerspectiveAttachment::new(pl.id(), 0.0)));
             }
         }
         if let Some(v) = doc.unknown.get_mut(DOC_KEY).and_then(Value::as_object_mut) {
@@ -676,7 +676,7 @@ pub enum Axis {
 
 /// The plane and depth object `n` is attached to (its own record).
 pub fn attachment(n: &Node) -> Option<(Plane, f64)> {
-    let a = n.perspective.as_deref()?;
+    let a = n.extras().perspective.as_deref()?;
     Plane::parse(&a.plane).filter(|p| *p != Plane::None).map(|p| (p, a.depth))
 }
 
@@ -697,7 +697,8 @@ pub fn attached_roots(doc: &Document) -> Vec<(NodeId, Plane, f64)> {
 
 /// Attach `n` to `plane` at `depth` (type and symbols keep their projection).
 pub fn set_attachment(n: &mut Node, plane: Plane, depth: f64) {
-    let rec = n.perspective.get_or_insert_with(Default::default);
+    let mut extras = n.extras_mut();
+    let rec = extras.perspective.get_or_insert_with(Default::default);
     rec.plane = plane.id().into();
     rec.depth = if depth.is_finite() { depth } else { 0.0 };
 }
@@ -705,9 +706,10 @@ pub fn set_attachment(n: &mut Node, plane: Plane, depth: f64) {
 /// Release `n` from the grid (Release with Perspective): it keeps its look, type and symbols their
 /// projection.
 pub fn release(n: &mut Node) {
-    match n.perspective.as_deref_mut() {
+    let mut extras = n.extras_mut();
+    match extras.perspective.as_deref_mut() {
         Some(rec) if rec.projection.is_some() => *rec = PerspectiveAttachment { projection: rec.projection, ..Default::default() },
-        _ => n.perspective = None,
+        _ => extras.perspective = None,
     }
 }
 
@@ -739,7 +741,8 @@ fn mapped_bounds(n: &Node, hi: &Homography) -> Option<Rect> {
     if ok { acc } else { None }
 }
 
-fn in_quad(q: &[Point; 4], p: Point) -> bool {
+/// Is `p` inside the convex quad `q` (either winding; a point on an edge is inside)?
+pub(crate) fn in_quad(q: &[Point; 4], p: Point) -> bool {
     let mut sign = 0.0;
     for i in 0..4 {
         let (a, b) = (q[i], q[(i + 1) % 4]);
@@ -1037,6 +1040,7 @@ impl Tool for PerspectiveGridTool {
             Some(_) => Cursor::Move,
             None => Cursor::Arrow,
         }
+        .turned(cx.view_angle())
     }
     fn busy(&self) -> bool {
         self.drag.is_some() || self.plane.is_some()
@@ -1258,7 +1262,9 @@ impl Tool for PerspectiveSelectionTool {
                 }
             }
         }
-        if let Some((p, t)) = &self.measure {
+        if cx.measurement_labels
+            && let Some((p, t)) = &self.measure
+        {
             out.push(Overlay::Measure { p: *p, text: t.clone() });
         }
         out
@@ -1277,7 +1283,8 @@ impl Tool for PerspectiveSelectionTool {
             && let Some(k) = handle.or_else(|| persp_handle_at(rect, &h, p, cx.tol(5.0)))
             && let (Some(a), Some(c)) = (h.apply(k.pos(rect)), h.apply(rect.center()))
         {
-            return resize_cursor(a - c);
+            // The handle's direction on screen: the view turns it clockwise.
+            return resize_cursor((Affine::rotate(cx.view_angle().to_radians()) * (a - c).to_point()).to_vec2());
         }
         Cursor::Arrow
     }
@@ -1395,6 +1402,13 @@ mod tests {
         let c = cx(&d, &s, &p);
         let g = PerspectiveGrid::effective(&d);
         let mut t = PerspectiveGridTool::default();
+        // The horizon handle drags up and down; in a view turned 90° it drags left and right on
+        // screen.
+        let horizon = handles(&g, c.tol(1.0)).into_iter().find(|h| h.0 == Handle::Horizon).map(|h| h.1).unwrap();
+        assert_eq!(t.cursor(&c, horizon, Mods::default()), Cursor::ResizeV);
+        let mut turned = cx(&d, &s, &p);
+        turned.screen = turned_view(90.0);
+        assert_eq!(t.cursor(&turned, horizon, Mods::default()), Cursor::ResizeH);
         // Click the right face of the widget.
         let (faces, _) = g.widget(&d, 1.0);
         let q = faces[1].1;
@@ -1460,7 +1474,7 @@ mod tests {
         old.attached.insert(id2.0.to_string(), Plane::Left);
         d2.unknown.insert(DOC_KEY.into(), serde_json::to_value(&old).unwrap());
         grid(2).store(&mut d2);
-        assert!(d2.node(id2).unwrap().perspective.is_none());
+        assert!(d2.node(id2).unwrap().extras().perspective.is_none());
     }
 
     #[test]
@@ -1481,6 +1495,10 @@ mod tests {
         // A corner handle scales.
         let corner = h.apply(Point::new(rect.x1, rect.y1)).unwrap();
         assert!(matches!(t.cursor(&c, corner, Mods::default()), Cursor::ResizeNwSe | Cursor::ResizeNeSw));
+        // In a view turned 90° its cursor turns with the view.
+        let mut turned = cx(&d, &s, &p);
+        turned.screen = turned_view(90.0);
+        assert_eq!(t.cursor(&turned, corner, Mods::default()), t.cursor(&c, corner, Mods::default()).turned(90.0));
         assert_eq!(t.pointer(&c, &PointerEvent::new(PointerKind::Down, corner.x, corner.y)), vec![Action::Begin("Scale in Perspective".into())]);
         let acts = t.pointer(&c, &PointerEvent::new(PointerKind::Drag, corner.x + 10.0, corner.y + 10.0));
         assert!(matches!(&acts[0], Action::Preview(cmd, _) if cmd == "perspective.transform"));

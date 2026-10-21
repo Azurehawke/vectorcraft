@@ -1,23 +1,24 @@
 //! Document → PDF (krilla). Mirrors the tree walk of `vectorcraft-render`.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use craft_pdf::write::backend as krilla;
+use craft_pdf::write::{self, Metadata};
 use krilla::color::separation::{Color as SepColor, SeparationColorant, SeparationSpace};
 use krilla::color::{cmyk, luma, rgb};
-use krilla::configure::{Archival, ConfigurationBuilder, PdfVersion};
+use krilla::configure::{Archival, PdfVersion};
 use krilla::geom::{Path, PathBuilder, Size, Transform};
 use krilla::image::Image;
-use krilla::metadata::Metadata;
 use krilla::num::NormalizedF32;
 use krilla::page::PageSettings;
 use krilla::paint::{Fill, LinearGradient, RadialGradient, SpreadMethod, Stop, Stroke, StrokeDash};
 use krilla::surface::Surface;
-use krilla::text::{GlyphId, KrillaGlyph};
+use krilla::text::{Glyph, GlyphId, KrillaGlyph};
 use kurbo::{PathEl, Shape, Vec2};
 use vectorcraft_color::{BlendMode, Color, GradientKind, Paint};
-use vectorcraft_doc::{AppearanceItem, Document, LineCap, LineJoin, Node, NodeKind, StrokeAlign, StrokeLayer, TextObject};
+use vectorcraft_doc::{AppearanceItem, Document, LineCap, LineJoin, Node, NodeKind, StrokeAlign, StrokeLayer, SymbolBoxes, TextObject};
 use vectorcraft_effects::stroke::{self, WrittenShape};
 use vectorcraft_geom::{Affine, BezPath, FillRule, Rect};
 use vectorcraft_text::TextLayout;
@@ -37,22 +38,47 @@ pub fn export(doc: &Document, opts: &PdfOptions) -> Result<Vec<u8>, PdfError> {
 /// Like [`export`], also returning warnings: options accepted but not applied yet (see
 /// [`crate::PdfSettings::warnings`]) and features approximated or dropped.
 pub fn export_with_report(doc: &Document, opts: &PdfOptions) -> Result<ExportReport, PdfError> {
+    write::guard(|| leaving_out_undecodable(|left_out| export_with_report_inner(doc, opts, left_out)))
+}
+
+/// Run `write` (a whole PDF written by a [`Writer`]), and run it again each time it fails on an
+/// image whose pixel data the writer couldn't decode, with that image left out: [`Writer::finish`]
+/// adds the image's key to the set `write` is given, and the exporters leave out the images it
+/// holds. The writer reports such an image (a PNG, GIF or WebP kept as it is, whose header reads)
+/// only when it finishes the file. Each repeated run leaves out at least one more image.
+pub(crate) fn leaving_out_undecodable<T>(mut write: impl FnMut(&mut HashSet<String>) -> Result<T, PdfError>) -> Result<T, PdfError> {
+    let mut left_out = HashSet::new();
+    loop {
+        let known = left_out.len();
+        match write(&mut left_out) {
+            Err(_) if left_out.len() > known => {}
+            done => return done,
+        }
+    }
+}
+
+fn export_with_report_inner(doc: &Document, opts: &PdfOptions, left_out: &mut HashSet<String>) -> Result<ExportReport, PdfError> {
     let set = &opts.settings;
     set.check()?;
+    vectorcraft_doc::cancel::check().map_err(|_| PdfError::Cancelled)?;
     // Live geometry effects export as their result; raster effects are reported below.
     let baked = vectorcraft_effects::bake_document(doc);
+    // Baking stops early when cancelled, leaving a half-baked copy that must not be written.
+    vectorcraft_doc::cancel::check().map_err(|_| PdfError::Cancelled)?;
     let doc = baked.as_ref().unwrap_or(doc);
     let pages = pages(doc, opts)?;
 
     let title = crate::pdfx::title(set.standard, opts.title.clone().unwrap_or_else(|| doc.title.clone()));
-    let created_at = opts.created.or_else(vectorcraft_doc::metadata::now_unix);
+    // The time of writing (none on the web) dates the editing data and the page information.
+    let now = vectorcraft_doc::metadata::output_time();
+    let created_at = opts.created.or(now);
     crate::pdfx::require_date(set.standard, created_at)?;
     let mut w = Writer::new(doc, set, &title, created_at, doc.color_mode == vectorcraft_doc::ColorMode::Cmyk)?;
     // Preserve Editing: the native document as an embedded file (`check` refused PDF/A with it).
     let mut warnings = set.warnings();
     let native = opts.native.as_deref().filter(|_| set.preserve_editing);
     if let Some(native) = native {
-        w.pdf.embed_file(crate::editing::embedded_file(native, set.compression.compress_text, created_at.map(date_time)));
+        w.pdf.document_mut().embed_file(crate::editing::embedded_file(native, set.compression.compress_text, now.map(date_time)));
     } else if set.preserve_editing {
         warnings.push("Preserve editing needs the native document, which wasn't given: the PDF reopens as plain artwork".into());
     }
@@ -60,6 +86,7 @@ pub fn export_with_report(doc: &Document, opts: &PdfOptions) -> Result<ExportRep
     let mut ex = Exporter::new(doc, set);
     ex.non_printing = set.include_non_printing || set.create_layers;
     ex.out = w.out.clone();
+    ex.left_out = left_out.clone();
     // A knockout page group draws the layers' objects one by one, not layer by layer.
     ex.layers = set.writes_layers() && !doc.page_knockout;
     if set.writes_layers() && doc.page_knockout {
@@ -68,14 +95,27 @@ pub fn export_with_report(doc: &Document, opts: &PdfOptions) -> Result<ExportRep
     ex.overprint = set.advanced.overprint == crate::Overprint::Preserve;
     let bleed = set.bleed_of(doc);
     let marks = set.marks.printer_marks();
-    for (i, boxes) in pages {
+    // In PDF 1.6 and later files that aren't PDF/X files, a page with a side longer than
+    // [`MAX_PAGE_SIDE`] is written in larger units; other files have every page in points.
+    let scales = set.compatibility.has_user_unit() && !set.standard.is_pdfx();
+    let mut units = Vec::with_capacity(pages.len());
+    let total = pages.len() as u64;
+    for (written, (i, boxes)) in pages.into_iter().enumerate() {
+        // The page count and the page being written, for a client that asked for progress.
+        vectorcraft_doc::cancel::check().map_err(|_| PdfError::Cancelled)?;
+        vectorcraft_doc::cancel::progress(written as u64 + 1, total, &format!("Writing page {} of {total}", written + 1));
         let (m, r) = (boxes.media, boxes.bleed);
-        let info = if marks.page_info { crate::marks::page_info(doc, &title, i, created_at) } else { String::new() };
+        let info = if marks.page_info { crate::marks::page_info(doc, &title, i, now) } else { String::new() };
         let art = crate::marks::art(doc, &marks, &boxes, bleed, &info);
-        // The page is the media box, y down from its top-left corner (like ours).
-        let view = Affine::translate((-m.x0, -m.y0));
+        // The page is the media box, y down from its top-left corner (like ours), in units of
+        // `unit` points.
+        let unit = if scales { user_unit(m.width(), m.height()) } else { 1.0 };
+        units.push(unit);
+        let shift = Affine::translate((-m.x0, -m.y0));
+        let view = if unit > 1.0 { Affine::scale(1.0 / unit) * shift } else { shift };
         let sheet = Sheet {
-            size: (m.width(), m.height()),
+            size: (m.width() / unit, m.height() / unit),
+            unit,
             trim: view.transform_rect_bbox(boxes.trim),
             bleed: view.transform_rect_bbox(r),
             view,
@@ -89,11 +129,18 @@ pub fn export_with_report(doc: &Document, opts: &PdfOptions) -> Result<ExportRep
         };
         w.page(&mut ex, &sheet).map_err(|_| PdfError::BadArtboard(i))?;
     }
-    let (layers, overprinted) = (ex.layers, ex.overprinted);
+    vectorcraft_doc::cancel::check().map_err(|_| PdfError::Cancelled)?;
+    let (layers, overprinted, invisible) = (ex.layers, ex.overprinted, ex.invisible);
     w.absorb(ex);
-    let (bytes, more) = w.finish()?;
-    let bytes = crate::forms::finish(bytes, doc, set, layers, overprinted)?;
+    let (bytes, more) = w.finish(left_out)?;
+    let bytes = crate::forms::finish(bytes, doc, set, layers, overprinted, invisible)?;
+    // The writer gives the file its creation date as its modification date too.
+    let bytes = match opts.modified.filter(|m| Some(*m) != created_at) {
+        Some(modified) => crate::post::modification_date(bytes, modified)?,
+        None => bytes,
+    };
     warnings.extend(more);
+    let bytes = crate::post::user_units(bytes, &units)?;
     let bytes = crate::post::finish(bytes, opts, native.is_some(), &mut warnings)?;
     warnings.dedup();
     Ok(ExportReport { bytes, warnings })
@@ -120,10 +167,58 @@ pub fn page_areas(doc: &Document, opts: &PdfOptions) -> Result<Vec<Rect>, PdfErr
     Ok(pages(doc, opts)?.into_iter().map(|(_, b)| b.media).collect())
 }
 
+/// The largest side of a page in units of its default user space that ISO 32000-1 (Annex C.2)
+/// gives: 14,400 (200 inches in units of 1/72 inch).
+pub(crate) const MAX_PAGE_SIDE: f64 = 14_400.0;
+
+/// The `UserUnit` (PDF 1.6) of a page `w` × `h` points large: 1 when both sides are at most
+/// [`MAX_PAGE_SIDE`], else the longer side divided by it, rounded up to the next thousandth, so
+/// that both sides are at most [`MAX_PAGE_SIDE`] units.
+fn user_unit(w: f64, h: f64) -> f64 {
+    let side = w.abs().max(h.abs());
+    if side.is_finite() && side > MAX_PAGE_SIDE { (side / MAX_PAGE_SIDE * 1000.0).ceil() / 1000.0 } else { 1.0 }
+}
+
+/// The RGB colours and non-CMYK images a CMYK document carries, which the export separates into
+/// CMYK. Their darkest values come out as rich blacks, so the export says how many there are.
+#[derive(Default)]
+pub(crate) struct RgbInCmyk {
+    /// Distinct RGB colours, by the bits of their channels.
+    colours: HashSet<[u32; 3]>,
+    /// Keys of the raster images that aren't CMYK.
+    images: HashSet<String>,
+}
+
+impl RgbInCmyk {
+    fn merge(&mut self, other: RgbInCmyk) {
+        self.colours.extend(other.colours);
+        self.images.extend(other.images);
+    }
+
+    /// The warning for the export report; `None` when the document has nothing of the sort.
+    fn warning(&self) -> Option<String> {
+        let (c, i) = (self.colours.len(), self.images.len());
+        if c == 0 && i == 0 {
+            return None;
+        }
+        let mut parts = vec![];
+        if c > 0 {
+            parts.push(format!("{c} RGB colour{}", if c == 1 { "" } else { "s" }));
+        }
+        if i > 0 {
+            parts.push(format!("{i} RGB or grey image{}", if i == 1 { "" } else { "s" }));
+        }
+        Some(format!(
+            "this CMYK document has {}: they are converted to CMYK through the colour settings, so dark ones can come out as rich blacks on several plates; paint them with CMYK colours (Edit › Edit Colors › Convert to CMYK) for pure black ink",
+            parts.join(" and ")
+        ))
+    }
+}
+
 /// A PDF being written, shared by export and print: the file's configuration and metadata, then
 /// its pages ([`Self::page`]), each drawn by an [`Exporter`].
 pub(crate) struct Writer {
-    pub pdf: krilla::Document,
+    pub pdf: write::Writer,
     /// How colours are written (the Output settings).
     pub out: Arc<ColorOut>,
     /// Groups blend in CMYK (a CMYK document's composite, or converting to CMYK; see
@@ -132,15 +227,23 @@ pub(crate) struct Writer {
     /// Spot colours written with a Lab alternate, gathered from the exporters ([`Self::absorb`]).
     lab_spots: Vec<(String, vectorcraft_color::cms::Lab)>,
     warnings: Vec<String>,
+    /// RGB content of a CMYK document, gathered from the exporters ([`Self::absorb`]).
+    rgb_in_cmyk: RgbInCmyk,
     /// A PDF 1.3 file ([`crate::PdfSettings::pdf13`]): flat, without page groups.
     pdf13: bool,
+    /// The document's images the exporters wrote, by key, gathered from the exporters
+    /// ([`Self::absorb`]): [`Self::finish`] finds the key of an image the writer couldn't decode.
+    images: Vec<(String, Image)>,
 }
 
 /// One page as [`Writer::page`] draws it: the art placed in a drawing space ([`Self::place`]),
 /// which [`Self::view`] maps onto the page.
 pub(crate) struct Sheet<'a> {
-    /// The page's size in points.
+    /// The page's size in its units.
     pub size: (f64, f64),
+    /// The size of the page's unit in points (its `UserUnit`): a page in points has 1. A side is
+    /// written at least 1 pt long.
+    pub unit: f64,
     /// The TrimBox and BleedBox, in page space (y down from the top-left corner).
     pub trim: Rect,
     pub bleed: Rect,
@@ -166,7 +269,7 @@ impl Writer {
     /// CMYK (unless the colours are converted to RGB).
     pub(crate) fn new(doc: &Document, set: &crate::PdfSettings, title: &str, created: Option<i64>, cmyk: bool) -> Result<Self, PdfError> {
         let out = ColorOut::new(doc, set)?;
-        let mut warnings = vec![];
+        let mut warnings = out.profile_notes.clone();
         // Tagged CMYK colours need the profile (PDF/A tags every colour).
         let cmyk_profile = if out.tagged { out.cmyk_icc() } else { None };
         if out.tagged && cmyk_profile.is_none() {
@@ -180,12 +283,9 @@ impl Writer {
             Compatibility::Pdf17 => PdfVersion::Pdf17,
             Compatibility::Pdf20 => PdfVersion::Pdf20,
         };
-        let mut cb = ConfigurationBuilder::new().with_version(version);
         // `check` has refused the standards (and standard/version pairs) the writer can't produce.
-        if set.standard == Standard::PdfA2b {
-            cb = cb.with_archival_validator(Archival::A2_B);
-        }
-        let configuration = cb.finish().map_err(|e| PdfError::Write(format!("{e:?}")))?;
+        let archival = (set.standard == Standard::PdfA2b).then_some(Archival::A2_B);
+        let configuration = write::configuration(version, archival)?;
         let settings = krilla::SerializeSettings {
             compress_content_streams: set.compression.compress_text,
             no_device_cs: out.tagged,
@@ -194,43 +294,47 @@ impl Writer {
             ..Default::default()
         };
 
-        let mut pdf = krilla::Document::new_with(settings);
-        let mut meta = Metadata::new().creator("VectorCraft".into()).producer("VectorCraft".into());
-        if !title.is_empty() {
-            meta = meta.title(title.to_string());
-        }
-        // File Info.
+        // File Info normalization stays with the application.
         let info = &doc.metadata;
         let given = |s: &str| Some(s.trim()).filter(|s| !s.is_empty()).map(str::to_string);
-        if let Some(a) = given(&info.author) {
-            meta = meta.authors(vec![a]);
-        }
-        if let Some(d) = given(&info.description) {
-            meta = meta.description(d);
-        }
-        if !info.keywords.is_empty() {
-            meta = meta.keywords(info.keywords.clone());
-        }
-        if let Some(t) = created.map(date_time) {
-            meta = meta.creation_date(t);
-        }
-        pdf.set_metadata(meta);
-        Ok(Self { pdf, cmyk: out.blends_cmyk(cmyk), out: Arc::new(out), lab_spots: vec![], warnings, pdf13: set.pdf13() })
+        let metadata = Metadata {
+            creator: "VectorCraft".into(),
+            producer: "VectorCraft".into(),
+            title: Some(title.to_owned()),
+            authors: given(&info.author).into_iter().collect(),
+            description: given(&info.description),
+            keywords: info.keywords.clone(),
+            created: created.map(date_time),
+        };
+        let pdf = write::Writer::new(settings, metadata);
+        Ok(Self {
+            pdf,
+            cmyk: out.blends_cmyk(cmyk),
+            out: Arc::new(out),
+            lab_spots: vec![],
+            warnings,
+            rgb_in_cmyk: RgbInCmyk::default(),
+            pdf13: set.pdf13(),
+            images: vec![],
+        })
     }
 
     /// Draw one page: the art of `ex`'s document placed as `sheet` says, then its marks.
     pub(crate) fn page(&mut self, ex: &mut Exporter, sheet: &Sheet) -> Result<(), PdfError> {
         let (w, h) = sheet.size;
-        let size = Size::from_wh(w.max(1.0) as f32, h.max(1.0) as f32).ok_or_else(|| PdfError::BadSetting(format!("page size {w} × {h}")))?;
+        let least = 1.0 / sheet.unit;
+        let size = Size::from_wh(w.max(least) as f32, h.max(least) as f32).ok_or_else(|| PdfError::BadSetting(format!("page size {w} × {h}")))?;
         let at = |b: Rect| krilla::geom::Rect::from_ltrb(b.x0 as f32, b.y0 as f32, b.x1 as f32, b.y1 as f32);
-        let mut page = self.pdf.start_page_with(PageSettings::new(size).with_trim_box(at(sheet.trim)).with_bleed_box(at(sheet.bleed)));
+        let mut page = self.pdf.document_mut().start_page_with(PageSettings::new(size).with_trim_box(at(sheet.trim)).with_bleed_box(at(sheet.bleed)));
         let mut s = page.surface();
         let paper = Rect::new(0.0, 0.0, w, h);
         if sheet.negative {
             cover(&mut s, paper, 255, 1.0);
         }
+        // A page whose art or marks would be placed beyond [`MAX_COORD`] is left blank.
+        let fits = writable(&s, sheet.view, Rect::ZERO) && writable(&s, sheet.view * sheet.place, Rect::ZERO);
         s.push_transform(&xf(sheet.view));
-        let window = sheet.window.and_then(|r| to_path(&r.to_path(0.1)));
+        let window = sheet.window.and_then(|r| to_path(&s, &r.to_path(0.1)));
         if let Some(clip) = &window {
             s.push_clip_path(clip, &krilla::paint::FillRule::NonZero);
         }
@@ -239,24 +343,27 @@ impl Writer {
             s.push_transform(&xf(sheet.place));
         }
         let r = sheet.area;
-        let clip = sheet.clip.then(|| to_path(&r.to_path(0.1))).flatten();
+        let clip = sheet.clip.then(|| to_path(&s, &r.to_path(0.1))).flatten();
         if let Some(clip) = &clip {
             s.push_clip_path(clip, &krilla::paint::FillRule::NonZero);
         }
         // Page Isolated Blending / Page Knockout Group: the page content is one group (the PDF
         // writer has no page group attributes; a flat PDF 1.3 file has none). In CMYK, transparency
-        // at the top of a page is put in a non-isolated group of its own, whose blending space
-        // `cmyk_blending` rewrites.
+        // at the top of a page is put in a group of its own, whose blending space `cmyk_blending`
+        // rewrites: non-isolated only when blending on the page reaches the paper, since some
+        // readers (CoreGraphics) drop most of a page in a non-isolated group (#2156).
         let doc = ex.doc;
-        let page_group = !self.pdf13 && (doc.page_isolate || doc.page_knockout);
-        let cmyk_page_group = self.cmyk && !page_group && ex.shows_transparency();
-        if page_group {
+        let page_group = fits && !self.pdf13 && (doc.page_isolate || doc.page_knockout);
+        let cmyk_page_group = fits && self.cmyk && !page_group && ex.shows_transparency();
+        if page_group || (cmyk_page_group && !Node::children_blend(&doc.layers, &mut |c| c.blends_through())) {
             s.push_isolated();
         } else if cmyk_page_group {
             let all = constant_mask(&mut s, r, 1.0);
             s.push_mask(all);
         }
-        ex.children(&mut s, &doc.layers, r);
+        if fits {
+            ex.children(&mut s, &doc.layers, r);
+        }
         if page_group || cmyk_page_group {
             s.pop();
         }
@@ -266,7 +373,7 @@ impl Writer {
         if placed {
             s.pop();
         }
-        if let Some(art) = sheet.marks {
+        if fits && let Some(art) = sheet.marks {
             // The drawing space the page shows (the marks' area).
             let shown = sheet.view.inverse().transform_rect_bbox(paper);
             let knockout = std::mem::replace(&mut ex.knockout, false);
@@ -291,25 +398,41 @@ impl Writer {
         Ok(())
     }
 
-    /// Take an exporter's warnings and Lab spot colours once its pages are drawn.
+    /// Take an exporter's warnings, Lab spot colours and images once its pages are drawn.
     pub(crate) fn absorb(&mut self, ex: Exporter) {
         for w in ex.warnings {
             if !self.warnings.contains(&w) {
                 self.warnings.push(w);
             }
         }
+        self.rgb_in_cmyk.merge(ex.rgb_in_cmyk);
         for spot in ex.lab_spots {
             if !self.lab_spots.iter().any(|(n, _)| *n == spot.0) {
                 self.lab_spots.push(spot);
+            }
+        }
+        // The exporter caches images by their key, followed by their size and mask after a NUL.
+        for (cache, image) in ex.images {
+            if let (Some(key), Some(image)) = (cache.split('\0').next(), image) {
+                self.images.push((key.to_string(), image));
             }
         }
     }
 
     /// The finished file (with the output intent and Trapped entries, and checked against its
     /// standard) and the warnings of its drawing. PDF/X-1a spot colours keep their CMYK
-    /// alternates.
-    pub(crate) fn finish(mut self) -> Result<(Vec<u8>, Vec<String>), PdfError> {
-        let mut bytes = self.pdf.finish().map_err(|e| PdfError::Write(format!("{e:?}")))?;
+    /// alternates. When the writer couldn't decode one of the images, its key is added to
+    /// `left_out` ([`leaving_out_undecodable`]) and the writer's error is returned.
+    pub(crate) fn finish(mut self, left_out: &mut HashSet<String>) -> Result<(Vec<u8>, Vec<String>), PdfError> {
+        let images = std::mem::take(&mut self.images);
+        let mut bytes = self.pdf.finish().map_err(|e| {
+            if let write::WriteError::Serialization(k) = &e
+                && let krilla::error::KrillaError::Image(failed, ..) = &**k
+            {
+                left_out.extend(images.iter().filter(|(_, image)| image == failed).map(|(key, _)| key.clone()));
+            }
+            PdfError::from(e)
+        })?;
         if self.cmyk {
             cmyk_blending(&mut bytes, self.out.tagged);
         }
@@ -317,6 +440,7 @@ impl Writer {
         let bytes = if lab { crate::lab_spot::lab_alternates(bytes, &self.lab_spots) } else { bytes };
         let (bytes, more) = self.out.write_catalog(bytes)?;
         self.warnings.extend(more);
+        self.warnings.extend(self.rgb_in_cmyk.warning());
         Ok((crate::pdfx::finish(bytes, self.out.standard, self.pdf13)?, self.warnings))
     }
 }
@@ -428,6 +552,11 @@ fn date_time(t: i64) -> krilla::metadata::DateTime {
 
 pub(crate) struct Exporter<'a> {
     doc: &'a Document,
+    /// The art boxes of `doc`'s symbols, which the walk measures symbol instances by when it
+    /// leaves out objects outside the page ([`SymbolBoxes::quick`]). The box of an instance whose
+    /// art holds brushed strokes grows by as far as their brush art can paint
+    /// ([`SymbolBoxes::with_brush_art`]).
+    symbols: SymbolBoxes<'a>,
     warnings: Vec<String>,
     images: HashMap<String, Option<Image>>,
     /// The brush library, parsed when the first brushed stroke is written.
@@ -450,6 +579,8 @@ pub(crate) struct Exporter<'a> {
     pub out: Arc<ColorOut>,
     /// Colours are converted to the destination (printer's marks aren't).
     convert: bool,
+    /// RGB colours and images of a CMYK document drawn so far.
+    rgb_in_cmyk: RgbInCmyk,
     /// Text as glyph outlines; else the characters' fills are real text in embedded fonts.
     outline_text: bool,
     /// The fonts real text is written in, by face id, with their units per em; `None` for faces
@@ -466,13 +597,22 @@ pub(crate) struct Exporter<'a> {
     pub overprint: bool,
     /// An overprinting fill or stroke was drawn so.
     pub overprinted: bool,
+    /// Characters with neither fill nor stroke were written as text in forms marked invisible.
+    pub invisible: bool,
     /// Inline graphics being drawn inside inline graphics (text in a symbol shown inline in
     /// text…): deeper ones are left out.
     inline_depth: u32,
+    /// Keys of the images left out because the writer couldn't decode them
+    /// ([`leaving_out_undecodable`]).
+    pub left_out: HashSet<String>,
 }
 
 /// How deep inline graphics nest before they are left out.
 const MAX_INLINE_DEPTH: u32 = 4;
+
+/// The warning for an image left out because it can't be decoded: the note raster exports give
+/// (`vectorcraft-engine`'s `rasterfx::undecoded_warning`).
+const UNDECODED: &str = "an image couldn't be decoded and is missing from the picture";
 
 impl<'a> Exporter<'a> {
     /// An exporter of `doc` writing images as `set` says; layers whose Print option is off are
@@ -480,6 +620,7 @@ impl<'a> Exporter<'a> {
     pub(crate) fn new(doc: &'a Document, set: &'a crate::PdfSettings) -> Self {
         Self {
             doc,
+            symbols: doc.symbol_boxes().quick().with_brush_art(),
             warnings: vec![],
             images: HashMap::new(),
             brushes: None,
@@ -492,6 +633,7 @@ impl<'a> Exporter<'a> {
             transparent: None,
             out: Arc::default(),
             convert: true,
+            rgb_in_cmyk: RgbInCmyk::default(),
             outline_text: set.advanced.outline_text,
             fonts: HashMap::new(),
             layers: false,
@@ -499,7 +641,9 @@ impl<'a> Exporter<'a> {
             in_layer: 0,
             overprint: false,
             overprinted: false,
+            invisible: false,
             inline_depth: 0,
+            left_out: HashSet::new(),
         }
     }
 
@@ -525,12 +669,43 @@ struct GlyphLine {
 /// Most pixels along a side of a freeform gradient's image (its colour field is smooth).
 const MAX_FIELD_PX: f64 = 512.0;
 
+/// The largest magnitude a coordinate, length or transform entry may have in the content stream it
+/// is drawn into (for glyph spacing, in thousandths of an em). Art that would go beyond it is left
+/// out. A PDF/A-2 file may hold only integers from -2,147,483,648 to 2,147,483,647 (ISO 19005-2,
+/// 6.1.13). The PDF writer writes a whole number in the `i32` range as an integer, and in builds
+/// with overflow checks it panics on -2,147,483,648.
+const MAX_COORD: f64 = 1e9;
+
 fn xf(a: Affine) -> Transform {
     let c = a.as_coeffs();
     Transform::from_row(c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32, c[4] as f32, c[5] as f32)
 }
 
-fn to_path(bp: &BezPath) -> Option<Path> {
+/// The current transform of surface `s` in the content stream it draws into, without that stream's
+/// root transform (a page's y flip).
+fn ctm(s: &Surface) -> Affine {
+    let t = s.ctm();
+    Affine::new([t.sx(), t.ky(), t.kx(), t.sy(), t.tx(), t.ty()].map(f64::from))
+}
+
+/// Are `values` finite and within [`MAX_COORD`]?
+fn in_range(values: &[f64]) -> bool {
+    values.iter().all(|v| v.is_finite() && v.abs() <= MAX_COORD)
+}
+
+/// Can art spanning `b`, in the space `space` maps into the one `s` draws in, be written: `b`, the
+/// transform of `s` followed by `space`, and `b` through that transform all within [`MAX_COORD`]?
+fn writable(s: &Surface, space: Affine, b: Rect) -> bool {
+    let t = ctm(s) * space;
+    let to = t.transform_rect_bbox(b);
+    in_range(&t.as_coeffs()) && in_range(&[b.x0, b.y0, b.x1, b.y1, to.x0, to.y0, to.x1, to.y1])
+}
+
+/// `bp` as a path to draw on `s`; `None` when it is empty or reaches beyond [`MAX_COORD`] there.
+fn to_path(s: &Surface, bp: &BezPath) -> Option<Path> {
+    if !writable(s, Affine::IDENTITY, bp.control_box()) {
+        return None;
+    }
     let mut pb = PathBuilder::new();
     for el in bp.elements() {
         match *el {
@@ -597,7 +772,7 @@ fn color(c: &Color) -> krilla::color::Color {
 /// Fill the page (with a margin) with a grey level (0 = black, 255 = white) at `opacity`: mask
 /// backdrops.
 fn cover(s: &mut Surface, page: Rect, level: u8, opacity: f32) {
-    let Some(p) = to_path(&page.inflate(1.0, 1.0).to_path(0.1)) else { return };
+    let Some(p) = to_path(s, &page.inflate(1.0, 1.0).to_path(0.1)) else { return };
     s.set_stroke(None);
     s.set_fill(Some(Fill { paint: rgb::Color::new(level, level, level).into(), opacity: norm(opacity), rule: krilla::paint::FillRule::NonZero }));
     s.draw_path(&p);
@@ -605,10 +780,11 @@ fn cover(s: &mut Surface, page: Rect, level: u8, opacity: f32) {
 
 /// An alpha mask of constant `alpha` over the page. A group drawn through it is a transparency
 /// group of that opacity that, unlike the writer's opacity groups, is not isolated.
+/// The cover is white, so a reader that takes every soft mask as a luminosity mask shows the same.
 fn constant_mask(s: &mut Surface, page: Rect, alpha: f32) -> krilla::mask::Mask {
     let mut sb = s.stream_builder();
     let mut ms = sb.surface();
-    cover(&mut ms, page, 0, alpha);
+    cover(&mut ms, page, 255, alpha);
     ms.finish();
     krilla::mask::Mask::new(sb.finish(), krilla::mask::MaskType::Alpha)
 }
@@ -625,9 +801,12 @@ fn rects_overlap(a: Rect, b: Rect) -> bool {
 impl Exporter<'_> {
     /// A colour for the page, as the Output settings write it ([`ColorOut::color`]): without
     /// conversion, RGB and Lab colours of CMYK documents are separated into CMYK through the
-    /// active colour settings, so the file carries press values.
+    /// document's colour spaces, so the file carries press values.
     fn col(&mut self, c: &Color) -> krilla::color::Color {
         let cmyk_doc = self.doc.color_mode == vectorcraft_doc::ColorMode::Cmyk;
+        if let (true, true, Color::Rgb { r, g, b }) = (cmyk_doc, self.convert, c) {
+            self.rgb_in_cmyk.colours.insert([r.to_bits(), g.to_bits(), b.to_bits()]);
+        }
         let c = self.out.color(c, self.intent, cmyk_doc, self.convert);
         if let (Color::Rgb { .. }, Some(note)) = (c, &self.out.srgb_note) {
             let note = note.clone();
@@ -717,14 +896,15 @@ impl Exporter<'_> {
         }
     }
 
-    /// Convert a paint. `bounds` resolves unset gradient geometry (like the renderer).
-    fn paint(&mut self, p: &Paint, bounds: Rect) -> Option<krilla::paint::Paint> {
-        self.paint_in(p, bounds, Affine::IDENTITY)
+    /// Convert a paint to draw on `s`. `bounds` resolves unset gradient geometry (like the
+    /// renderer). A gradient placed beyond [`MAX_COORD`] there gives no paint.
+    fn paint(&mut self, s: &Surface, p: &Paint, bounds: Rect) -> Option<krilla::paint::Paint> {
+        self.paint_in(s, p, bounds, Affine::IDENTITY)
     }
 
     /// [`Self::paint`] drawn in another space: `space` maps the paint's space (where `bounds`
     /// is) to the one drawn in.
-    fn paint_in(&mut self, p: &Paint, bounds: Rect, space: Affine) -> Option<krilla::paint::Paint> {
+    fn paint_in(&mut self, s: &Surface, p: &Paint, bounds: Rect, space: Affine) -> Option<krilla::paint::Paint> {
         match p {
             Paint::None => None,
             Paint::Solid { color: c, swatch, tint } => Some(self.solid(c, swatch.as_deref(), *tint).into()),
@@ -760,6 +940,9 @@ impl Exporter<'_> {
                 }
                 match g.gradient.kind {
                     GradientKind::Linear => {
+                        if !writable(s, space, Rect::from_points(geom.start, geom.end)) {
+                            return None;
+                        }
                         let (s, mut e) = (geom.start, geom.end);
                         if s.distance(e) < 1e-9 {
                             e = s + Vec2::new(1.0, 0.0);
@@ -784,6 +967,10 @@ impl Exporter<'_> {
                         let (cx, cy) = (geom.start.x as f32, geom.start.y as f32);
                         // An off-centre focal point: a two-point radial shading from it.
                         let f = t.inverse() * geom.focal_point();
+                        let circles = Rect::from_center_size(geom.start, (2.0 * f64::from(r), 2.0 * f64::from(r))).union_pt(f);
+                        if !writable(s, space * t, circles) {
+                            return None;
+                        }
                         Some(
                             RadialGradient {
                                 fx: f.x as f32,
@@ -863,7 +1050,7 @@ impl Exporter<'_> {
         self.warn("knockout groups are written as soft-masked groups (same look, but not editable as knockout groups)");
         let elements: Vec<_> = Node::knockout_elements(children)
             .into_iter()
-            .filter(|c| c.visual_bounds().is_some_and(|b| rects_overlap(b.inflate(1.0, 1.0), page)))
+            .filter(|c| c.visual_bounds_with(&self.symbols).is_some_and(|b| rects_overlap(b.inflate(1.0, 1.0), page)))
             .collect();
         let Some((first, rest)) = elements.split_first() else { return };
         for c in rest.iter().rev() {
@@ -880,7 +1067,13 @@ impl Exporter<'_> {
     /// A luminosity mask that is 1 − the knockout shape of `c`: white, then black through an alpha
     /// mask of `c` (at full object opacity without its own mask, unless those define its shape).
     fn knockout_mask(&mut self, s: &mut Surface, c: &Node, page: Rect) -> krilla::mask::Mask {
-        let shape = if c.knockout_shape { c.clone() } else { Node { opacity: 1.0, mask: None, ..c.clone() } };
+        let shape = if c.knockout_shape {
+            c.clone()
+        } else {
+            let mut s = c.clone().with_mask(None);
+            s.opacity = 1.0;
+            s
+        };
         let mut sb = s.stream_builder();
         let mut ms = sb.surface();
         cover(&mut ms, page, 255, 1.0);
@@ -921,7 +1114,7 @@ impl Exporter<'_> {
         {
             return;
         }
-        match n.visual_bounds() {
+        match n.visual_bounds_with(&self.symbols) {
             Some(b) if !force && !rects_overlap(b.inflate(1.0, 1.0), page) => return,
             None if !n.is_container() => return,
             _ => {}
@@ -948,8 +1141,13 @@ impl Exporter<'_> {
             }
             pushes += 1;
         }
-        if let Some(m) = n.mask.as_deref()
-            && !m.disabled
+        let mask = n.extras().mask.as_deref().filter(|m| !m.disabled);
+        let alpha = match (&n.kind, mask) {
+            (NodeKind::Image(im), Some(m)) => self.masked_image(im, m),
+            _ => None,
+        };
+        if let Some(m) = mask
+            && alpha.is_none()
         {
             let mask = self.soft_mask(s, m, page);
             s.push_mask(mask);
@@ -961,7 +1159,7 @@ impl Exporter<'_> {
                 // The region every output clips to; nothing to clip by hides the clipped art. The
                 // clipping path's fill paints behind the clipped art and its stroke over it, unclipped.
                 if let Some((clip, rest)) = children.split_first()
-                    && let Some((p, r)) = vectorcraft_effects::clip_outline(clip).and_then(|(bp, r)| to_path(&bp).map(|p| (p, r)))
+                    && let Some((p, r)) = vectorcraft_effects::clip_outline(clip).and_then(|(bp, r)| to_path(s, &bp).map(|p| (p, r)))
                 {
                     let paint = clip.clip_paint();
                     s.push_clip_path(&p, &rule(r));
@@ -990,7 +1188,7 @@ impl Exporter<'_> {
                 self.shape(s, n, &bp, *rule, page);
             }
             NodeKind::Text(t) => self.text(s, n, t, page),
-            NodeKind::Image(im) => self.image(s, im),
+            NodeKind::Image(im) => self.image(s, im, alpha),
             NodeKind::SymbolInstance { symbol, xf } => {
                 if let Some(sym) = self.doc.symbols.iter().find(|x| &x.name == symbol) {
                     let mut art = (*sym.art).clone();
@@ -999,7 +1197,12 @@ impl Exporter<'_> {
                 }
             }
             // Live blends/envelopes/meshes export their evaluated (expanded) form.
-            NodeKind::Blend { .. } | NodeKind::Envelope { .. } | NodeKind::Mesh(_) | NodeKind::Repeat(_) | NodeKind::PlacedDocument(_) => {
+            NodeKind::Blend { .. }
+            | NodeKind::Envelope { .. }
+            | NodeKind::Mesh(_)
+            | NodeKind::Repeat(_)
+            | NodeKind::PlacedDocument(_)
+            | NodeKind::Intertwine { .. } => {
                 let g = vectorcraft_effects::expand_live_deep(Some(self.doc), n);
                 for c in g.children().into_iter().flatten() {
                     self.node(s, c, page, false);
@@ -1013,7 +1216,7 @@ impl Exporter<'_> {
     }
 
     fn shape(&mut self, s: &mut Surface, n: &Node, bp: &BezPath, r: FillRule, page: Rect) {
-        let Some(path) = to_path(bp) else { return };
+        let Some(path) = to_path(s, bp) else { return };
         let bounds = bp.bounding_box();
         for item in &n.appearance.items {
             match item {
@@ -1026,7 +1229,7 @@ impl Exporter<'_> {
                         if ex.area(s, &path, rule(r), &fl.paint, (fl.opacity, fl.blend), bounds, bounds) {
                             return;
                         }
-                        let Some(paint) = ex.paint(&fl.paint, bounds) else { return };
+                        let Some(paint) = ex.paint(s, &fl.paint, bounds) else { return };
                         let bl = fl.blend != BlendMode::Normal;
                         if bl {
                             s.push_blend_mode(blend(fl.blend));
@@ -1159,14 +1362,18 @@ impl Exporter<'_> {
             // The area the stroke paints (dashes, caps, joins, profile, arrowheads, alignment), as
             // Outline Stroke makes it, painted with the pattern's tiles or the freeform's image.
             let region = stroke::outline_region(&vectorcraft_geom::PathData::from_bezpath(bp), r, st).to_bezpath();
-            if let Some(clip) = to_path(&region) {
+            if let Some(clip) = to_path(s, &region) {
                 let area = region.bounding_box();
                 self.area(s, &clip, krilla::paint::FillRule::NonZero, &st.paint, (st.opacity, st.blend), st.paint_bounds(bounds), area);
             }
             return;
         }
-        let Some(paint) = self.paint(&st.paint, st.paint_bounds(bounds)) else { return };
+        let Some(paint) = self.paint(s, &st.paint, st.paint_bounds(bounds)) else { return };
         let w = stroke::for_writer(bp, st);
+        // A stroke whose width, caps or miter spikes reach beyond [`MAX_COORD`] is left out.
+        if !writable(s, Affine::IDENTITY, w.reach(st, bp.control_box()).inflate(1.0, 1.0)) {
+            return;
+        }
         let mut pushes = 0;
         if st.blend != BlendMode::Normal {
             s.push_blend_mode(blend(st.blend));
@@ -1182,7 +1389,7 @@ impl Exporter<'_> {
                 // (miter spikes included) plus the path, even-odd.
                 let mut outside = w.reach(st, bounds).inflate(1.0, 1.0).to_path(0.1);
                 outside.extend(bp.iter());
-                if let Some(p) = to_path(&outside) {
+                if let Some(p) = to_path(s, &outside) {
                     s.push_clip_path(&p, &krilla::paint::FillRule::EvenOdd);
                     pushes += 1;
                 }
@@ -1196,7 +1403,11 @@ impl Exporter<'_> {
                     if pat.len() % 2 == 1 {
                         pat.extend(pat.clone());
                     }
-                    StrokeDash { array: pat, offset: d.offset as f32 }
+                    // An offset beyond [`MAX_COORD`] is written as its remainder after whole
+                    // periods of the pattern.
+                    let period: f64 = pat.iter().copied().map(f64::from).sum();
+                    let offset = if in_range(&[d.offset]) { d.offset } else { d.offset.rem_euclid(period) };
+                    StrokeDash { array: pat, offset: if offset.is_finite() { offset as f32 } else { 0.0 } }
                 });
                 s.set_fill(None);
                 s.set_stroke(Some(Stroke {
@@ -1223,7 +1434,7 @@ impl Exporter<'_> {
                 // A gradient along or across the stroke: slices clipped to its outlines, under
                 // the stroke's opacity as a group.
                 if let Some(ws) = stroke::written_slices(bp, r, st, outlines)
-                    && let Some(clip) = to_path(&ws.clip)
+                    && let Some(clip) = to_path(s, &ws.clip)
                 {
                     self.warn("gradients along or across strokes are exported as slices of linear gradients");
                     if st.opacity < 1.0 {
@@ -1234,7 +1445,7 @@ impl Exporter<'_> {
                     s.set_stroke(None);
                     for (shape, paint) in &ws.slices {
                         let b = shape.bounding_box();
-                        if let (Some(paint), Some(p)) = (self.paint(paint, b), to_path(shape)) {
+                        if let (Some(paint), Some(p)) = (self.paint(s, paint, b), to_path(s, shape)) {
                             s.set_fill(Some(Fill { paint, opacity: NormalizedF32::ONE, rule: krilla::paint::FillRule::NonZero }));
                             s.draw_path(&p);
                         }
@@ -1253,8 +1464,10 @@ impl Exporter<'_> {
                 let opacity = if grouped { NormalizedF32::ONE } else { norm(st.opacity) };
                 s.set_stroke(None);
                 s.set_fill(Some(Fill { paint, opacity, rule: krilla::paint::FillRule::NonZero }));
-                for p in outlines.iter().filter_map(to_path) {
-                    s.draw_path(&p);
+                for outline in outlines {
+                    if let Some(p) = to_path(s, outline) {
+                        s.draw_path(&p);
+                    }
                 }
                 s.set_fill(None);
             }
@@ -1270,7 +1483,7 @@ impl Exporter<'_> {
         let doc = self.doc;
         let brushes = self.brushes.get_or_insert_with(|| vectorcraft_brush::library(doc));
         let Some(b) = st.brush.as_deref().and_then(|name| brushes.iter().find(|b| b.name == name)) else { return false };
-        let art = vectorcraft_brush::stroke_pieces(b, bp, st);
+        let art = vectorcraft_brush::stroke_pieces(doc, b, bp, st);
         let mut pushes = 0;
         if st.blend != BlendMode::Normal {
             s.push_blend_mode(blend(st.blend));
@@ -1308,14 +1521,16 @@ impl Exporter<'_> {
                 all.extend(bar.iter());
             }
             all.apply_affine(t.xf);
-            to_path(&all).map(|p| (all, p))
+            to_path(s, &all).map(|p| (all, p))
         });
         let all = all.flatten();
         if let Some((bp, path)) = &all {
             self.text_items(s, below, bp, path, page, tb);
         }
-        s.push_transform(&xf(t.xf));
-        // Real text: the characters' fills as text in embedded fonts.
+        // Real text: the characters' fills as text in embedded fonts. The type's transform is
+        // pushed for each fill and stroke of the characters, inside its form when the fill or
+        // stroke overprints.
+        let text_space = xf(t.xf);
         let plain = (!self.outline_text).then(|| t.plain_text());
         let bars = vectorcraft_text::decorations(&layout, vectorcraft_text::FontDb::global(), t);
         for (i, run) in t.runs.iter().enumerate() {
@@ -1331,6 +1546,7 @@ impl Exporter<'_> {
             bp.extend(run_bars.iter());
             let fill = &run.style.fill;
             self.overprinting(s, run.style.overprint_fill, fill, |ex, s| {
+                s.push_transform(&text_space);
                 // The outlines left to fill as paths: all of them, or those real text leaves.
                 let outlines = match plain.as_deref().filter(|_| !fill.is_none() && !ex.area_paint(fill)) {
                     Some(text) => {
@@ -1341,26 +1557,43 @@ impl Exporter<'_> {
                     None => Cow::Borrowed(&bp),
                 };
                 let opaque = (1.0, BlendMode::Normal);
-                if let Some(path) = to_path(&outlines)
+                if let Some(path) = to_path(s, &outlines)
                     && !ex.area(s, &path, krilla::paint::FillRule::NonZero, fill, opaque, layout.bounds, outlines.bounding_box())
-                    && let Some(paint) = ex.paint(fill, layout.bounds)
+                    && let Some(paint) = ex.paint(s, fill, layout.bounds)
                 {
                     s.set_stroke(None);
                     s.set_fill(Some(Fill { paint, opacity: NormalizedF32::ONE, rule: krilla::paint::FillRule::NonZero }));
                     s.draw_path(&path);
                 }
+                s.pop();
             });
-            if run.style.has_stroke()
-                && let Some(path) = to_path(&bp)
-            {
+            // Characters with neither fill nor stroke (a scanned page's recognized text) are still
+            // text: written invisible (rendering mode 3), so they can still be selected and searched.
+            if let Some(text) = plain.as_deref().filter(|_| fill.is_none() && !run.style.has_stroke()) {
+                self.invisible = true;
+                crate::forms::form(s, Mark::Invisible, |s| {
+                    s.push_transform(&text_space);
+                    // The paint only lets the writer write the text; the glyphs it can't write
+                    // as text draw nothing.
+                    self.glyph_text(s, &layout, i, text, &Paint::solid(Color::gray(0.0)));
+                    s.pop();
+                });
+            }
+            s.push_transform(&text_space);
+            let path = run.style.has_stroke().then(|| to_path(s, &bp)).flatten();
+            s.pop();
+            if let Some(path) = path {
                 // Character strokes are drawn in text space, with their cap, join and dashes.
                 let st = run.style.stroke_layer();
-                self.overprinting(s, st.overprint, &st.paint, |ex, s| ex.stroke(s, &bp, &path, FillRule::NonZero, &st, page, layout.bounds));
+                self.overprinting(s, st.overprint, &st.paint, |ex, s| {
+                    s.push_transform(&text_space);
+                    ex.stroke(s, &bp, &path, FillRule::NonZero, &st, page, layout.bounds);
+                    s.pop();
+                });
             }
         }
         s.set_fill(None);
         s.set_stroke(None);
-        s.pop();
         if self.inline_depth < MAX_INLINE_DEPTH {
             self.inline_depth += 1;
             for ig in &layout.inlines {
@@ -1386,7 +1619,7 @@ impl Exporter<'_> {
             match item {
                 AppearanceItem::Fill(fl) if fl.visible => self.overprinting(s, fl.overprint, &fl.paint, |ex, s| {
                     if !ex.area(s, path, krilla::paint::FillRule::NonZero, &fl.paint, (fl.opacity, fl.blend), tb, bp.bounding_box())
-                        && let Some(paint) = ex.paint(&fl.paint, tb)
+                        && let Some(paint) = ex.paint(s, &fl.paint, tb)
                     {
                         s.set_stroke(None);
                         s.set_fill(Some(Fill { paint, opacity: norm(fl.opacity), rule: krilla::paint::FillRule::NonZero }));
@@ -1461,9 +1694,9 @@ impl Exporter<'_> {
     }
 
     /// Draw glyphs `line` (of `text`), filled with `fill` (whose space is text space, where
-    /// `bounds` is).
+    /// `bounds` is). A line that would be written with a pen position, size or spacing (in
+    /// thousandths of an em) beyond [`MAX_COORD`] is left out.
     fn draw_glyph_line(&mut self, s: &mut Surface, line: GlyphLine, text: &str, fill: &Paint, bounds: Rect) {
-        let Some(paint) = self.paint_in(fill, bounds, line.frame.inverse()) else { return };
         let size = line.size;
         let glyphs: Vec<KrillaGlyph> = line
             .glyphs
@@ -1474,10 +1707,18 @@ impl Exporter<'_> {
                 KrillaGlyph::new(GlyphId::new(*gid), ((next - x) / size) as f32, 0.0, 0.0, 0.0, range.clone(), None)
             })
             .collect();
+        let pens =
+            line.glyphs.iter().fold(Rect::new(0.0, -size, 0.0, size), |r, (_, x, advance, _)| r.union_pt((*x, 0.0)).union_pt((x + advance, 0.0)));
+        let spacing: Vec<f64> = glyphs.iter().map(|g| f64::from(g.x_advance(1.0)) * 1000.0).collect();
+        if !(writable(s, line.frame, pens) && in_range(&spacing)) {
+            return;
+        }
         s.push_transform(&xf(line.frame));
-        s.set_stroke(None);
-        s.set_fill(Some(Fill { paint, opacity: NormalizedF32::ONE, rule: krilla::paint::FillRule::NonZero }));
-        s.draw_glyphs(krilla::geom::Point::from_xy(0.0, 0.0), &glyphs, line.font, text, size as f32, false);
+        if let Some(paint) = self.paint_in(s, fill, bounds, line.frame.inverse()) {
+            s.set_stroke(None);
+            s.set_fill(Some(Fill { paint, opacity: NormalizedF32::ONE, rule: krilla::paint::FillRule::NonZero }));
+            s.draw_glyphs(krilla::geom::Point::from_xy(0.0, 0.0), &glyphs, line.font, text, size as f32, false);
+        }
         s.pop();
     }
 
@@ -1496,13 +1737,13 @@ impl Exporter<'_> {
             Embedding::Subset => {
                 // A named instance of a variable font is embedded instanced (its own outlines and
                 // widths, not the default instance's).
-                let coords: Vec<(krilla::text::Tag, f32)> = face.variations().iter().map(|(t, v)| (krilla::text::Tag::new(t), *v)).collect();
-                let font =
-                    krilla::text::Font::new_variable(face.file_data().to_vec().into(), face.face_index(), &coords).map(|f| (f, face.units_per_em()));
-                if font.is_none() {
-                    self.warn(format!("the font “{name}” can't be embedded: its text is exported as outlines"));
+                match write::font(face.file_data(), face.face_index(), Some(face.variations())) {
+                    Ok(font) => Some((font, face.units_per_em())),
+                    Err(error) => {
+                        self.warn(format!("the font “{name}” can't be embedded ({error}): its text is exported as outlines"));
+                        None
+                    }
                 }
-                font
             }
             Embedding::Whole => {
                 self.warn(format!(
@@ -1521,7 +1762,8 @@ impl Exporter<'_> {
 
     /// Image `key` placed `size` points wide and high, resampled and compressed as the Compression
     /// settings say ([`crate::images::recode`], [`crate::images::recode_cmyk`] for CMYK images);
-    /// cached by key (and size when images are resampled).
+    /// cached by key (and size when images are resampled). `None`, with [`UNDECODED`] among the
+    /// warnings, for an image that is missing, can't be decoded or is in [`Self::left_out`].
     fn load_image(&mut self, key: &str, size: (f64, f64)) -> Option<Image> {
         let c = self.compression;
         let sized = [c.color.downsample, c.gray.downsample, c.mono.downsample].iter().any(|d| *d != crate::Downsample::None);
@@ -1532,9 +1774,13 @@ impl Exporter<'_> {
         let interpolate = self.interpolate;
         let doc = self.doc;
         let out = self.out.clone();
-        let img = doc.images.get(key).and_then(|blob| {
-            let r = if blob.is_cmyk() {
-                crate::images::recode_cmyk(blob, size, c, interpolate, out.cmyk_pixels())
+        let img = doc.images.get(key).filter(|_| !self.left_out.contains(key)).and_then(|blob| {
+            let cmyk_image = blob.is_cmyk();
+            if !cmyk_image && self.convert && doc.color_mode == vectorcraft_doc::ColorMode::Cmyk {
+                self.rgb_in_cmyk.images.insert(key.to_string());
+            }
+            let r = if cmyk_image {
+                crate::images::recode_cmyk(blob, size, c, interpolate, out.cmyk_pixels(), None)
             } else {
                 crate::images::recode(&blob.bytes, size, c, interpolate, out.pixels())
             };
@@ -1544,22 +1790,61 @@ impl Exporter<'_> {
             r.image.or_else(|| embed(blob, interpolate))
         });
         if img.is_none() {
-            self.warn(format!("image '{key}' could not be decoded and was skipped"));
+            self.warn(UNDECODED);
         }
         self.images.insert(cache, img.clone());
         img
     }
 
-    fn image(&mut self, s: &mut Surface, im: &vectorcraft_doc::ImageObject) {
-        // The size it is placed at: its pixel grid's sides through its transform.
-        let [a, b, c, d, ..] = im.xf.as_coeffs();
-        let size = (im.width as f64 * a.hypot(b), im.height as f64 * c.hypot(d));
-        let Some(img) = self.load_image(&im.key, size) else { return };
+    /// CMYK image `im` with the alpha of its opacity mask `m`, when the mask is a greyscale image
+    /// on the image's own pixel grid (an image's soft mask as it opens): the alpha is written as the
+    /// image's soft mask, as an RGBA image's is, rather than as a luminosity soft mask over it,
+    /// through which CoreGraphics draws CMYK images on black boxes (#2159). `None` for other
+    /// images and masks; cached like [`Self::load_image`].
+    fn masked_image(&mut self, im: &vectorcraft_doc::ImageObject, m: &vectorcraft_doc::OpacityMask) -> Option<Image> {
+        let art = &m.art;
+        let NodeKind::Image(mi) = &art.kind else { return None };
+        let plain =
+            art.opacity >= 1.0 && art.blend == BlendMode::Normal && art.extras().mask.is_none() && !art.appearance.effects.iter().any(|e| e.visible);
+        if m.invert || !plain || (mi.xf, mi.width, mi.height) != (im.xf, im.width, im.height) {
+            return None;
+        }
+        let size = placed_size(im);
+        let cache = format!("{}\u{0}{}\u{0}{}\u{0}{:.3}x{:.3}", im.key, mi.key, m.clip, size.0, size.1);
+        if let Some(i) = self.images.get(&cache) {
+            return i.clone();
+        }
+        let doc = self.doc;
+        let img = doc.images.get(&im.key).filter(|b| b.is_cmyk()).and_then(|blob| {
+            let alpha = crate::images::mask_alpha(doc.images.get(&mi.key)?, im.width, im.height, m.clip)?;
+            let r = crate::images::recode_cmyk(blob, size, self.compression, self.interpolate, self.out.cmyk_pixels(), Some(alpha));
+            if let (Some(w), Some(_)) = (r.warning, &r.image) {
+                self.warn(w);
+            }
+            r.image
+        });
+        self.images.insert(cache, img.clone());
+        img
+    }
+
+    /// Draw image `im`: `img` when given (its pixels already written), else as it is loaded.
+    fn image(&mut self, s: &mut Surface, im: &vectorcraft_doc::ImageObject, img: Option<Image>) {
+        // An image placed or sized beyond [`MAX_COORD`] is left out.
+        if !writable(s, im.xf, Rect::new(0.0, 0.0, im.width.max(1).into(), im.height.max(1).into())) {
+            return;
+        }
+        let Some(img) = img.or_else(|| self.load_image(&im.key, placed_size(im))) else { return };
         let Some(size) = Size::from_wh(im.width.max(1) as f32, im.height.max(1) as f32) else { return };
         s.push_transform(&xf(im.xf));
         s.draw_image(img, size);
         s.pop();
     }
+}
+
+/// The size image `im` is placed at: its pixel grid's sides through its transform.
+fn placed_size(im: &vectorcraft_doc::ImageObject) -> (f64, f64) {
+    let [a, b, c, d, ..] = im.xf.as_coeffs();
+    (im.width as f64 * a.hypot(b), im.height as f64 * c.hypot(d))
 }
 
 /// Image `blob` as it is: PNG, JPEG, GIF and WebP through the PDF writer (JPEG data unchanged),
@@ -1578,4 +1863,30 @@ fn embed(blob: &vectorcraft_doc::ImageBlob, interpolate: bool) -> Option<Image> 
         let (w, h) = rgba.dimensions();
         Some(Image::from_rgba8(rgba.into_raw(), w, h))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writable_bounds_values_the_transform_and_values_through_it() {
+        let mut pdf = krilla::Document::new();
+        let mut page = pdf.start_page_with(PageSettings::new(Size::from_wh(100.0, 100.0).unwrap()));
+        let mut s = page.surface();
+        let r = Rect::new(0.0, 0.0, 10.0, 10.0);
+        assert!(writable(&s, Affine::IDENTITY, r));
+        assert!(!writable(&s, Affine::IDENTITY, Rect::new(-2_147_483_649.0, 0.0, 10.0, 10.0)));
+        assert!(!writable(&s, Affine::IDENTITY, Rect::new(f64::NAN, 0.0, 10.0, 10.0)));
+        assert!(!writable(&s, Affine::translate((0.0, 2e9)), r));
+        assert!(!writable(&s, Affine::scale(2e9), Rect::ZERO));
+        // `writable` also checks the surface's own transform: with the surface moved to
+        // x = MAX_COORD, a point at the origin fits and a 10 by 10 box does not.
+        s.push_transform(&xf(Affine::translate((MAX_COORD, 0.0))));
+        assert!(writable(&s, Affine::IDENTITY, Rect::ZERO));
+        assert!(!writable(&s, Affine::IDENTITY, r));
+        s.pop();
+        s.finish();
+        page.finish();
+    }
 }

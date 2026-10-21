@@ -84,14 +84,27 @@ const SAMPLES_PER_FRAME: usize = 4;
 const MAX_PENDING: usize = 8;
 /// What a sample shows when the font lacks the selected text's characters (or there is none).
 const FALLBACK_SAMPLE: &str = "Sample";
-/// The script filter's choices: all, Japanese, Latin.
-const SCRIPTS: usize = 3;
+/// The script filter's choices: all, Japanese, Latin, Thai.
+const SCRIPTS: usize = 4;
 
 fn script_label(i: usize) -> &'static str {
     match i {
-        1 => tl!("Japanese"),
+        // CJK families use the `japanese` font trait; Chinese UI calls this 汉字 (#2206).
+        1 => crate::i18n::tr_ctx(crate::i18n::current(), "font-script", "Japanese"),
         2 => tl!("Latin"),
+        3 => tl!("Thai"),
         _ => tl!("All Scripts"),
+    }
+}
+
+/// Does a family of `traits` pass script filter `script` ([`SCRIPTS`])? Latin: neither Japanese
+/// nor Thai.
+fn script_matches(script: usize, traits: vectorcraft_text::FontTraits) -> bool {
+    match script {
+        1 => traits.japanese,
+        2 => !traits.japanese && !traits.thai,
+        3 => traits.thai,
+        _ => true,
     }
 }
 
@@ -129,6 +142,13 @@ impl Row {
     fn pick(&self) -> (String, Option<String>) {
         (self.family().to_string(), self.style().map(str::to_string))
     }
+}
+
+/// Keep keyboard/pointer focus on the same font after filtering, loading new fonts or
+/// expanding a family's styles. A row index on its own can now name a different font.
+fn remap_highlight(before: &[Row], selected: Option<usize>, after: &[Row]) -> Option<usize> {
+    let row = before.get(selected?)?;
+    after.iter().position(|candidate| candidate == row)
 }
 
 /// What the rows were listed for: the query, the script, kind and favourites filters, Show Font
@@ -276,7 +296,7 @@ fn list(ui: &mut Ui, state_id: egui::Id, st: &mut MenuState, current: &str, samp
                 return true;
             }
             let traits = db.family_traits(f);
-            (st.script == 0 || (st.script == 1) == traits.japanese) && st.class.is_none_or(|c| c == traits.class)
+            script_matches(st.script, traits) && st.class.is_none_or(|c| c == traits.class)
         };
         let mut rows: Vec<Row> = vec![];
         for f in db.menu_family_list().iter().filter(|f| wanted(f)) {
@@ -285,6 +305,10 @@ fn list(ui: &mut Ui, state_id: egui::Id, st: &mut MenuState, current: &str, samp
                 rows.extend(db.styles(f).into_iter().map(|s| Row::Style(f.clone(), s)));
             }
         }
+        // Filter changes (including un-starring a favourite) may remove rows; expanding
+        // another family or a background font scan can insert rows before the highlight.
+        // Never preview an unrelated family because the old numeric index now points to it.
+        st.highlight = remap_highlight(&st.rows, st.highlight, &rows);
         st.rows = rows.into();
         st.rows_key = Some(key);
     }
@@ -320,7 +344,9 @@ fn list(ui: &mut Ui, state_id: egui::Id, st: &mut MenuState, current: &str, samp
     }
     if rows.is_empty() {
         widgets::dim_label(ui, tl!("No matching fonts"));
-        return None;
+        // A filter or a font rescan can remove the row whose font was previewed.
+        // Do not leave that font applied while the list has no candidate to highlight.
+        return st.previewed.take().map(|_| FontPick::EndPreview);
     }
     // The rows: only those in view are laid out (there are thousands of families). The list is
     // the menu's one scrolling part, under the search field and filters (#555): it fills the
@@ -347,6 +373,9 @@ fn list(ui: &mut Ui, state_id: egui::Id, st: &mut MenuState, current: &str, samp
     let mut toggled: Option<String> = None;
     let mut starred: Option<String> = None;
     ui.spacing_mut().item_spacing.y = 0.0;
+    // The scroll bar beside the rows, not over them: a floating one covered the stars at their
+    // right ends, so a favourite was hard to click (#2277).
+    ui.spacing_mut().scroll = widgets::list_scroll_style();
     let shown = area.show_rows(ui, row_h, rows.len(), |ui, range| {
         for i in range {
             let Some(row) = rows.get(i) else { continue };
@@ -438,6 +467,7 @@ fn list(ui: &mut Ui, state_id: egui::Id, st: &mut MenuState, current: &str, samp
             st.previewed = Some(pick.clone());
             Some(FontPick::Preview(pick.0, pick.1))
         }
+        None => st.previewed.take().map(|_| FontPick::EndPreview),
         _ => None,
     }
 }
@@ -730,4 +760,95 @@ pub(crate) fn sample_text(app: &VectorcraftApp) -> Option<String> {
     }?;
     let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
     Some(line.chars().take(12).collect())
+}
+
+#[cfg(test)]
+mod tests {
+
+    /// The script filter: Thai lists families with Thai; Latin, those with neither Thai nor
+    /// Japanese.
+    #[test]
+    fn the_thai_filter_lists_fonts_with_thai() {
+        use vectorcraft_text::FontTraits;
+        let (thai, japanese, latin) =
+            (FontTraits { thai: true, ..Default::default() }, FontTraits { japanese: true, ..Default::default() }, FontTraits::default());
+        let passing = |t: FontTraits| (0..super::SCRIPTS).filter(|s| super::script_matches(*s, t)).collect::<Vec<_>>();
+        assert_eq!(passing(thai), [0, 3]);
+        assert_eq!(passing(japanese), [0, 1]);
+        assert_eq!(passing(latin), [0, 2]);
+        assert_eq!(super::script_label(3), "Thai");
+        let zh = crate::i18n::Lang::from_code("zh-hans").unwrap();
+        crate::i18n::set_current(zh);
+        assert_eq!(super::script_label(1), "汉字");
+        crate::i18n::set_current(crate::i18n::Lang::EN);
+        assert_eq!(super::script_label(1), "Japanese");
+    }
+
+    /// #2277: the list's scroll bar has a column of its own, so the stars at the rows' right ends
+    /// stay clear of it.
+    #[test]
+    fn the_scroll_bar_leaves_the_stars_clear() {
+        // Every family starred, so each row draws its star.
+        let all = vectorcraft_text::FontDb::global().families();
+        let families = all.len();
+        let ctx = egui::Context::default();
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 160.0));
+        let mut st = super::MenuState::default();
+        let look = super::MenuLook { samples: false, favorites: &all, ..Default::default() };
+        let mut stars = vec![];
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(area), ..Default::default() }, |ui| {
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area));
+                super::list(&mut child, egui::Id::new("fonts"), &mut st, "", None, look);
+            });
+            out.textures_delta.clear();
+            stars = out
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    // The rows' stars, not the ★ filter button at the top left.
+                    egui::Shape::Text(t) if t.galley.text() == "★" && t.pos.x > area.center().x => Some(t.visual_bounding_rect().right()),
+                    _ => None,
+                })
+                .collect();
+        }
+        assert!(!stars.is_empty() || families == 0, "{families} families, no row stars drawn");
+        // The rows don't fill the list without enough families to scroll, and then there is no bar.
+        if families as f32 * look.row > area.height() {
+            let bar = super::widgets::list_scroll_style();
+            let column = bar.bar_width + bar.bar_inner_margin + bar.bar_outer_margin;
+            for right in stars {
+                assert!(right <= area.right() - column + 0.5, "a star at {right} runs under the scroll bar");
+            }
+        }
+    }
+
+    use super::{Row, remap_highlight};
+
+    fn family(name: &str) -> Row {
+        Row::Family(name.to_string())
+    }
+
+    #[test]
+    fn keeps_the_same_family_when_other_rows_are_inserted_or_removed() {
+        let before = [family("Alpha"), family("Bravo"), family("Charlie")];
+        assert_eq!(remap_highlight(&before, Some(2), &[family("Bravo"), family("Charlie")]), Some(1));
+        assert_eq!(remap_highlight(&before, Some(2), &[family("Alpha"), family("New"), family("Bravo"), family("Charlie")]), Some(3));
+    }
+
+    #[test]
+    fn clears_the_highlight_when_its_family_is_filtered_out() {
+        let before = [family("Alpha"), family("Bravo"), family("Charlie")];
+        assert_eq!(remap_highlight(&before, Some(1), &[family("Alpha"), family("Charlie")]), None);
+        assert_eq!(remap_highlight(&before, Some(10), &before), None);
+        assert_eq!(remap_highlight(&before, None, &before), None);
+    }
+
+    #[test]
+    fn expanded_style_rows_do_not_retarget_the_highlight() {
+        let before = [family("Alpha"), family("Bravo")];
+        let after = [family("Alpha"), Row::Style("Alpha".into(), "Bold".into()), family("Bravo")];
+        assert_eq!(remap_highlight(&before, Some(1), &after), Some(2));
+        assert_eq!(remap_highlight(&after, Some(1), &before), None);
+    }
 }

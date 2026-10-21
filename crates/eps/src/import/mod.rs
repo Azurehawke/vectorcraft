@@ -18,16 +18,19 @@
 //! `%%Creator`) and these operators: Adobe Illustrator File Format Specification, version 7.0
 //! (1998), listed by PRONOM at https://www.nationalarchives.gov.uk/PRONOM/fmt/423. A file in that
 //! format whose program has its layers (`%AI5_BeginLayer`) comes in through them, as `native` reads
-//! an Illustrator EPS's editing copy (#1027).
+//! an Illustrator EPS's editing copy (#1027). One VectorCraft wrote (its prolog the procedure set
+//! [`crate::legacy_ai::PROCSET`], which prints its gradients flat and leaves its type out) comes in
+//! from those layers alone, without its page.
 //!
 //! The page is the file's `%%BoundingBox` (`%%HiResBoundingBox` when it has one), the first page
 //! of a PostScript file without one. A file whose program can't be read (an operator the
 //! interpreter doesn't know, an error, a limit reached) or that draws nothing comes in from its
 //! layers when its program has them (a `.ai` in PostScript form whose prolog is named but not
-//! included, as other apps write it), else as its preview (a TIFF image, a Windows metafile or an
-//! EPSI bitmap), with a warning that names the error, the operator and the procedures it ran in;
-//! without a preview, what was drawn before the error is kept (with that warning), else the file
-//! is refused.
+//! included, as other apps write it), or with its art on one layer when it is in the legacy format
+//! without layers (Illustrator 3, as image editors still export their paths), else as its preview
+//! (a TIFF image, a Windows metafile or an EPSI bitmap), with a warning that names the error, the
+//! operator and the procedures it ran in; without a preview, what was drawn before the error is
+//! kept (with that warning), else the file is refused.
 
 mod ai;
 mod ate;
@@ -54,10 +57,11 @@ mod tests_images;
 #[cfg(test)]
 mod tests_native;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use vectorcraft_color::Paint;
-use vectorcraft_color::swatch::Swatch;
+use vectorcraft_color::swatch::{REGISTRATION, Swatch};
 use vectorcraft_doc::{ColorMode, Document, LayerColor, Node};
 use vectorcraft_geom::{Affine, Rect};
 
@@ -91,6 +95,9 @@ struct Dsc {
     /// In the legacy Illustrator format: its header has `%AI…` comments or names the app as the
     /// creator (see the module docs for the specification).
     illustrator: bool,
+    /// Its prolog is the one VectorCraft's legacy `.ai` writer includes
+    /// ([`crate::legacy_ai::PROCSET`] in `%%DocumentSuppliedResources`).
+    own_legacy: bool,
 }
 
 /// The four numbers of a bounding box comment's value, when it has them and they make a box.
@@ -125,6 +132,9 @@ impl Dsc {
             if header && (line.starts_with("%AI") || line.starts_with("%%AI") || creator) {
                 d.illustrator = true;
             }
+            if header && value("%%DocumentSuppliedResources:").is_some_and(|v| v.strip_prefix("procset ") == Some(crate::legacy_ai::PROCSET)) {
+                d.own_legacy = true;
+            }
             if let Some(v) = value("%%HiResBoundingBox:") {
                 if header || atend {
                     hires = box_of(v).or(hires);
@@ -146,17 +156,44 @@ impl Dsc {
     }
 }
 
-/// What went wrong, for the user (and for us, reading a report): the PostScript error, the
-/// operator that raised it and the procedure it ran in (`fault`).
+/// The PostScript errors the reader raises and what each means, which import warnings and errors
+/// show after the error's name. `undefined` is not listed: its message names the undefined name
+/// and leaves the error's name out.
+pub const POSTSCRIPT_ERRORS: &[(&str, &str)] = &[
+    ("dictstackunderflow", "the program ends a dictionary it didn't begin"),
+    ("invalidfileaccess", "the program opens a file, which the reader can't do"),
+    ("invalidrestore", "the program restores a saved state that was already restored"),
+    ("ioerror", "data the program reads is damaged or cut short, or the program asks for a position in a file that has none"),
+    ("limitcheck", "the program goes past one of the reader's limits"),
+    ("nocurrentpoint", "the path has no point to continue from"),
+    ("rangecheck", "a value is outside the range the operator takes"),
+    ("stackunderflow", "the operator needs more values than the stack holds"),
+    ("syntaxerror", "part of the program isn't valid PostScript text"),
+    ("typecheck", "a value has the wrong type for the operator"),
+    ("undefinedfilename", "the program runs, deletes or renames a file, which the reader can't do"),
+    ("undefinedresource", "the program asks for a resource that isn't defined"),
+    ("undefinedresult", "a calculation has no result, as in a division by zero"),
+    ("unmatchedmark", "the operator looks for a mark on the stack and finds none"),
+];
+
+/// What went wrong, for the user (and for us, reading a report): the PostScript error with what
+/// it means ([`POSTSCRIPT_ERRORS`]), the operator that raised it and the procedure it ran in
+/// (`fault`).
 fn reason(e: &PsError, fault: Option<&Fault>) -> String {
     let what = match e {
         PsError::Ps("undefined", at) => format!("it uses `{at}`, which VectorCraft's PostScript reader doesn't know"),
-        PsError::Ps(name, at) => match fault.and_then(|f| f.op) {
-            Some(op) if at.is_empty() || at == op => format!("a PostScript error ({name} in `{op}`)"),
-            Some(op) => format!("a PostScript error ({name} in `{op}`: {at})"),
-            None if at.is_empty() => format!("a PostScript error ({name})"),
-            None => format!("a PostScript error ({name} in `{at}`)"),
-        },
+        PsError::Ps(name, at) => {
+            let detail = match fault.and_then(|f| f.op) {
+                Some(op) if at.is_empty() || at == op => format!("{name} in `{op}`"),
+                Some(op) => format!("{name} in `{op}`: {at}"),
+                None if at.is_empty() => name.to_string(),
+                None => format!("{name} in `{at}`"),
+            };
+            match POSTSCRIPT_ERRORS.iter().find(|(n, _)| n == name) {
+                Some((_, meaning)) => format!("a PostScript error ({detail}; {meaning})"),
+                None => format!("a PostScript error ({detail})"),
+            }
+        }
         PsError::Limit(what) => return what.to_string(),
         PsError::Exit | PsError::Stop => return "the program stopped with an error".into(),
         PsError::Quit => return "the program ended early".into(),
@@ -176,14 +213,37 @@ pub fn import(bytes: &[u8]) -> Result<Imported, String> {
     import_with(bytes, true)
 }
 
-/// [`import`], an Illustrator EPS through the editing copy of its art only when `editing_data`
-/// (else what its page prints, as any EPS).
-pub fn import_with(bytes: &[u8], editing_data: bool) -> Result<Imported, String> {
+/// The PostScript of an EPS or PostScript file (behind its binary header, if it has one).
+fn program(bytes: &[u8]) -> Result<&[u8], String> {
     let (ps, _) = crate::sections(bytes).ok_or("the file's preview header points outside the file")?;
     if !ps.starts_with(b"%!") {
         return Err("this is not a PostScript file".into());
     }
+    Ok(ps)
+}
+
+/// An EPS or PostScript file's page at the origin, read from its comments without running its
+/// program: its bounding box (`%%HiResBoundingBox` when it has one), a US Letter page without
+/// one. [`import_with`] runs the program on the same page when it reads what the page prints.
+pub fn page(bytes: &[u8]) -> Result<Rect, String> {
+    let [llx, lly, urx, ury] = Dsc::read(program(bytes)?).bbox.unwrap_or(LETTER);
+    Ok(Rect::new(0.0, 0.0, urx - llx, ury - lly))
+}
+
+/// [`import`], an Illustrator EPS through the editing copy of its art only when `editing_data`
+/// (else what its page prints, as any EPS).
+pub fn import_with(bytes: &[u8], editing_data: bool) -> Result<Imported, String> {
+    let ps = program(bytes)?;
     let dsc = Dsc::read(ps);
+    // A legacy `.ai` VectorCraft wrote: its prolog prints the art plainly (gradients flat, no
+    // type), and its program has all of it, which is read as the format (as before the file
+    // printed).
+    if editing_data
+        && dsc.own_legacy
+        && let Some(Ok((document, warnings))) = native::program_alone(ps, dsc.illustrator)
+    {
+        return Ok(Imported { document, warnings, preview: false });
+    }
     let [llx, lly, urx, ury] = dsc.bbox.unwrap_or(LETTER);
     let frame = Rect::new(0.0, 0.0, urx - llx, ury - lly);
     let mut doc = Document::new(frame.width(), frame.height());
@@ -206,8 +266,9 @@ pub fn import_with(bytes: &[u8], editing_data: bool) -> Result<Imported, String>
         (Err(e), _) => reason(e, fault.as_ref()),
     };
     // A file in the legacy Illustrator format whose program can't be run (a `.ai` that names the
-    // prolog defining its operators without including it): its layers, which the program has.
-    let why = match editing_data.then(|| native::program_alone(ps)).flatten() {
+    // prolog defining its operators without including it): its layers, which the program has, or
+    // its art on one layer when it has none (Illustrator 3).
+    let why = match editing_data.then(|| native::program_alone(ps, dsc.illustrator)).flatten() {
         Some(Ok((document, warnings))) => return Ok(Imported { document, warnings, preview: false }),
         Some(Err(e)) => format!("{why}; its layers couldn't be read either ({e})"),
         None => why,
@@ -250,19 +311,24 @@ fn finish_with(out: Out, layers: Vec<Arc<Node>>) -> Imported {
     let mut doc = out.doc;
     if out.cmyk > out.rgb {
         doc.color_mode = ColorMode::Cmyk;
-        (doc.swatches, doc.swatch_groups) = vectorcraft_color::default_swatches(ColorMode::Cmyk.model());
+        let (swatches, groups) = vectorcraft_color::default_swatches(ColorMode::Cmyk.model());
+        (doc.swatches, doc.swatch_groups) = (swatches.into(), groups.into());
     }
+    // `taken` holds the names `Document::swatch` finds: each swatch's name, and Registration.
+    let mut taken: HashSet<String> = doc.swatches_iter().map(|s| s.name.clone()).chain([REGISTRATION.to_string()]).collect();
     for (name, color) in out.spots {
-        if doc.swatch(&name).is_none() {
+        if taken.insert(name.clone()) {
             doc.swatches.push(Swatch { name, paint: Paint::solid(color), global: true, spot: true });
         }
     }
     // Tiling patterns are pattern swatches.
     for name in doc.patterns.iter().map(|p| p.name.clone()).collect::<Vec<_>>() {
-        if doc.swatch(&name).is_none() {
+        if taken.insert(name.clone()) {
             doc.swatches.push(Swatch { paint: Paint::Pattern { pattern: name.clone(), xf: Affine::IDENTITY }, name, global: false, spot: false });
         }
     }
     doc.layers = layers;
-    Imported { document: doc, warnings: out.warnings, preview: false }
+    let mut warnings = out.warnings;
+    doc.limit_depth_noting(&mut warnings);
+    Imported { document: doc, warnings, preview: false }
 }

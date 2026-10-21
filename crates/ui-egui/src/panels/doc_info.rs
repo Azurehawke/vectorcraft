@@ -1,5 +1,5 @@
 //! Document Info panel: the document's setup and what it contains (objects by kind, graphic
-//! styles, spot colours, patterns, gradients, symbols, fonts and their files, linked and embedded
+//! styles, brushes, spot colors, patterns, gradients, symbols, fonts and their files, linked and embedded
 //! images), for the whole document or the selection only. The flyout picks one category (or all)
 //! and saves the text report (`docInfo.save`, the report File → Package writes too).
 
@@ -183,7 +183,7 @@ mod tests {
         let text = crate::tests_labels::painted_text(&mut app, show);
         assert!(text.contains("Color Mode") && text.contains("Artboard 1"), "{text}");
         let menu_text = crate::tests_labels::painted_text(&mut app, menu);
-        assert!(menu_text.contains("Font Details") && menu_text.contains("Save…"), "{menu_text}");
+        assert!(menu_text.contains("Font Details") && menu_text.contains("Brushes") && menu_text.contains("Save…"), "{menu_text}");
         let filtered = crate::tests_labels::painted_text(&mut app, |app, ui| {
             set_pstate(ui.ctx(), "docinfo-category", "fonts".to_string());
             show(app, ui);

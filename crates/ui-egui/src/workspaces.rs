@@ -31,8 +31,19 @@ pub struct Workspace {
     pub floating_flyouts: Vec<FloatingFlyout>,
     /// Panels dragged out of the dock, where they float (built-in workspaces: none).
     pub floating_panels: Vec<FloatingPanels>,
+    /// Custom docking tree, including floating tab groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docking: Option<craft_ui::docking::Layout<String>>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub docking_hidden: std::collections::BTreeMap<String, craft_ui::docking::Location<String>>,
+    /// Panels whose saved return destination is the iconic rail.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub docking_icons: std::collections::BTreeSet<String>,
     /// Where the Tools panel floats (built-in workspaces: docked).
     pub toolbar_pos: Option<[f32; 2]>,
+    /// Main dock column width in screen points (#1753).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dock_width: Option<f32>,
 }
 
 impl Default for Workspace {
@@ -128,7 +139,11 @@ pub fn capture(ui: &UiState, name: &str) -> Workspace {
         status_bar: ui.status_bar,
         floating_flyouts: ui.floating_flyouts.clone(),
         floating_panels: ui.floating_panels.clone(),
+        docking: ui.docking.clone(),
+        docking_hidden: ui.docking_hidden.clone(),
+        docking_icons: ui.docking_icons.clone(),
         toolbar_pos: ui.toolbar_pos,
+        dock_width: ui.dock_width,
     }
 }
 
@@ -141,13 +156,21 @@ pub fn apply(ui: &mut UiState, w: &Workspace) {
     ui.toolbar_advanced = w.toolbar_advanced;
     ui.task_bar = w.task_bar;
     ui.dock = w.dock;
+    ui.tab_hid = None;
     ui.dock_tab = w.dock_tab;
     ui.dock_collapsed = w.dock_collapsed;
     ui.open_panel = w.open_panel.clone();
     ui.status_bar = w.status_bar;
     ui.floating_flyouts = w.floating_flyouts.clone();
     ui.floating_panels = w.floating_panels.clone();
+    ui.docking_generation = ui.docking_generation.wrapping_add(1);
+    ui.docking = w.docking.clone().filter(crate::panel_docking::valid);
+    ui.docking_hidden = w.docking_hidden.clone();
+    ui.docking_icons =
+        w.docking_icons.iter().filter(|id| crate::state::ICON_PANELS.iter().any(|entry| entry.0 == id.as_str())).take(64).cloned().collect();
     ui.toolbar_pos = w.toolbar_pos;
+    ui.dock_width = w.dock_width;
+    ui.dock_width_pending = true;
     FloatingPanels::sanitize(&mut ui.floating_panels, &mut ui.toolbar_pos);
     ui.flyout = None;
     ui.workspace = w.name.clone();
@@ -473,5 +496,22 @@ mod tests {
         for n in ["Essentials", "Essentials Classic", "Painting", "Typography", "Layout", "Tracing", "Web", "Automation"] {
             assert!(find(&ui, n).is_some(), "{n}");
         }
+    }
+
+    #[test]
+    fn saved_workspaces_restore_dock_width() {
+        let mut ui = UiState { dock_width: Some(420.0), ..Default::default() };
+        save_as(&mut ui, "Wide").unwrap();
+        ui.dock_width = Some(260.0);
+        save_as(&mut ui, "Narrow").unwrap();
+        let wide = find(&ui, "Wide").unwrap();
+        apply(&mut ui, &wide);
+        assert_eq!(ui.dock_width, Some(420.0));
+        assert!(ui.dock_width_pending);
+        let narrow = find(&ui, "Narrow").unwrap();
+        apply(&mut ui, &narrow);
+        assert_eq!(ui.dock_width, Some(260.0));
+        let back: UiState = serde_json::from_value(serde_json::to_value(&ui).unwrap()).unwrap();
+        assert_eq!(back.custom_workspaces[1].dock_width, Some(260.0));
     }
 }

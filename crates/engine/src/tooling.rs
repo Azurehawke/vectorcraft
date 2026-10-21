@@ -21,10 +21,14 @@ pub struct ViewInfo {
     pub snap_to_pixel: bool,
     /// View → Snap to Point: picked points (a transform's reference point) land on anchors.
     pub snap_to_point: bool,
+    /// View → Snap to Glyph: drawing snaps to live-text baselines and glyph bounds (needs Smart Guides).
+    pub snap_to_glyph: bool,
     /// View → Show Corner Widget.
     pub corner_widgets: bool,
     /// The document window (none headless): screen-fixed widgets sit in it.
     pub screen: Option<vectorcraft_tools::ScreenFrame>,
+    /// The view's active artboard (an index): artboard rulers measure from it.
+    pub artboard: usize,
 }
 
 impl Default for ViewInfo {
@@ -38,8 +42,10 @@ impl Default for ViewInfo {
             show_bbox: true,
             snap_to_pixel: false,
             snap_to_point: true,
+            snap_to_glyph: false,
             corner_widgets: true,
             screen: None,
+            artboard: 0,
         }
     }
 }
@@ -115,6 +121,12 @@ impl Session {
             return *ev;
         }
         let Some(id) = self.lent_tool(self.tool.id()) else { return *ev };
+        // Typing in progress is kept as its own step first: the lent tool's drag previews from the
+        // document its interaction started from, which would drop the typing (#1881).
+        if crate::cmd::typing_in_progress(self) {
+            // Fails only without a document, and then there is no typing to keep.
+            let _ = crate::cmd::settle_interaction(self);
+        }
         let lent = self.make_tool(id);
         self.lender = Some(std::mem::replace(&mut self.tool, lent));
         PointerEvent { mods: Mods { cmd: false, ..ev.mods }, ..*ev }
@@ -178,6 +190,7 @@ impl Session {
         let (unit, stroke_unit) = (self.general_unit(), self.stroke_unit());
         let cx = ToolContext {
             doc: &st.doc,
+            ruler_origin: st.doc.ruler_origin_for(view.artboard),
             revision: (st.uid, st.revision),
             selection: &st.selection,
             zoom: view.zoom,
@@ -188,16 +201,21 @@ impl Session {
             guides: view.guides && !self.menu.guides_locked,
             snap_to_grid: view.snap_to_grid,
             show_bbox: view.show_bbox,
-            snap_to_pixel: view.snap_to_pixel,
+            // Snap to Grid and Snap to Pixel are exclusive, as in Illustrator; left both on, the grid
+            // wins instead of pixels quietly rounding every drag to whole points (#1816).
+            snap_to_pixel: view.snap_to_pixel && !view.snap_to_grid,
             snap_to_point: view.snap_to_point,
+            snap_to_glyph: view.snap_to_glyph && view.smart_guides && !view.snap_to_grid,
             corner_widgets: view.corner_widgets,
             fill_active: self.fill_active,
             gradient_stop: self.selected_stop(),
             appearance_item: self.appearance_item(),
             constrain_angle: self.prefs.constrain_angle,
+            keyboard_increment: self.prefs.keyboard_increment,
             freeform_point: self.selected_freeform_point(),
             raster_sample: self.prefs.eyedropper.sample_size,
             preview_bounds: self.prefs.use_preview_bounds,
+            preview_memo: Some(&self.preview_memo),
             unit,
             stroke_unit,
             paste_plain_text: self.prefs.paste_text_formatting == "plain",
@@ -259,6 +277,7 @@ impl Session {
         if let Some(r) = self.plane_widget_pointer(ev, view) {
             return r;
         }
+        self.leave_draw_inside(ev, view)?;
         let ev = &self.lend_selection_tool(ev);
         let acts = self.with_tool_cx(view, |t, cx| t.pointer(cx, ev));
         let r = self.take_tool_panic().and_then(|()| {
@@ -272,6 +291,26 @@ impl Session {
             self.give_back_tool(view)?;
         }
         r
+    }
+
+    /// In Draw Inside, a double-click with a selection tool outside the geometric bounds of the
+    /// object new art goes inside, grown by the selection tolerance, or after that object is gone,
+    /// sets the drawing mode to Draw Normal (`view.drawMode {mode: "normal"}`, as Shift+D does).
+    /// The tool then takes the double-click as in Draw Normal.
+    fn leave_draw_inside(&mut self, ev: &PointerEvent, view: ViewInfo) -> Result<()> {
+        if ev.kind != PointerKind::DoubleClick
+            || self.draw_mode != crate::DrawMode::Inside
+            || !vectorcraft_tools::catalog::is_selection_tool(self.tool.id())
+        {
+            return Ok(());
+        }
+        let Some(d) = self.active() else { return Ok(()) };
+        let tol = self.prefs.selection_tolerance / view.zoom.max(1e-9);
+        let inside = self.draw_inside.and_then(|t| d.doc.bounds_of(&[t], false)).is_some_and(|b| b.inflate(tol, tol).contains(ev.pos));
+        if !inside {
+            self.execute("view.drawMode", &serde_json::json!({ "mode": "normal" }))?;
+        }
+        Ok(())
     }
 
     /// A guide dragged out of a ruler, whatever the tool: a vertical one out of the left ruler, a
@@ -370,6 +409,12 @@ impl Session {
 
     pub fn overlays(&mut self, view: ViewInfo) -> Vec<Overlay> {
         let mut v = self.with_tool_cx(view, |t, cx| t.overlays(cx));
+        // The Type tools draw the overflow markers of selected type themselves.
+        if !matches!(self.tool.id(), "type" | "areaType" | "typeOnPath" | "verticalType" | "verticalAreaType" | "verticalTypeOnPath") {
+            let mut marks = std::mem::take(&mut self.overflow_marks);
+            v.extend(self.with_tool_cx(view, |_, cx| vectorcraft_tools::text::overflow_markers(&mut marks, cx)));
+            self.overflow_marks = marks;
+        }
         if let Some(g) = self.ruler_guide.take() {
             v.extend(self.with_tool_cx(view, |_, cx| g.overlays(cx)));
             self.ruler_guide = Some(g);
@@ -445,6 +490,16 @@ impl Session {
         if let Some(k) = p.get("key").and_then(Value::as_str) {
             values.insert(k.to_string(), p.get("value").cloned().unwrap_or(Value::Null));
         }
+        if tool.unwrap_or(self.tool_id()) == "dimension" {
+            if let Some(style) = values.get("style") {
+                vectorcraft_doc::dimension::DimensionOptions::from_params(style.clone())?;
+            }
+            if let Some(mode) = values.get("mode")
+                && !mode.as_str().is_some_and(|m| ["linear", "angular", "radial", "radius", "diameter"].contains(&m))
+            {
+                return Err("Unknown dimension mode".into());
+            }
+        }
         Ok(self.set_tool_options(tool, &values))
     }
 
@@ -494,7 +549,11 @@ impl Session {
                     self.cancel_interaction()?
                 }
                 Action::Exec(cmd, p) => {
-                    self.execute(&cmd, &p)?;
+                    // A command's warning (Crop Image's when the image couldn't be decoded) goes to the
+                    // status bar too.
+                    if let Some(w) = self.execute(&cmd, &p)?.get("warning").and_then(Value::as_str) {
+                        ui.push(UiRequest::Status(w.to_string()));
+                    }
                 }
                 Action::Dialog(k, p) => ui.push(UiRequest::Dialog(k, p)),
                 Action::SwitchTool(t) => ui.push(UiRequest::SwitchTool(t)),

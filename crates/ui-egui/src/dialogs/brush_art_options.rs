@@ -8,7 +8,8 @@
 //! Scatter: per value (`size`, `spacing`, `scatter` %, `rotation` °) `…Min`, `…Max` and `…Mode`
 //! (`fixed` | `random` | `pressure`), `rotationRelativeTo` (`page` | `path`).
 //! Art: `width` (%), `scaleMode` (`proportional` | `stretch` | `betweenGuides`), `guideStart` and
-//! `guideEnd` (% of the art's length), `direction` (`leftToRight` …), `flipAlong`, `flipAcross`.
+//! `guideEnd` (% of the art's length), `direction` (`leftToRight` …), `flipAlong`, `flipAcross`,
+//! `overlap` (bend on each run between sharp corners).
 //! Pattern: `scale`, `spacing` (%), `fit` (`stretch` | `addSpace` | `approximate`), `flipAlong`,
 //! `flipAcross`, `__tiles` (slot → preview key, for the tiles the brush has).
 
@@ -96,6 +97,7 @@ pub(super) fn fields(b: &Brush, def: Value, f: &mut Map<String, Value>) {
             f.insert("direction".into(), json!(id_of(&a.direction)));
             f.insert("flipAlong".into(), json!(a.flip_along));
             f.insert("flipAcross".into(), json!(a.flip_across));
+            f.insert("overlap".into(), json!(a.overlap));
         }
         BrushKind::Pattern(p) => {
             f.insert("scale".into(), json!(p.scale));
@@ -168,6 +170,7 @@ pub(super) fn params(d: &Dialog) -> Value {
                 "direction": id_of(&parse_field::<Direction>(d, "direction")),
                 "flip_along": d.bool("flipAlong"),
                 "flip_across": d.bool("flipAcross"),
+                "overlap": d.bool("overlap"),
             })
         }
         _ => json!({
@@ -209,6 +212,13 @@ fn number(ui: &mut egui::Ui, d: &mut Dialog, key: &str, range: (f64, f64), suffi
             d.fields.insert(key.into(), json!(v));
         }
     });
+}
+
+/// A row labeled `label` with a slider and a whole-number field (%) bound to `d.fields[key]`, both
+/// kept within `range`; screen readers call the slider `label`.
+fn slider_row(ui: &mut egui::Ui, d: &mut Dialog, key: &str, label: &str, range: (f64, f64)) {
+    let rail = Tokens::get(ui.ctx()).input_border;
+    widgets::label_row(ui, label, LABEL_W, |ui| super::form::slider_field_named(ui, d, key, label, range.0..=range.1, "%", &|_| rail));
 }
 
 /// A row of radio buttons bound to the string field `key`: (value, label).
@@ -257,7 +267,7 @@ fn scatter_body(ui: &mut egui::Ui, d: &mut Dialog) {
 }
 
 fn art_body(ui: &mut egui::Ui, d: &mut Dialog) {
-    widgets::label_row(ui, tl!("Width:"), LABEL_W, |ui| number(ui, d, "width", ArtBrush::WIDTH_RANGE, "%", true));
+    slider_row(ui, d, "width", tl!("Width:"), ArtBrush::WIDTH_RANGE);
     ui.add_space(4.0);
     widgets::section_header(ui, tl!("Brush Scale Options"));
     let scales = [
@@ -284,6 +294,8 @@ fn art_body(ui: &mut egui::Ui, d: &mut Dialog) {
         }
     });
     flips(ui, d);
+    ui.add_space(4.0);
+    super::form::check(ui, d, "overlap", tl!("Overlap"));
 }
 
 /// A toggle button showing an arrow pointing the way `dir` runs. Whether it was clicked.
@@ -313,7 +325,7 @@ fn arrow_button(ui: &mut egui::Ui, dir: Direction, selected: bool, tip: &str) ->
 }
 
 fn pattern_body(ui: &mut egui::Ui, d: &mut Dialog) {
-    widgets::label_row(ui, tl!("Scale:"), LABEL_W, |ui| number(ui, d, "scale", PatternBrush::SCALE_RANGE, "%", true));
+    slider_row(ui, d, "scale", tl!("Scale:"), PatternBrush::SCALE_RANGE);
     widgets::label_row(ui, tl!("Spacing:"), LABEL_W, |ui| number(ui, d, "spacing", PatternBrush::SPACING_RANGE, "%", true));
     ui.add_space(6.0);
     tiles(ui, d);

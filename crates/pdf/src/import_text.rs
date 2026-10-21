@@ -7,11 +7,11 @@
 //! Glyphs each turned a little further along a curve (type set on a path: apps write each glyph
 //! with its own placement) make one type-on-a-path object, its path through the glyphs' baseline.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use kurbo::{Affine, BezPath, Point, Rect, Vec2};
 use vectorcraft_color::Paint;
-use vectorcraft_doc::{CharStyle, ParaDirection, TextKind, TextObject, TextRun};
+use vectorcraft_doc::{CharStyle, Node, ParaDirection, TextKind, TextObject, TextRun};
 use vectorcraft_text::TextLayout;
 
 /// One glyph's placement: its baseline origin, advance direction, size and horizontal scale.
@@ -81,17 +81,22 @@ pub(crate) struct Look {
     pub h_scale: f64,
     pub fill: Option<Paint>,
     pub stroke: Option<(Paint, f64)>,
+    /// The fill, the stroke overprints.
+    pub overprint_fill: bool,
+    pub overprint_stroke: bool,
 }
 
 impl Look {
     /// Can a glyph drawn with `other` join a run drawn with this? A fill joins a run whose
-    /// glyphs were also stroked over (fill and stroke rendering draws each glyph twice).
+    /// glyphs were also stroked over (fill and stroke rendering draws each glyph twice); invisible
+    /// text (neither fill nor stroke) joins only invisible text.
     fn takes(&self, other: &Look) -> bool {
         self.font == other.font
             && (self.size - other.size).abs() <= self.size * 0.01
             && (self.h_scale - other.h_scale).abs() < 0.5
             && self.fill == other.fill
-            && (other.stroke.is_none() || self.stroke == other.stroke)
+            && self.overprint_fill == other.overprint_fill
+            && ((other.stroke.is_none() && other.fill.is_some()) || (self.stroke == other.stroke && self.overprint_stroke == other.overprint_stroke))
     }
 
     fn style(&self) -> CharStyle {
@@ -105,6 +110,8 @@ impl Look {
             fill: self.fill.clone().unwrap_or(Paint::None),
             stroke,
             stroke_width,
+            overprint_fill: self.overprint_fill,
+            overprint_stroke: self.overprint_stroke,
             ..CharStyle::default()
         }
     }
@@ -133,9 +140,18 @@ pub(crate) struct TextLine {
     /// Each glyph's ink box as drawn (document space), in drawing order; glyphs without ink are
     /// left out.
     pub ink: Vec<Rect>,
-    /// The spaces read from gaps between glyphs: their byte offset in the text, and the gap from
-    /// the end of the glyph before to the start of the next (points).
+    /// The spaces read from gaps between glyphs, and the spaces the file draws between two glyphs
+    /// that aren't spaces: their byte offset in the text, and the gap from the end of the glyph
+    /// before to the start of the next (points).
     gaps: Vec<(usize, f64)>,
+    /// A space the file drew after a glyph that isn't one, until the next glyph comes: its byte
+    /// offset, and the gap before it plus its advance (points).
+    drawn_space: Option<(usize, f64)>,
+    /// Each glyph's advance in the file's font (points), with [`Self::baseline`].
+    advances: Vec<f64>,
+    /// The strokes of its glyphs' outlines drawn between them, one per glyph with ink so far
+    /// (written right after the line).
+    pub held: Vec<Node>,
 }
 
 /// What a finished line of type tells beyond its text object (see [`crate::import_lines`]).
@@ -168,7 +184,15 @@ impl TextLine {
             column: false,
             ink: vec![],
             gaps: vec![],
+            drawn_space: None,
+            advances: vec![],
+            held: vec![],
         }
+    }
+
+    /// The paint the last glyph is filled with.
+    pub fn last_fill(&self) -> Option<&Paint> {
+        self.runs.last()?.0.fill.as_ref()
     }
 
     /// Add glyph `text` set vertically (`upright`) if it continues this column (or makes this
@@ -228,7 +252,8 @@ impl TextLine {
                 && at.dir.dot(self.at.dir) > 0.9995
                 && (at.slant - self.at.slant).abs() < 1e-3
                 && (at.origin - self.at.origin).dot(self.at.up()).abs() < size * 0.15
-                && gap > -size * 0.3
+                // Proportional widths close CJK marks up by up to half an em.
+                && gap > -size * 0.6
                 && gap < size * 3.0;
             // Or on a curve: turned a little from the glyph before it, and starting about where
             // that one ends.
@@ -248,6 +273,15 @@ impl TextLine {
                     self.gaps.push((bytes, gap));
                 }
             }
+            // A space the file draws between two glyphs spans the gaps on both sides of it.
+            let drawn = self.drawn_space.take();
+            if on_line {
+                if text == " " && !run.ends_with(' ') {
+                    self.drawn_space = Some((bytes, gap + advance));
+                } else if let Some((b, before)) = drawn.filter(|_| !text.starts_with(' ')) {
+                    self.gaps.push((b, before + gap));
+                }
+            }
             if last.takes(look) {
                 run.push_str(text);
             } else {
@@ -263,6 +297,7 @@ impl TextLine {
         self.last = at.origin;
         self.last_dir = at.dir;
         self.baseline.push(at.origin);
+        self.advances.push(advance);
         true
     }
 
@@ -296,12 +331,13 @@ impl TextLine {
     }
 
     /// A stroke (`stroke`: paint and width) over the glyph just drawn at `at` in `font` (fill
-    /// and stroke rendering): the run is stroked. `false`: it isn't that glyph.
-    pub fn stroke_last(&mut self, font: u128, at: Placement, stroke: (Paint, f64)) -> bool {
+    /// and stroke rendering), which `overprint`s or not: the run is stroked. `false`: it isn't
+    /// that glyph.
+    pub fn stroke_last(&mut self, font: u128, at: Placement, stroke: (Paint, f64), overprint: bool) -> bool {
         let Some((look, _)) = self.runs.last_mut().filter(|(l, _)| l.font == font && (at.origin - self.last).hypot() < self.at.size * 1e-3) else {
             return false;
         };
-        look.stroke = Some(stroke);
+        (look.stroke, look.overprint_stroke) = (Some(stroke), overprint);
         true
     }
 
@@ -329,7 +365,29 @@ impl TextLine {
         // The glyphs' tops lean along the baseline (+x), up being -y in the type's own space.
         t.xf = Affine::translate(self.at.origin.to_vec2()) * Affine::rotate(angle) * Affine::skew(-self.at.slant, 0.0);
         let db = vectorcraft_text::FontDb::global();
+        // Glyphs spaced each their own way (character tightening, optical kerning) keep their
+        // place: each character its own tracking.
+        let own = (self.upright.is_none() && t.para.direction.is_none())
+            .then(|| own_spacing(&t, &self.baseline, &self.advances, path.as_ref(), self.at.dir, self.at.size))
+            .flatten();
+        if let Some(own) = &own {
+            t.runs = tracked_each(std::mem::take(&mut t.runs), own, self.at.size);
+        }
         if let Some(path) = path {
+            // Evenly spaced type keeps its length along the path: the path runs through the
+            // glyphs' origins, one curve each, to the end of the last glyph, and tracking makes up
+            // the difference from the advances.
+            if own.is_none() {
+                let length: f64 = path.segments().take(self.baseline.len()).map(|seg| kurbo::ParamCurveArclen::arclen(&seg, 1e-3)).sum();
+                let laid = vectorcraft_text::layout(db, &t);
+                let natural: f64 = laid.glyphs.iter().map(|g| g.advance).sum();
+                let chars: usize = t.runs.iter().map(|r| r.text.chars().count()).sum();
+                let size = self.at.size;
+                if chars > 1 && length.is_finite() && (length - natural).abs() > size * 0.01 {
+                    let (tracking, spaces) = spacing(&laid, &[], length - natural, chars, size);
+                    t.runs = tracked(std::mem::take(&mut t.runs), tracking, &spaces);
+                }
+            }
             t.kind = TextKind::OnPath { path: vectorcraft_geom::PathData::from_bezpath(&path), start: 0.0, end: None };
             t.xf = Affine::IDENTITY;
             t.cached_bounds = Some(vectorcraft_text::layout(db, &t).bounds);
@@ -358,8 +416,9 @@ impl TextLine {
         let chars: usize = t.runs.iter().map(|r| r.text.chars().count()).sum();
         let size = self.at.size;
         let mut bounds = laid.bounds;
-        if chars > 1 && length.is_finite() && (length - natural).abs() > size * 0.01 {
-            // The spaces read from gaps keep their own place only in text left in the file's order.
+        if own.is_none() && chars > 1 && length.is_finite() && (length - natural).abs() > size * 0.01 {
+            // The spaces read from gaps or drawn between glyphs keep their own place only in text
+            // left in the file's order.
             let total: usize = t.runs.iter().map(|r| r.text.len()).sum();
             let gaps: Vec<(usize, f64)> =
                 if t.para.direction.is_none() { self.gaps.into_iter().filter(|(b, _)| *b < total).collect() } else { vec![] };
@@ -373,32 +432,88 @@ impl TextLine {
     }
 }
 
+/// The space each glyph of `t` (laid out untracked) leaves after its advance to put the next one
+/// where the file did (points; the last glyph's is the one before it), when that varies by more
+/// than a fiftieth of an em: one tracking value can't place them. Glyph origins are `baseline`,
+/// measured along `path` (type on a path: one curve per glyph) or along `dir`. None when the
+/// glyphs can't be matched to the characters one to one (spaces, ligatures), or when the font
+/// laid out isn't the file's (its advances differ from `advances`): spacing measured against a
+/// stand-in's widths would keep the stand-in's differences once the font is installed.
+fn own_spacing(t: &TextObject, baseline: &[Point], advances: &[f64], path: Option<&BezPath>, dir: Vec2, size: f64) -> Option<Vec<f64>> {
+    let text: String = t.runs.iter().map(|r| r.text.as_str()).collect();
+    let chars = text.chars().count();
+    if chars < 3 || text.contains(' ') || baseline.len() != chars || advances.len() != chars {
+        return None;
+    }
+    let laid = vectorcraft_text::layout(vectorcraft_text::FontDb::global(), t);
+    let advs: Vec<f64> = laid.glyphs.iter().map(|g| g.advance).collect();
+    if advs.len() != chars || advs.iter().zip(advances).any(|(a, b)| (a - b).abs() > size * 0.01) {
+        return None;
+    }
+    let dist: Vec<f64> = match path {
+        Some(bp) => bp.segments().take(chars - 1).map(|seg| kurbo::ParamCurveArclen::arclen(&seg, 1e-3)).collect(),
+        None => baseline.windows(2).map(|w| (w[1] - w[0]).dot(dir)).collect(),
+    };
+    if dist.len() != chars - 1 {
+        return None;
+    }
+    let mut extra: Vec<f64> = dist.iter().zip(&advs).map(|(d, a)| d - a).collect();
+    let mean = extra.iter().sum::<f64>() / extra.len() as f64;
+    if extra.iter().all(|e| (e - mean).abs() <= size * 0.02) {
+        return None;
+    }
+    extra.push(*extra.last()?);
+    Some(extra)
+}
+
+/// `runs` with each character's tracking from `own` (points, one per character), characters with
+/// the same tracking kept in one run.
+fn tracked_each(runs: Vec<TextRun>, own: &[f64], size: f64) -> Vec<TextRun> {
+    let em = |pts: f64| (pts / size * 1000.0).clamp(-1000.0, 1000.0).round();
+    let mut out: Vec<TextRun> = vec![];
+    let mut k = 0;
+    for r in runs {
+        for c in r.text.chars() {
+            let style = CharStyle { tracking: own.get(k).map_or(0.0, |e| em(*e)), ..r.style.clone() };
+            k += 1;
+            match out.last_mut() {
+                Some(last) if last.style == style && last.inline == r.inline => last.text.push(c),
+                _ => out.push(TextRun { text: c.to_string(), style, inline: r.inline.clone() }),
+            }
+        }
+    }
+    out
+}
+
 /// The tracking (thousandths of an em) that sets a line of `chars` characters, laid out untracked
 /// as `laid`, `extra` points longer, as the file set it: the same after every character, except
-/// the spaces read from gaps (`gaps`: byte offset, gap in points) where that would put the glyphs
-/// after them more than a tenth of an em off (a barcode's digits, set in groups apart). Those take
-/// their own tracking, given with their byte offsets.
+/// the spaces read from gaps or drawn between glyphs (`gaps`: byte offset, gap in points) where
+/// that would put the glyphs after them more than a tenth of an em off (a barcode's digits, set in
+/// groups apart). Those take their own tracking, given with their byte offsets.
 fn spacing(laid: &TextLayout, gaps: &[(usize, f64)], extra: f64, chars: usize, size: f64) -> (f64, Vec<(usize, f64)>) {
     let pairs = chars.saturating_sub(1).max(1) as f64;
+    // The advance of the first glyph laid out at each byte offset.
+    let space: HashMap<usize, f64> = laid.glyphs.iter().rev().map(|g| (g.byte, g.advance)).collect();
     // The space and the character before it take `need` (the gap less the space) between them;
     // tracking gives them twice its share.
-    let space = |b: usize| laid.glyphs.iter().find(|g| g.byte == b).map(|g| g.advance);
-    let needs: Vec<(usize, f64)> = gaps.iter().filter_map(|&(b, gap)| Some((b, gap - space(b)?))).collect();
+    let needs: Vec<(usize, f64)> = gaps.iter().filter_map(|&(b, gap)| Some((b, gap - space.get(&b)?))).collect();
     let mut own: Vec<(usize, f64)> = vec![];
+    let mut taken: HashSet<usize> = HashSet::new();
     let mut tracking = extra / pairs;
     // Each space taken apart changes the others' share: until no more are.
     loop {
         let more: Vec<(usize, f64)> =
-            needs.iter().filter(|(b, need)| !own.iter().any(|(o, _)| o == b) && (need - 2.0 * tracking).abs() > size * 0.1).copied().collect();
+            needs.iter().filter(|(b, need)| !taken.contains(b) && (need - 2.0 * tracking).abs() > size * 0.1).copied().collect();
         if more.is_empty() {
             break;
         }
+        taken.extend(more.iter().map(|(b, _)| *b));
         own.extend(more);
         let rest = pairs - 2.0 * own.len() as f64;
         tracking = if rest >= 1.0 { (extra - own.iter().map(|(_, need)| need).sum::<f64>()) / rest } else { 0.0 };
     }
     own.sort_by_key(|(b, _)| *b);
-    let em = |pts: f64| (pts / size * 1000.0).clamp(-1000.0, 1000.0).round();
+    let em = |pts: f64| (pts / size * 1000.0).clamp(-1000.0, 10000.0).round();
     (em(tracking), own.into_iter().map(|(b, need)| (b, em(need - tracking))).collect())
 }
 

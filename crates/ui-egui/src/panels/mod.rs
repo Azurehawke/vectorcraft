@@ -9,6 +9,7 @@ pub mod appearance;
 pub mod artboards;
 pub mod asset_export;
 pub mod attributes;
+pub mod blend;
 pub mod brushes;
 pub mod character;
 pub mod color;
@@ -36,6 +37,7 @@ pub mod pattern_options;
 pub mod properties;
 pub mod separations;
 pub mod stroke;
+pub mod svg_interactivity;
 pub mod swatches;
 pub mod symbols;
 pub mod tabs;
@@ -82,12 +84,44 @@ pub(crate) fn field_width(ui: &Ui) -> f32 {
 }
 
 /// The Corner Radius field of a live rectangle's properties: [`corner_radius`], which a new value
-/// sets on those corners.
+/// sets on those corners. The link behind it is the `singleCornerRadius` preference: off, a field
+/// for each of the four corners follows, each setting its own corner.
 pub(crate) fn corner_radius_row(app: &mut VectorcraftApp, ui: &mut Ui, n: &Node, id: &str) {
     let fw = field_width(ui);
+    let single = app.session.prefs.single_corner_radius;
     ui.horizontal(|ui| {
         dim_label(ui, tl!("Corner Radius:"));
-        corner_radius_field(app, ui, n, id, fw);
+        if single {
+            corner_radius_field(app, ui, n, id, fw);
+        }
+        let tip = tl!("Single Corner Radius");
+        if crate::widgets::icon_button(ui, if single { "link" } else { "link-2-off" }, tip, single, 22.0).clicked() {
+            transform::set_pref(app, "singleCornerRadius", !single);
+        }
+    });
+    if !single {
+        corner_fields(app, ui, n, id, fw);
+    }
+}
+
+/// The corners of a live rectangle in the order their fields show, with their labels.
+fn rectangle_corners() -> [(usize, &'static str); 4] {
+    [(0, tl!("Top Left:")), (1, tl!("Top Right:")), (2, tl!("Bottom Right:")), (3, tl!("Bottom Left:"))]
+}
+
+/// One Corner Radius field per corner of a live rectangle, each on its own row with its label,
+/// the fields in line.
+fn corner_fields(app: &mut VectorcraftApp, ui: &mut Ui, n: &Node, id: &str, width: f32) {
+    let Some(lc) = LiveCorners::of(n) else { return };
+    let unit = app.session.general_unit();
+    egui::Grid::new((id, "corners")).num_columns(2).spacing(vec2(6.0, 4.0)).show(ui, |ui| {
+        for (k, label) in rectangle_corners() {
+            dim_label(ui, label);
+            if let Some(v) = crate::widgets::num_field(ui, (id, "corner", k), Some(lc.radius(k)), unit, width) {
+                app.run("object.setLiveShape", json!({"radius": v, "corners": [k]})).ok();
+            }
+            ui.end_row();
+        }
     });
 }
 
@@ -114,6 +148,7 @@ pub fn show_icon_panel(app: &mut VectorcraftApp, ui: &mut Ui, id: &str) {
         "graphicStyles" => graphic_styles::show(app, ui),
         "align" => align::show(app, ui),
         "pathfinder" => pathfinder::show(app, ui),
+        blend::ID => blend::show(app, ui),
         "transform" => transform::show(app, ui),
         "history" => history::show(app, ui),
         "actions" => actions::show(app, ui),
@@ -137,11 +172,13 @@ pub fn show_icon_panel(app: &mut VectorcraftApp, ui: &mut Ui, id: &str) {
         "tabs" => tabs::show(app, ui),
         flattener_preview::ID => flattener_preview::show(app, ui),
         "attributes" => attributes::show(app, ui),
+        svg_interactivity::ID => svg_interactivity::show(app, ui),
         variables::ID => variables::show(app, ui),
         "colorThemes" => color_themes::show(app, ui),
         links::ID => links::show(app, ui),
         asset_export::ID => asset_export::show(app, ui),
         css_properties::ID => css_properties::show(app, ui),
+        id if library_panel::parse(id).is_some() => library_panel::show(app, ui, id),
         _ => {
             dim_label(ui, tl!("This panel is on the roadmap (see the parity plan)."));
         }
@@ -184,12 +221,15 @@ pub fn panel_menu_items(app: &mut VectorcraftApp, ui: &mut Ui, id: &str) -> bool
         "libraries" => libraries::menu(app, ui),
         flattener_preview::ID => flattener_preview::menu(app, ui),
         "attributes" => attributes::menu(app, ui),
+        svg_interactivity::ID => svg_interactivity::menu(app, ui),
         "colorThemes" => color_themes::menu(app, ui),
         "layers" => layers::menu(app, ui),
         links::ID => links::menu(app, ui),
         asset_export::ID => asset_export::menu(app, ui),
         css_properties::ID => css_properties::menu(app, ui),
         variables::ID => variables::menu(app, ui),
+        "actions" => actions::menu(app, ui),
+        id if library_panel::parse(id).is_some() => library_panel::menu(app, ui, id),
         _ => return false,
     }
     true
@@ -200,6 +240,7 @@ pub fn panel_menu(app: &mut VectorcraftApp, ui: &mut Ui, id: &str, rect: Rect) {
     let t = Tokens::get(ui.ctx());
     let resp = ui.interact(rect, ui.id().with(("panel-menu", id)), Sense::click());
     icons::paint(ui, "menu", rect.shrink(1.0), if resp.hovered() { t.text_strong } else { t.text_dim });
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tl!("Panel menu")));
     let resp = resp.on_hover_text(tl!("Panel menu"));
     egui::Popup::menu(&resp).show(|ui| {
         crate::widgets::menu_scroll(ui, |ui| {
@@ -285,9 +326,12 @@ pub(crate) fn current_stroke(app: &VectorcraftApp) -> Option<StrokeLayer> {
 
 /// Which Stroke panel values the selection doesn't share and whether Align Stroke applies
 /// ([`vectorcraft_engine::DocState::stroke_mixed`]), cached per document revision. While the Type
-/// tool edits text, the selected characters' stroke shows as it is.
+/// tool edits text, the selected characters' stroke shows as it is, and aligns to their glyphs.
 pub(crate) fn stroke_mixed(app: &VectorcraftApp, ctx: &egui::Context) -> StrokeMixed {
-    let Some(st) = app.session.active().filter(|_| character::text_editing(app).is_none()) else { return StrokeMixed::default() };
+    if character::text_editing(app).is_some() {
+        return StrokeMixed { can_align: true, ..Default::default() };
+    }
+    let Some(st) = app.session.active() else { return StrokeMixed::default() };
     let key = (st.uid, st.revision);
     match pstate::<Option<((u64, u64), StrokeMixed)>>(ctx, "stroke-mixed") {
         Some((k, mixed)) if k == key => mixed,
@@ -348,13 +392,13 @@ pub(crate) fn paint_chip(app: &mut VectorcraftApp, ui: &mut Ui, stroke: bool, si
     let (fill, stroke_paint) = current_paints(app);
     let mixed = mixed_paints(app, ui.ctx());
     let (paint, mixed) = if stroke { (stroke_paint, mixed.1) } else { (fill, mixed.0) };
-    let resp = crate::widgets::chip_button(ui, size, chevron, |ui, chip| {
-        crate::widgets::proxy_chip(ui, chip, &paint, mixed, stroke.then_some(size * 0.25));
-    });
-    let resp = resp.on_hover_text(if stroke {
-        "Stroke: click for swatches, Shift-click for the color mixer"
+    let tip = if stroke {
+        tl!("Stroke: click for swatches, Shift-click for the color mixer")
     } else {
-        "Fill: click for swatches, Shift-click for the color mixer"
+        tl!("Fill: click for swatches, Shift-click for the color mixer")
+    };
+    let resp = crate::widgets::chip_button_named(ui, size, chevron, tip, |ui, chip| {
+        crate::widgets::proxy_chip(ui, chip, &paint, mixed, stroke.then_some(size * 0.25));
     });
     if resp.clicked() {
         app.run("paint.toggleActive", json!({ "fill": !stroke })).ok();
@@ -461,6 +505,16 @@ pub(crate) fn paint_params(p: &Paint) -> Value {
     }
 }
 
+/// [`paint_params`] for a swatch made from paint the app shows: a color and a gradient's stops
+/// and points keep their color models (`keepModel`), in a CMYK document too.
+pub(crate) fn swatch_paint_params(p: &Paint) -> Value {
+    let mut v = paint_params(p);
+    if matches!(p, Paint::Solid { swatch: None, .. } | Paint::Gradient(_)) {
+        v["keepModel"] = json!(true);
+    }
+    v
+}
+
 /// Egui colour of a document colour.
 pub(crate) fn c32(c: &Color) -> egui::Color32 {
     let [r, g, b, _] = c.to_rgba8(1.0);
@@ -503,6 +557,8 @@ mod tests {
 mod tests_appearance;
 #[cfg(test)]
 mod tests_asset_export;
+#[cfg(test)]
+mod tests_blend;
 #[cfg(test)]
 mod tests_constrain;
 #[cfg(test)]

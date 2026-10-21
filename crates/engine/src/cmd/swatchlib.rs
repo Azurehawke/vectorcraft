@@ -63,7 +63,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Save Swatch Library…",
             ["Window", "Swatches"],
             None,
-            "{path?, format?: \"vcswatches\" (lossless JSON: colour models, global, spot, gradients, groups) | \"gpl\" (8-bit RGB palette; groups as `# Group:` comments) | \"ase\" (swatch exchange, binary: solid colors in their own model (RGB, CMYK, Lab, Gray) as global, spot or process colors, and color groups; gradients are left out, and a tint swatch is saved as the color it shows) | \"css\" (custom properties on :root) (default: the path's extension, else vcswatches), names?: [swatch or colour group names] (default: all; None and patterns are never saved), name?: library name (default: the document's), user?: false (save into the user library folder, listed under User Defined)} save the document's swatches as a library → {path, format, count, library?: id when saved to the user folder}; without path or user → {data: the file's text, format, count}, or {dataBase64, format, count} for ase",
+            "{path?, format?: \"vcswatches\" (lossless JSON: colour models, global, spot, gradients, groups) | \"gpl\" (8-bit RGB palette; groups as `# Group:` comments) | \"ase\" (swatch exchange, binary: solid colors in their own model (RGB, CMYK, Lab, Gray) as global, spot or process colors, and color groups; gradients are left out, and a tint swatch is saved as the color it shows) | \"css\" (custom properties on :root) (default: the path's extension, else vcswatches), names?: [swatch or colour group names] (default: all; None and patterns are never saved), name?: library name (default: the document's), user?: false (save into the user library folder, listed under User Defined)} save the document's swatches as a library → {path, format, count: the swatches written (gpl and ase hold solid colors only, and css leaves freeform gradients out), library?: id when saved to the user folder}; without path or user → {data: the file's text, format, count}, or {dataBase64, format, count} for ase",
             has_doc,
             save
         ),
@@ -152,13 +152,16 @@ impl<L: LibraryFile> Libraries<L> {
     }
 
     /// Re-read the library files of the user library folder (unreadable ones are skipped). The
-    /// folder is the app's own: automation roots don't apply to it ([`crate::file_access`]).
+    /// folder is the app's own: automation roots don't apply to it ([`crate::file_access`]). Each
+    /// file is read inside [`crate::guard::catch_panic`], and a file whose reading panics is
+    /// skipped too.
     pub fn rescan(&mut self) {
         self.extra.retain(|e| e.info.category != "user");
         let Some(dir) = self.user_dir.clone() else { return };
         for path in library_files(&dir, L::EXTS) {
             let file = file_name(&path);
-            let Some(lib) = crate::file_access::unconfined(|| read_file(&path)).ok().and_then(|b| L::read(&b, stem(&file)).ok()) else { continue };
+            let read = || crate::file_access::unconfined(|| read_file(&path)).ok().and_then(|b| L::read(&b, stem(&file)).ok());
+            let Some(lib) = crate::guard::catch_panic(read).ok().flatten() else { continue };
             let info = LibraryInfo { id: format!("user/{file}"), name: lib.name().to_string(), category: "user" };
             self.extra.push(Extra { info, path: Some(path), lib: Arc::new(lib) });
         }
@@ -272,7 +275,14 @@ impl<L: LibraryFile> Libraries<L> {
             .map(|e| (e.path.clone(), e.lib.clone()))
             .ok_or_else(|| bad(cmd, format!("`{id}` isn't a loaded library")))?;
         let (file, bytes) = match source.filter(|p| L::EXTS.contains(&extension(p).as_str())) {
-            Some(p) => (file_name(&p), read_file(&p)?),
+            Some(p) => {
+                let ext = extension(&p);
+                let base = file_name(&p);
+                // Color books (.acb) name the tab from the book title inside the file; a sandbox
+                // copy of an import often lands as tmp….tmp.acb (#2996).
+                let file = if ext == "acb" || temporary_library_file_name(&base) { library_file_name(lib.name(), &ext) } else { base };
+                (file, read_file(&p)?)
+            }
             None => (library_file_name(lib.name(), ext), encode(&lib)?),
         };
         self.rescan();
@@ -300,6 +310,12 @@ impl<L: LibraryFile> Libraries<L> {
         self.copied.push((id.to_string(), info.id.clone()));
         Ok((info, lib, written.is_some()))
     }
+}
+
+/// A library file name that looks like a host temporary (e.g. macOS `tmp1F2C.tmp.acb`).
+fn temporary_library_file_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains(".tmp.")
 }
 
 /// The file name of library `name` with extension `ext`: characters file systems reject become
@@ -393,6 +409,17 @@ pub fn library_colors(s: &Session, key: &str) -> Option<Vec<Color>> {
     Some(library(s, key)?.1.iter().filter_map(colors).collect())
 }
 
+/// The colour swatches of library `key` (an id or name) or, for [`DOCUMENT_SWATCHES`], of the
+/// active document (tint swatches left out: they stand for their base). `None` when there is no
+/// such library (or document).
+pub fn library_swatches(s: &Session, key: &str) -> Option<Vec<Swatch>> {
+    let own = |sw: &&Swatch| matches!(sw.paint, Paint::Solid { swatch: None, .. });
+    if key == DOCUMENT_SWATCHES {
+        return Some(s.active()?.doc.swatches_iter().filter(own).cloned().collect());
+    }
+    Some(library(s, key)?.1.iter().filter(own).cloned().collect())
+}
+
 /// The `limitTo` parameter's palette ([`limit_palette`]); `None` without one (or for "").
 pub(crate) fn limit_param(s: &Session, p: &Value, cmd: &str) -> Result<Option<Palette>> {
     let Some(key) = str_param(p, "limitTo").filter(|k| !k.is_empty()) else { return Ok(None) };
@@ -454,7 +481,7 @@ fn save(s: &mut Session, p: &Value) -> Result<Value> {
     let lib = document_library(&st.doc, &str_list(p, "names"), name, C)?;
     let bytes = palette_io::write(&lib, format).map_err(|e| bad(C, e))?;
     let data = if format.binary() { FileData::Binary(bytes) } else { FileData::Text(String::from_utf8_lossy(&bytes).into_owned()) };
-    let mut out = json!({"format": format.id(), "count": lib.len()});
+    let mut out = json!({"format": format.id(), "count": lib.iter().filter(|w| format.holds(&w.paint)).count()});
     s.swatch_libraries.write(p, &lib.name, format.id(), data, &mut out, C)?;
     Ok(out)
 }
@@ -606,7 +633,7 @@ fn reset_defaults(s: &mut Session, p: &Value) -> Result<Value> {
         let mut added = vec![];
         if replace {
             let before: Vec<String> = d.swatches_iter().map(|w| w.name.clone()).collect();
-            (d.swatches, d.swatch_groups) = (defaults, groups);
+            (d.swatches, d.swatch_groups) = (defaults.into(), groups.into());
             added.extend(d.swatches_iter().filter(|w| !before.contains(&w.name)).map(|w| w.name.clone()));
             live.extend(d.swatches_iter().filter(|w| w.global).map(|w| w.name.clone()));
             d.map_solid_paints(&mut |_, l, _| unlink_dead(&live, l));

@@ -1,12 +1,19 @@
 //! Artboard tool (Shift+O).
 //!
-//! Click an artboard to make it active (dashed bounds, 8 handles and its name). Drag inside moves
-//! it (with its artwork when the `moveArt` option is on, Shift constrains; Alt moves a copy and
+//! Click an object to create an artboard fitted to its visible bounds; drag still moves the
+//! containing artboard or draws one on the pasteboard. The second click of a double-click on an
+//! object does not fit another artboard, and that double-click does not open Artboard Options.
+//! Double-click an empty part of an artboard to open Artboard Options. Click an empty
+//! part of an artboard to make it active (dashed bounds, 8 handles and its name); Shift-click adds
+//! artboards to the selection or takes them out (dashed bounds), and a drag or Delete then acts on
+//! all of them (#1139). Shift-drag inside an artboard draws a new artboard there, and Shift-drag on
+//! the pasteboard is a marquee: the artboards it touches leave the selection or join it. Drag inside
+//! moves it (with its artwork when the `moveArt` option is on; Alt moves a copy and
 //! leaves the artboard where it was), drag a handle resizes it
 //! (Shift proportional, Alt from centre; with the `scaleArt` option on, Scale Artwork with Artboard,
 //! always proportional, and the art fully inside scales with it), drag on the pasteboard draws a new artboard, Delete removes
 //! the active one (Copy, Cut and Paste take it with its art: `artboard.copy`) and Escape returns to
-//! the Selection tool. Moving and resizing snap like drawing
+//! the Selection tool (during a drag it only cancels the drag). Moving and resizing snap like drawing
 //! does: to whole pixels, to the grid, or with Smart Guides to other artboards, their bleed and
 //! objects (never to the dragged artboard or the art moving or scaling with it); the artboard's own bleed edges
 //! snap too. A new artboard's corners snap as drawn points do ([`DrawSnap`]).
@@ -15,7 +22,7 @@ use serde_json::{Value, json};
 use vectorcraft_geom::{Affine, Point, Rect, Vec2};
 
 use super::{BLUE, polygon, rect_corners};
-use crate::bbox::{Handle, hit_handle, move_delta, scale_for_drag};
+use crate::bbox::{Handle, hit_handle, scale_for_drag};
 use crate::guides::{DrawSnap, Leave, Targets};
 use crate::{Action, Cursor, Mods, Overlay, PointerEvent, PointerKind, Tool, ToolContext, ToolKey};
 
@@ -26,6 +33,8 @@ enum Drag {
     /// last drag event (the step under way is a duplicate).
     Move {
         index: usize,
+        /// Several artboards move together (the selected ones, `index` among them).
+        many: bool,
         start: Point,
         rect: Rect,
         began: bool,
@@ -42,18 +51,29 @@ enum Drag {
     Create {
         start: Point,
         cur: Point,
+        /// A Shift-press inside an artboard (its index and the pressed point): released without
+        /// being dragged, it toggles that artboard.
+        toggle: Option<(usize, Point)>,
+    },
+    Marquee {
+        start: Point,
+        cur: Point,
     },
 }
 
 pub struct ArtboardTool {
     /// Index of the active artboard.
     pub active: usize,
+    /// The other selected artboards (Shift-click), in order.
+    pub others: Vec<usize>,
     /// Move artwork with the artboard.
     pub move_art: bool,
     /// Scale artwork with the artboard: a resize takes the art fully inside it along, and keeps the
     /// artboard's proportions.
     pub scale_art: bool,
     drag: Option<Drag>,
+    /// The pressed object can be fitted on release; a drag, modifier or cancellation takes over.
+    click_art: Option<(Point, Rect)>,
     preview: Option<Rect>,
     /// Smart Guide targets, gathered when a move or resize starts.
     targets: Option<Targets>,
@@ -63,20 +83,26 @@ pub struct ArtboardTool {
     guides: Vec<Overlay>,
     /// Smart Guides for the corners of a new artboard.
     draw: DrawSnap,
+    /// The canvas sets this on the second click of a double-click, so that release does not fit
+    /// a second artboard before [`PointerKind::DoubleClick`] arrives.
+    suppress_fit: bool,
 }
 
 impl Default for ArtboardTool {
     fn default() -> Self {
         Self {
             active: 0,
+            others: vec![],
             move_art: true,
             scale_art: false,
             drag: None,
+            click_art: None,
             preview: None,
             targets: None,
             copy_targets: None,
             guides: vec![],
             draw: DrawSnap::default(),
+            suppress_fit: false,
         }
     }
 }
@@ -88,6 +114,55 @@ fn rect_json(index: usize, r: Rect) -> Value {
 impl ArtboardTool {
     fn active_rect(&self, cx: &ToolContext) -> Option<Rect> {
         cx.doc.artboards.get(self.active).map(|a| a.rect)
+    }
+
+    /// The selected artboards that are still in the document: the active one and the others,
+    /// in order.
+    fn selected(&self, cx: &ToolContext) -> Vec<usize> {
+        let mut all: Vec<usize> = std::iter::once(self.active).chain(self.others.iter().copied()).filter(|i| *i < cx.doc.artboards.len()).collect();
+        all.sort_unstable();
+        all.dedup();
+        all
+    }
+
+    /// Shift-click on artboard `i`: into the selection, active, or out of it (another becomes
+    /// active).
+    fn toggle(&mut self, cx: &ToolContext, i: usize) {
+        let mut sel = self.selected(cx);
+        if let Some(at) = sel.iter().position(|j| *j == i) {
+            if sel.len() > 1 {
+                sel.remove(at);
+                self.active = if i == self.active { sel.first().copied().unwrap_or(0) } else { self.active };
+            }
+        } else {
+            sel.push(i);
+            self.active = i;
+        }
+        self.others = sel.into_iter().filter(|j| *j != self.active).collect();
+    }
+
+    /// A Shift-drag marquee `r`: the artboards it touches leave the selection when they are in
+    /// it and join it otherwise, the last one joining becoming active. One artboard always stays
+    /// selected.
+    fn toggle_touched(&mut self, cx: &ToolContext, r: Rect) {
+        let touched: Vec<usize> = cx
+            .doc
+            .artboards
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| r.x0 <= a.rect.x1 && a.rect.x0 <= r.x1 && r.y0 <= a.rect.y1 && a.rect.y0 <= r.y1)
+            .map(|(i, _)| i)
+            .collect();
+        let sel = self.selected(cx);
+        let added: Vec<usize> = touched.iter().copied().filter(|i| !sel.contains(i)).collect();
+        let kept: Vec<usize> = sel.into_iter().filter(|i| !touched.contains(i)).chain(added.iter().copied()).collect();
+        let Some(&first) = kept.first() else { return };
+        self.active = match added.last() {
+            Some(i) => *i,
+            None if kept.contains(&self.active) => self.active,
+            None => first,
+        };
+        self.others = kept.into_iter().filter(|j| *j != self.active).collect();
     }
 
     /// Gather the Smart Guide targets for dragging artboard `index` (call before the first preview,
@@ -146,6 +221,7 @@ impl ArtboardTool {
 
     fn end_drag(&mut self) {
         self.drag = None;
+        self.click_art = None;
         self.preview = None;
         self.targets = None;
         self.copy_targets = None;
@@ -156,6 +232,21 @@ impl ArtboardTool {
 
 /// An artboard's shortest side (as `artboard.setProps` keeps it).
 const MIN_SIDE: f64 = 1.0;
+
+fn rect_params(r: Rect) -> Value {
+    json!({ "x": r.x0, "y": r.y0, "width": r.width(), "height": r.height() })
+}
+
+fn create_artboard(r: Rect) -> Vec<Action> {
+    vec![Action::Exec("artboard.new".into(), rect_params(r)), Action::Notify("created".into())]
+}
+
+/// The visible bounds of the topmost object under `p`, when they are large enough to be an artboard.
+fn fittable_bounds(cx: &ToolContext, p: Point) -> Option<Rect> {
+    vectorcraft_doc::hit::hit_test(cx.doc, p, cx.hit_options())
+        .and_then(|h| cx.doc.bounds_of(&[h.top_object(cx.isolation)], true))
+        .filter(|r| r.width() >= MIN_SIDE && r.height() >= MIN_SIDE && [r.x0, r.y0, r.x1, r.y1].iter().all(|n| n.is_finite()))
+}
 
 /// `r` grown about `anchor` until both sides are at least [`MIN_SIDE`], by one factor, so a
 /// proportional resize keeps its proportions where the command would lengthen only the short side.
@@ -188,26 +279,59 @@ impl Tool for ArtboardTool {
     fn pointer(&mut self, cx: &ToolContext, ev: &PointerEvent) -> Vec<Action> {
         let p = ev.pos;
         let m = ev.mods;
+        // Set by the canvas on the second click of a double-click, and only for the release that
+        // follows. Any other event drops it, so a later single click still fits.
+        let skip_fit = ev.kind == PointerKind::Up && self.suppress_fit;
+        self.suppress_fit = false;
+        if ev.kind == PointerKind::Drag && self.click_art.is_some_and(|(start, _)| m != Mods::default() || p.distance(start) >= cx.tol(3.0)) {
+            self.click_art = None;
+        }
         match (ev.kind, self.drag) {
             (PointerKind::Down, _) => {
+                self.click_art = None;
                 if let Some(r) = self.active_rect(cx)
                     && let Some(handle) = hit_handle(r, p, cx.tol(5.0))
                 {
                     self.drag = Some(Drag::Resize { index: self.active, handle, rect: r, grab: handle.pos(r) - p, began: false });
                     return vec![];
                 }
+                if m == Mods::default() {
+                    // Match Fit to Selected Art, and do not stretch zero-sized art to the
+                    // artboard command's minimum side or pass non-finite bounds to it.
+                    self.click_art = fittable_bounds(cx, p).map(|r| (p, r));
+                }
+                if m.shift {
+                    // Shift-drag inside an artboard draws a new one there, and a Shift-click
+                    // toggles the artboard on release. Shift-drag outside every artboard is a
+                    // marquee: the artboards it touches toggle on release.
+                    match cx.doc.artboard_at(p) {
+                        Some(i) => {
+                            let start = self.draw.press(cx, p, &[], None);
+                            self.drag = Some(Drag::Create { start, cur: start, toggle: Some((i, p)) });
+                        }
+                        None => self.drag = Some(Drag::Marquee { start: p, cur: p }),
+                    }
+                    return vec![];
+                }
                 if let Some(i) = cx.doc.artboard_at(p)
                     && let Some(a) = cx.doc.artboards.get(i)
                 {
-                    self.active = i;
-                    self.drag = Some(Drag::Move { index: i, start: p, rect: a.rect, began: false, copy: false });
+                    if !self.selected(cx).contains(&i) {
+                        // A plain click on an artboard that isn't selected selects just it; on a
+                        // selected one, the selection stays, so the drag moves them all.
+                        self.others.clear();
+                        self.active = i;
+                    }
+                    let many = self.selected(cx).len() > 1 && self.selected(cx).contains(&i);
+                    self.drag = Some(Drag::Move { index: i, many, start: p, rect: a.rect, began: false, copy: false });
                 } else {
+                    self.others.clear();
                     let p = self.draw.press(cx, p, &[], None);
-                    self.drag = Some(Drag::Create { start: p, cur: p });
+                    self.drag = Some(Drag::Create { start: p, cur: p, toggle: None });
                 }
                 vec![]
             }
-            (PointerKind::Drag, Some(Drag::Move { index, start, rect, began, copy })) => {
+            (PointerKind::Drag, Some(Drag::Move { index, many, start, rect, began, copy })) => {
                 let mut out = vec![];
                 let label = |copy: bool| if copy { "Duplicate Artboard" } else { "Move Artboard" };
                 if !began {
@@ -221,13 +345,14 @@ impl Tool for ArtboardTool {
                     out.push(Action::Cancel);
                     out.push(Action::Begin(label(m.alt).into()));
                 }
-                self.drag = Some(Drag::Move { index, start, rect, began: true, copy: m.alt });
-                let d = self.snap_move(cx, rect, move_delta(start, p, m.shift), m.alt);
+                self.drag = Some(Drag::Move { index, many, start, rect, began: true, copy: m.alt });
+                let d = self.snap_move(cx, rect, p - start, m.alt);
                 self.preview = Some(rect + d);
-                out.push(Action::Preview(
-                    "artboard.move".into(),
-                    json!({ "index": index, "dx": d.x, "dy": d.y, "moveArt": self.move_art, "copy": m.alt }),
-                ));
+                let mut v = json!({ "index": index, "dx": d.x, "dy": d.y, "moveArt": self.move_art, "copy": m.alt });
+                if many {
+                    v["indices"] = json!(self.selected(cx));
+                }
+                out.push(Action::Preview("artboard.move".into(), v));
                 out
             }
             (PointerKind::Drag, Some(Drag::Resize { index, handle, rect, grab, began })) => {
@@ -251,37 +376,67 @@ impl Tool for ArtboardTool {
                 out.push(Action::Preview("artboard.setProps".into(), v));
                 out
             }
-            (PointerKind::Drag, Some(Drag::Create { start, .. })) => {
-                let cur = self.draw.drag(cx, p, Some(&Leave::diagonal(start, m.shift)));
-                self.drag = Some(Drag::Create { start, cur });
+            (PointerKind::Drag, Some(Drag::Create { start, toggle, .. })) => {
+                let cur = self.draw.drag(cx, p, Some(&Leave::diagonal(start, false)));
+                self.drag = Some(Drag::Create { start, cur, toggle });
+                vec![]
+            }
+            (PointerKind::Drag, Some(Drag::Marquee { start, .. })) => {
+                self.drag = Some(Drag::Marquee { start, cur: p });
                 vec![]
             }
             (PointerKind::Up, Some(d)) => {
+                let click_art = self.click_art;
                 self.end_drag();
+                if m == Mods::default()
+                    && !skip_fit
+                    && let Some((start, r)) = click_art
+                    && p.distance(start) < cx.tol(3.0)
+                {
+                    return create_artboard(r);
+                }
                 match d {
-                    Drag::Move { began: true, copy, .. } => {
-                        // The copy, last in the previewed document, becomes the active artboard.
+                    Drag::Move { began: true, copy, many, .. } => {
+                        // The copies, last in the previewed document, become the selection (the
+                        // last one active).
                         if copy {
-                            self.active = cx.doc.artboards.len().saturating_sub(1);
+                            let n = cx.doc.artboards.len();
+                            let k = if many { self.selected(cx).len().min(n) } else { 1 };
+                            self.active = n.saturating_sub(1);
+                            self.others = (n.saturating_sub(k)..n.saturating_sub(1)).collect();
                         }
                         vec![Action::Commit]
                     }
                     Drag::Resize { began: true, .. } => vec![Action::Commit],
-                    Drag::Create { start, cur } => {
+                    Drag::Create { toggle: Some((i, at)), .. } if p.distance(at) < cx.tol(3.0) => {
+                        self.toggle(cx, i);
+                        vec![]
+                    }
+                    Drag::Marquee { start, .. } => {
+                        let r = Rect::from_points(start, p);
+                        if r.width() >= cx.tol(3.0) || r.height() >= cx.tol(3.0) {
+                            self.toggle_touched(cx, r);
+                        }
+                        vec![]
+                    }
+                    Drag::Create { start, cur, .. } => {
                         let r = Rect::from_points(start, cur);
                         if r.width() < cx.tol(3.0) || r.height() < cx.tol(3.0) {
                             return vec![];
                         }
-                        vec![
-                            Action::Exec("artboard.new".into(), json!({ "x": r.x0, "y": r.y0, "width": r.width(), "height": r.height() })),
-                            Action::Notify("created".into()),
-                        ]
+                        create_artboard(r)
                     }
                     _ => vec![],
                 }
             }
             (PointerKind::DoubleClick, _) => {
                 self.end_drag();
+                // Fitting already happened on the first click. On an object this gesture does not
+                // open Artboard Options; a handle, a modifier, or empty artboard space still does.
+                let on_handle = self.active_rect(cx).and_then(|r| hit_handle(r, p, cx.tol(5.0))).is_some();
+                if m == Mods::default() && !on_handle && fittable_bounds(cx, p).is_some() {
+                    return vec![];
+                }
                 match cx.doc.artboards.get(self.active) {
                     Some(a) => {
                         let mut v = rect_json(self.active, a.rect);
@@ -295,29 +450,46 @@ impl Tool for ArtboardTool {
         }
     }
 
-    /// Delete/Backspace remove the active artboard ahead of the Clear shortcut, which would only
-    /// delete selected art; with one artboard left (it can't be deleted) they stay the shortcut's.
-    fn claims_key(&self, cx: &ToolContext, key: ToolKey) -> bool {
-        matches!(key, ToolKey::Delete | ToolKey::Backspace)
-            && self.drag.is_none()
-            && cx.doc.artboards.len() > 1
-            && self.active < cx.doc.artboards.len()
+    /// Escape owns the request to return to Selection (or cancel an active drag), so the UI
+    /// applies the tool's request instead of falling through to its general Escape behaviour.
+    /// Delete/Backspace belong to the artboards even when deletion is protected or a drag is
+    /// active: falling through to Clear would delete selected artwork instead.
+    fn claims_key(&self, _cx: &ToolContext, key: ToolKey) -> bool {
+        matches!(key, ToolKey::Escape | ToolKey::Delete | ToolKey::Backspace)
     }
 
     fn key(&mut self, cx: &ToolContext, key: ToolKey, _mods: Mods) -> Vec<Action> {
         match key {
             ToolKey::Delete | ToolKey::Backspace => {
-                if !self.claims_key(cx, key) {
+                let mut sel = self.selected(cx);
+                if self.drag.is_some() || cx.doc.artboards.len() <= 1 || self.active >= cx.doc.artboards.len() {
                     return vec![];
                 }
-                let i = self.active;
-                self.active = i.saturating_sub(1);
-                vec![Action::Exec("artboard.delete".into(), json!({ "index": i }))]
+                // With every artboard selected, keep the first one in the current order.
+                if sel.len() == cx.doc.artboards.len() {
+                    sel.retain(|i| *i != 0);
+                }
+                self.active = sel.first().copied().unwrap_or(0).saturating_sub(1);
+                self.others.clear();
+                let params = match sel.as_slice() {
+                    [i] => json!({ "index": i }),
+                    _ => json!({ "indices": sel }),
+                };
+                vec![Action::Exec("artboard.delete".into(), params)]
             }
             ToolKey::Escape => {
-                let busy = matches!(self.drag, Some(Drag::Move { began: true, .. } | Drag::Resize { began: true, .. }));
+                // During any drag (a move, a resize, a new artboard or a marquee) Escape only
+                // cancels the gesture; the next one leaves the tool.
+                let dragging = self.drag.is_some();
+                let previewed = matches!(self.drag, Some(Drag::Move { began: true, .. } | Drag::Resize { began: true, .. }));
                 self.end_drag();
-                if busy { vec![Action::Cancel] } else { vec![Action::SwitchTool("selection".into())] }
+                if previewed {
+                    vec![Action::Cancel]
+                } else if dragging {
+                    vec![]
+                } else {
+                    vec![Action::SwitchTool("selection".into())]
+                }
             }
             _ => vec![],
         }
@@ -326,12 +498,13 @@ impl Tool for ArtboardTool {
     fn notify(&mut self, cx: &ToolContext, what: &str) {
         if what == "created" {
             self.active = cx.doc.artboards.len().saturating_sub(1);
+            self.others.clear();
         }
     }
 
     fn overlays(&self, cx: &ToolContext) -> Vec<Overlay> {
         let mut o = vec![];
-        if let Some(Drag::Create { start, cur }) = self.drag {
+        if let Some(Drag::Create { start, cur, .. }) = self.drag {
             o.extend_from_slice(self.draw.guides());
             let r = Rect::from_points(start, cur);
             o.push(Overlay::Marquee(r));
@@ -339,6 +512,13 @@ impl Tool for ArtboardTool {
                 o.push(Overlay::Measure { p: cur + Vec2::new(cx.tol(12.0), cx.tol(12.0)), text: cx.size_label(r.width(), r.height()) });
             }
             return o;
+        }
+        if let Some(Drag::Marquee { start, cur }) = self.drag {
+            o.push(Overlay::Marquee(Rect::from_points(start, cur)));
+        }
+        // The other selected artboards: dashed bounds (in a drag the document shows them moved).
+        for r in self.others.iter().filter_map(|i| cx.doc.artboards.get(*i)).map(|a| a.rect) {
+            o.push(Overlay::Path { path: polygon(&rect_corners(r), true), color: BLUE, width: 1.0, dashed: true });
         }
         let Some(ab) = cx.doc.artboards.get(self.active) else { return o };
         let r = self.preview.unwrap_or(ab.rect);
@@ -362,7 +542,7 @@ impl Tool for ArtboardTool {
         o
     }
 
-    fn cursor(&self, cx: &ToolContext, p: Point, _m: Mods) -> Cursor {
+    fn cursor(&self, cx: &ToolContext, p: Point, m: Mods) -> Cursor {
         if let Some(r) = self.active_rect(cx)
             && let Some(h) = hit_handle(r, p, cx.tol(5.0))
         {
@@ -371,20 +551,36 @@ impl Tool for ArtboardTool {
                 Handle::Left | Handle::Right => Cursor::ResizeH,
                 Handle::TopLeft | Handle::BottomRight => Cursor::ResizeNwSe,
                 Handle::TopRight | Handle::BottomLeft => Cursor::ResizeNeSw,
-            };
+            }
+            .turned(cx.view_angle());
         }
-        if cx.doc.artboards.iter().any(|a| a.rect.contains(p)) { Cursor::Move } else { Cursor::Crosshair }
+        // With Shift a drag draws or selects, never moves.
+        if !m.shift && cx.doc.artboard_at(p).is_some() { Cursor::Move } else { Cursor::Crosshair }
     }
 
     fn options(&self) -> Value {
-        json!({ "active": self.active, "moveArt": self.move_art, "scaleArt": self.scale_art })
+        json!({ "active": self.active, "selected": std::iter::once(self.active).chain(self.others.iter().copied()).collect::<Vec<_>>(), "moveArt": self.move_art, "scaleArt": self.scale_art })
     }
 
     fn set_option(&mut self, key: &str, value: &Value) {
         match key {
-            "active" => self.active = value.as_u64().unwrap_or(0) as usize,
+            "active" => {
+                self.active = value.as_u64().unwrap_or(0) as usize;
+                self.others.clear();
+            }
+            // The selected artboards, the first active.
+            "selected" => {
+                let all: Vec<usize> =
+                    value.as_array().into_iter().flatten().filter_map(Value::as_u64).filter_map(|i| usize::try_from(i).ok()).collect();
+                if let Some((first, rest)) = all.split_first() {
+                    self.active = *first;
+                    self.others = rest.iter().copied().filter(|i| i != first).collect();
+                }
+            }
             "moveArt" => self.move_art = value.as_bool().unwrap_or(true),
             "scaleArt" => self.scale_art = value.as_bool().unwrap_or(false),
+            // Not one of the saved options: the canvas sets it for the release of a double-click.
+            "suppressFitClick" => self.suppress_fit = value.as_bool().unwrap_or(false),
             _ => {}
         }
     }
@@ -523,6 +719,174 @@ mod tests {
         assert_eq!(v["width"].as_f64(), Some(210.0));
     }
 
+    /// In a view turned 90° the handles' cursors turn with the view.
+    #[test]
+    fn handle_cursors_turn_with_the_view() {
+        let d = two_boards();
+        let (s, p) = (Selection::default(), paint());
+        let t = ArtboardTool { active: 1, ..Default::default() };
+        let mut c = cx(&d, &s, &p);
+        let (top, right) = (Point::new(700.0, 0.0), Point::new(800.0, 100.0));
+        assert_eq!(t.cursor(&c, top, Mods::default()), Cursor::ResizeV);
+        c.screen = turned_view(90.0);
+        assert_eq!(t.cursor(&c, top, Mods::default()), Cursor::ResizeH);
+        assert_eq!(t.cursor(&c, right, Mods::default()), Cursor::ResizeV);
+    }
+
+    /// Shift-click selects several artboards (#1139): a drag moves them all, Shift-click takes one
+    /// out again, a plain click on an unselected one selects just it, and Delete removes all the
+    /// selected ones (one artboard is always left).
+    #[test]
+    fn shift_click_selects_several_artboards_that_move_and_delete_together() {
+        let mut d = two_boards();
+        let mut third = d.artboards[0].clone();
+        third.rect = Rect::new(0.0, 600.0, 200.0, 800.0);
+        d.artboards.push(third);
+        let (s, p) = (Selection::default(), paint());
+        let c = cx(&d, &s, &p);
+        let shift = Mods { shift: true, ..Default::default() };
+        let click = |t: &mut ArtboardTool, x: f64, y: f64, m: Mods| {
+            t.pointer(&c, &ev(PointerKind::Down, x, y).with_mods(m));
+            t.pointer(&c, &ev(PointerKind::Up, x, y).with_mods(m));
+        };
+        let mut t = ArtboardTool::default();
+        click(&mut t, 450.0, 450.0, Mods::default());
+        click(&mut t, 700.0, 100.0, shift);
+        assert_eq!(t.options()["selected"], json!([1, 0]), "the Shift-clicked one is active");
+        // A drag from either moves both.
+        t.pointer(&c, &ev(PointerKind::Down, 450.0, 450.0));
+        let v = preview_params(&t.pointer(&c, &ev(PointerKind::Drag, 470.0, 450.0)));
+        assert_eq!((v["indices"].clone(), v["dx"].as_f64()), (json!([0, 1]), Some(20.0)));
+        assert_eq!(t.pointer(&c, &ev(PointerKind::Up, 470.0, 450.0)), vec![Action::Commit]);
+        // Delete removes both; with all three selected the keys retain the original first board.
+        assert_eq!(t.key(&c, ToolKey::Delete, Mods::default()), vec![Action::Exec("artboard.delete".into(), json!({"indices": [0, 1]}))]);
+        for key in [ToolKey::Delete, ToolKey::Backspace] {
+            t.set_option("selected", &json!([2, 0, 1]));
+            assert!(t.claims_key(&c, key));
+            assert_eq!(t.key(&c, key, Mods::default()), vec![Action::Exec("artboard.delete".into(), json!({"indices": [1, 2]}))]);
+            assert_eq!(t.options()["selected"], json!([0]));
+        }
+        t.set_option("selected", &json!([0, 1, 2]));
+        // Shift-click takes one out; a plain click on an unselected one selects just it.
+        click(&mut t, 100.0, 700.0, shift);
+        assert_eq!(t.options()["selected"], json!([0, 1]));
+        click(&mut t, 100.0, 700.0, Mods::default());
+        assert_eq!(t.options()["selected"], json!([2]));
+    }
+
+    /// A Shift-click toggles its artboard when the button comes up, so the press alone leaves the
+    /// selection as it was.
+    #[test]
+    fn a_shift_click_toggles_its_artboard_on_release() {
+        let d = two_boards();
+        let (s, p) = (Selection::default(), paint());
+        let c = cx(&d, &s, &p);
+        let shift = Mods { shift: true, ..Default::default() };
+        let mut t = ArtboardTool::default();
+        assert_eq!(t.pointer(&c, &ev(PointerKind::Down, 700.0, 100.0).with_mods(shift)), vec![]);
+        assert_eq!(t.options()["selected"], json!([0]), "the press alone selects nothing");
+        assert_eq!(t.pointer(&c, &ev(PointerKind::Up, 701.0, 100.0).with_mods(shift)), vec![]);
+        assert_eq!(t.options()["selected"], json!([1, 0]));
+        for kind in [PointerKind::Down, PointerKind::Up] {
+            t.pointer(&c, &ev(kind, 700.0, 100.0).with_mods(shift));
+        }
+        assert_eq!(t.options()["selected"], json!([0]), "a second Shift-click takes it out");
+    }
+
+    /// Shift-drag inside an artboard draws a new artboard there, neither square nor moving the
+    /// artboard it starts in, and the cursor shows a crosshair while Shift is held.
+    #[test]
+    fn a_shift_drag_inside_an_artboard_draws_a_new_one() {
+        let d = two_boards();
+        let (s, p) = (Selection::default(), paint());
+        let mut c = cx(&d, &s, &p);
+        c.smart_guides = false;
+        let shift = Mods { shift: true, ..Default::default() };
+        let mut t = ArtboardTool::default();
+        assert_eq!(t.cursor(&c, Point::new(300.0, 300.0), Mods::default()), Cursor::Move);
+        assert_eq!(t.cursor(&c, Point::new(300.0, 300.0), shift), Cursor::Crosshair);
+        assert_eq!(t.pointer(&c, &ev(PointerKind::Down, 300.0, 300.0).with_mods(shift)), vec![]);
+        assert_eq!(t.pointer(&c, &ev(PointerKind::Drag, 420.0, 380.0).with_mods(shift)), vec![], "no move preview");
+        assert!(matches!(t.overlays(&c)[0], Overlay::Marquee(_)));
+        let a = t.pointer(&c, &ev(PointerKind::Up, 420.0, 380.0).with_mods(shift));
+        assert_eq!(a, create_artboard(Rect::new(300.0, 300.0, 420.0, 380.0)));
+        assert_eq!(t.options()["selected"], json!([0]), "the artboard drawn in is not toggled");
+    }
+
+    /// Shift-drag on the pasteboard is a marquee: the artboards it touches leave the selection
+    /// or join it, the last one joining becoming active, and no artboard is drawn.
+    #[test]
+    fn a_shift_drag_on_the_pasteboard_selects_the_artboards_it_touches() {
+        let mut d = two_boards();
+        let mut third = d.artboards[0].clone();
+        third.rect = Rect::new(0.0, 600.0, 200.0, 800.0);
+        d.artboards.push(third);
+        let (s, p) = (Selection::default(), paint());
+        let c = cx(&d, &s, &p);
+        let shift = Mods { shift: true, ..Default::default() };
+        let mut t = ArtboardTool::default();
+        let marquee = |t: &mut ArtboardTool, from: (f64, f64), to: (f64, f64)| {
+            assert_eq!(t.pointer(&c, &ev(PointerKind::Down, from.0, from.1).with_mods(shift)), vec![]);
+            assert_eq!(t.pointer(&c, &ev(PointerKind::Drag, to.0, to.1).with_mods(shift)), vec![]);
+            assert!(t.overlays(&c).iter().any(|o| matches!(o, Overlay::Marquee(_))));
+            t.pointer(&c, &ev(PointerKind::Up, to.0, to.1).with_mods(shift))
+        };
+        // From between the artboards across Artboard 1 (selected) and Artboard 3: 1 leaves, 3 joins.
+        assert_eq!(marquee(&mut t, (550.0, 150.0), (150.0, 650.0)), vec![]);
+        assert_eq!(t.options()["selected"], json!([2]));
+        // Right of Artboard 2 across its corner: it joins and becomes active.
+        assert_eq!(marquee(&mut t, (850.0, -50.0), (700.0, 100.0)), vec![]);
+        assert_eq!(t.options()["selected"], json!([1, 2]));
+        // A Shift-click on the pasteboard changes nothing.
+        assert_eq!(marquee(&mut t, (550.0, 150.0), (551.0, 150.0)), vec![]);
+        assert_eq!(t.options()["selected"], json!([1, 2]));
+    }
+
+    /// A drag begun without Shift still moves the artboard, and on the pasteboard still draws one;
+    /// Shift pressed during either no longer keeps the move at 45° or the new artboard square.
+    #[test]
+    fn a_plain_drag_still_moves_and_shift_no_longer_constrains_it() {
+        let d = two_boards();
+        let (s, p) = (Selection::default(), paint());
+        let mut c = cx(&d, &s, &p);
+        c.smart_guides = false;
+        let shift = Mods { shift: true, ..Default::default() };
+        let mut t = ArtboardTool::default();
+        t.pointer(&c, &ev(PointerKind::Down, 700.0, 100.0));
+        let v = preview_params(&t.pointer(&c, &ev(PointerKind::Drag, 730.0, 110.0).with_mods(shift)));
+        assert_eq!((v["index"].as_u64(), v["dx"].as_f64(), v["dy"].as_f64()), (Some(1), Some(30.0), Some(10.0)));
+        assert_eq!(t.pointer(&c, &ev(PointerKind::Up, 730.0, 110.0).with_mods(shift)), vec![Action::Commit]);
+        t.pointer(&c, &ev(PointerKind::Down, 1000.0, 1000.0));
+        t.pointer(&c, &ev(PointerKind::Drag, 1100.0, 1050.0).with_mods(shift));
+        let a = t.pointer(&c, &ev(PointerKind::Up, 1100.0, 1050.0).with_mods(shift));
+        assert_eq!(a, create_artboard(Rect::new(1000.0, 1000.0, 1100.0, 1050.0)));
+    }
+
+    /// Escape during a marquee or while a new artboard is being drawn ends the gesture without
+    /// selecting or drawing anything and keeps the tool; the next Escape leaves it.
+    #[test]
+    fn escape_cancels_a_marquee_or_a_new_artboard_and_keeps_the_tool() {
+        let d = two_boards();
+        let (s, p) = (Selection::default(), paint());
+        let mut c = cx(&d, &s, &p);
+        c.smart_guides = false;
+        let shift = Mods { shift: true, ..Default::default() };
+        let mut t = ArtboardTool::default();
+        // A Shift-drag marquee on the pasteboard, a Shift-drag inside Artboard 1 and a plain drag on
+        // the pasteboard.
+        let drags =
+            [((850.0, -50.0), (700.0, 100.0), shift), ((300.0, 300.0), (420.0, 380.0), shift), ((1000.0, 1000.0), (1100.0, 1050.0), Mods::default())];
+        for (from, to, mods) in drags {
+            t.pointer(&c, &ev(PointerKind::Down, from.0, from.1).with_mods(mods));
+            t.pointer(&c, &ev(PointerKind::Drag, to.0, to.1).with_mods(mods));
+            assert_eq!(t.key(&c, ToolKey::Escape, Mods::default()), vec![], "Escape from {from:?} only ends the gesture");
+            assert!(!t.busy());
+            assert_eq!(t.pointer(&c, &ev(PointerKind::Up, to.0, to.1).with_mods(mods)), vec![], "the release draws nothing");
+            assert_eq!(t.options()["selected"], json!([0]), "the release selects nothing");
+        }
+        assert_eq!(t.key(&c, ToolKey::Escape, Mods::default()), vec![Action::SwitchTool("selection".into())]);
+    }
+
     /// Scale Artwork with Artboard (#602): the resize asks for the art to scale, keeps the artboard's
     /// proportions, and never snaps to the art scaling with it.
     #[test]
@@ -547,6 +911,22 @@ mod tests {
         let v = preview_params(&t.pointer(&c, &ev(PointerKind::Drag, 713.0, 100.0)));
         assert_eq!((v["width"].as_f64(), v["scaleArt"].as_bool()), (Some(113.0), Some(true)));
         assert!((v["height"].as_f64().unwrap() - 113.0).abs() < 1e-9);
+    }
+
+    /// Over an artboard's right or bottom edge the cursor shows Move and a click selects that
+    /// artboard, as on its left or top edge.
+    #[test]
+    fn a_click_on_an_artboards_right_or_bottom_edge_selects_it() {
+        let d = two_boards();
+        let (s, p) = (Selection::default(), paint());
+        let c = cx(&d, &s, &p);
+        for at in [Point::new(800.0, 100.0), Point::new(700.0, 200.0)] {
+            let mut t = ArtboardTool::default();
+            assert_eq!(t.cursor(&c, at, Mods::default()), Cursor::Move, "{at:?}");
+            t.pointer(&c, &ev(PointerKind::Down, at.x, at.y));
+            t.pointer(&c, &ev(PointerKind::Up, at.x, at.y));
+            assert_eq!(t.options()["selected"], json!([1]), "{at:?}");
+        }
     }
 
     /// A proportional resize never asks for a side under 1 pt, which the command would lengthen

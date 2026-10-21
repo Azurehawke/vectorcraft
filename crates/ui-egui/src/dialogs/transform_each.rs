@@ -1,15 +1,15 @@
 //! Object → Transform → Transform Each: scale, move and rotate every selected object about its own
-//! reference point, with reflection, randomness, Scale Corners and Scale Strokes & Effects
-//! (`object.transformEach`), previewed live on the canvas. Its Scale and Move sliders, Rotate dial
+//! reference point, with reflection, randomness, Transform Objects, Transform Patterns, Scale
+//! Corners and Scale Strokes & Effects (`object.transformEach`), previewed live on the canvas. Its Scale and Move sliders, Rotate dial
 //! and reflection, reference point and Random options are the Transform effect's too.
 //!
 //! Fields: `scaleH`, `scaleV` (%), `moveH`, `moveV` (pt), `rotate` (°), `reflectX`, `reflectY`,
-//! `random`, `reference` (0..8, the 9-point grid), `copy`, `corners`, `strokes` (default: the
-//! preferences, which OK updates) and `preview`.
+//! `random`, `reference` (0..8, the 9-point grid), `copy`, `objects`, `patterns`, `corners`,
+//! `strokes` (the last two default to the preferences, which OK updates) and `preview`.
 
 use serde_json::{Value, json};
 
-use super::transform::{add_scale_options, scale_options, with_scale_options};
+use super::transform::{add_object_options, add_scale_options, object_options, scale_options, with_scale_options};
 use super::{DialogSpec, form};
 use crate::VectorcraftApp;
 use crate::state::Dialog;
@@ -56,7 +56,8 @@ pub(super) fn sections(ui: &mut egui::Ui, d: &mut Dialog, units: vectorcraft_doc
     widgets::subheader(ui, tl!("Scale"));
     for (key, label) in axes("scaleH", "scaleV") {
         widgets::label_row(ui, label, LABEL_W, |ui| {
-            form::slider_rail(ui, d, key, 0.0..=200.0, &track);
+            let shown = widgets::SliderValue::field(d.f64(key, 100.0).clamp(-MAX_SCALE, MAX_SCALE), 0.0..=200.0, "%", 2);
+            form::slider_rail_valued(ui, d, key, label, 0.0..=200.0, Some(shown), &track);
             if let Some(n) = widgets::range_field(ui, ("te", key), d.f64(key, 100.0), -MAX_SCALE..=MAX_SCALE, "%", 2, FIELD_W) {
                 d.fields.insert(key.into(), json!(n));
             }
@@ -65,7 +66,8 @@ pub(super) fn sections(ui: &mut egui::Ui, d: &mut Dialog, units: vectorcraft_doc
     widgets::subheader(ui, tl!("Move"));
     for (key, label) in axes("moveH", "moveV") {
         widgets::label_row(ui, label, LABEL_W, |ui| {
-            form::slider_rail(ui, d, key, -1000.0..=1000.0, &track);
+            let shown = form::length_value(d, key, units, -1000.0..=1000.0);
+            form::slider_rail_valued(ui, d, key, label, -1000.0..=1000.0, shown, &track);
             form::length(ui, d, key, units, FIELD_W);
         });
     }
@@ -102,19 +104,23 @@ fn body(app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) -> bool {
         ui.vertical(|ui| {
             widgets::subheader(ui, tl!("Options"));
             ui.add_space(4.0);
+            object_options(app, ui, d);
             scale_options(app, ui, d);
             reflect_options(ui, d);
             form::check(ui, d, "copy", tl!("Copy"));
         });
     });
     let mut p = params(d);
+    add_object_options(app, d, &mut p);
     add_scale_options(app, d, &mut p);
     form::preview(app, ui, d, "Transform Each", CMD, p);
     false
 }
 
 fn confirm(app: &mut VectorcraftApp, d: &Dialog) -> Result<Value, String> {
-    let p = with_scale_options(app, d, params(d))?;
+    let mut p = params(d);
+    add_object_options(app, d, &mut p);
+    let p = with_scale_options(app, d, p)?;
     form::commit_preview(app, CMD, p)
 }
 
@@ -150,6 +156,6 @@ mod tests {
         assert!((n.geometric_bounds().unwrap().width() - 100.0).abs() < 1e-6);
         assert_eq!(n.appearance.stroke_width(), 1.0, "strokes kept their weight");
         let (cmd, p) = app.session.journal.last().unwrap();
-        assert_eq!((cmd.as_str(), &p["strokes"]), (CMD, &json!(false)));
+        assert_eq!((cmd.as_str(), &p["strokes"], &p["objects"]), (CMD, &json!(false), &json!(true)), "#1448: Transform Objects goes along");
     }
 }

@@ -29,6 +29,30 @@ pub fn simplify(path: &PathData, tolerance: f64) -> PathData {
     simplify_with(path, &SimplifyOptions { tolerance, ..Default::default() })
 }
 
+/// The Simplify slider's level for a tolerance of 1 pt, where the slider opens.
+pub const SIMPLIFY_LEVEL: f64 = 50.0;
+
+/// The tolerance (points) of Simplify slider level `level`, from 0 (the fewest anchor points) to
+/// 100 (the closest to the original): 1 pt at [`SIMPLIFY_LEVEL`], doubled for every 10 levels below
+/// it and halved for every 10 above, so level 0 is 32 pt and level 100 is 1/32 pt. A level outside
+/// 0..=100 counts as the nearer end, and one that is not a number counts as [`SIMPLIFY_LEVEL`].
+pub fn simplify_level_tolerance(level: f64) -> f64 {
+    let level = if level.is_finite() { level.clamp(0.0, 100.0) } else { SIMPLIFY_LEVEL };
+    ((SIMPLIFY_LEVEL - level) / 10.0).exp2()
+}
+
+/// Auto-Simplify's level for paths whose bounds are `size` points on their longer side: the lowest
+/// whole level whose tolerance ([`simplify_level_tolerance`]) is at most 1/400 of `size`. It returns
+/// level 100 for a size of 0 or one that is not a number, and for a size under 12.5 pt, where no
+/// level is that close.
+pub fn auto_simplify_level(size: f64) -> f64 {
+    let target = size / 400.0;
+    if !(target.is_finite() && target > 0.0) {
+        return 100.0;
+    }
+    (SIMPLIFY_LEVEL - 10.0 * target.log2()).ceil().clamp(0.0, 100.0)
+}
+
 /// Simplify never adds anchors: keep whichever subpath is smaller.
 fn no_worse(original: &SubPath, fitted: SubPath) -> SubPath {
     if fitted.anchors.len() > original.anchors.len() { original.clone() } else { fitted }
@@ -422,22 +446,24 @@ pub fn join(paths: &[PathData], tolerance: f64) -> PathData {
     PathData::new(closed)
 }
 
-/// Object → Path → Split Into Grid: `rows × cols` rectangles filling `rect` with `gutter` spacing
-/// (row-major, top-left first).
-pub fn split_into_grid(rect: Rect, rows: usize, cols: usize, gutter: f64) -> Vec<PathData> {
+/// Object → Path → Split Into Grid: `rows × cols` rectangles filling `rect` with a gutter between
+/// the rows and one between the columns (row-major, top-left first). No cells when they would have
+/// no size.
+pub fn split_into_grid(rect: Rect, rows: usize, cols: usize, (row_gutter, col_gutter): (f64, f64)) -> Vec<PathData> {
     if rows == 0 || cols == 0 {
         return Vec::new();
     }
-    let w = (rect.width() - gutter * (cols as f64 - 1.0)) / cols as f64;
-    let h = (rect.height() - gutter * (rows as f64 - 1.0)) / rows as f64;
-    if w <= 0.0 || h <= 0.0 {
+    let w = (rect.width() - col_gutter * (cols as f64 - 1.0)) / cols as f64;
+    let h = (rect.height() - row_gutter * (rows as f64 - 1.0)) / rows as f64;
+    // Written so that a size that is not a number gives no cells either.
+    if !(w > 0.0 && h > 0.0 && w.is_finite() && h.is_finite()) {
         return Vec::new();
     }
     let mut out = Vec::with_capacity(rows * cols);
     for r in 0..rows {
         for c in 0..cols {
-            let x = rect.x0 + c as f64 * (w + gutter);
-            let y = rect.y0 + r as f64 * (h + gutter);
+            let x = rect.x0 + c as f64 * (w + col_gutter);
+            let y = rect.y0 + r as f64 * (h + row_gutter);
             out.push(PathData::single(SubPath::polyline(
                 &[Point::new(x, y), Point::new(x + w, y), Point::new(x + w, y + h), Point::new(x, y + h)],
                 true,

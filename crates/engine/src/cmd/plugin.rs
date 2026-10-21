@@ -1,15 +1,17 @@
 //! `plugin.*` commands: sandboxed WebAssembly plug-ins (`vectorcraft-plugins`).
 //!
-//! Plug-ins are installed per process (`plugin.install`, or every `*.wasm` in the Additional
-//! Plug-ins Folder preference) and listed with `plugin.list` / `plugin.info`. Object filters run
+//! Plug-ins are installed with `plugin.install` (kept across restarts in the apps' plug-in folder,
+//! [`Session::attach_plugin_store`]) or from every `*.wasm` in the Additional Plug-ins Folder
+//! preference, and listed with `plugin.list` / `plugin.info`. Object filters run
 //! with `plugin.run` on the selected paths and compound paths (one undo step, transactional: a
 //! plug-in that fails leaves the document untouched); live-effect plug-ins are applied like any
-//! effect (`effect.apply {effect: "plugin.<id>"}`) and drawn by `vectorcraft-effects`.
+//! effect (`effect.apply {effect: "plugin.<id>"}`) and drawn by `vectorcraft-effects`; exporters
+//! add a file format that `document.export` writes (`fileio::plugin_formats`).
 
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Map, Value, json};
-use vectorcraft_plugins::{Kind, Plugin, effect, objects, registry};
+use vectorcraft_plugins::{Kind, Plugin, effect, export, objects, registry};
 
 use super::*;
 
@@ -26,8 +28,13 @@ pub fn describe(p: &Plugin) -> Value {
         "params": m.params_doc(), "paramsSchema": serde_json::to_value(m).ok().and_then(|v| v.get("params").cloned()),
         "size": p.size(), "source": p.source(),
     });
-    if m.kind == Kind::Effect {
-        v["effect"] = json!(effect::effect_id(&m.id));
+    match m.kind {
+        Kind::Effect => v["effect"] = json!(effect::effect_id(&m.id)),
+        Kind::Exporter => {
+            v["format"] = json!(export::format_id(&m.id));
+            v["extensions"] = json!(m.extensions);
+        }
+        Kind::Filter => {}
     }
     v
 }
@@ -55,8 +62,14 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "plugin.run";
     let plugin = plugin_by_id(C, p)?;
     let m = plugin.manifest();
-    if m.kind != Kind::Filter {
-        return Err(bad(C, format!("`{}` is a live effect: apply it with effect.apply {{\"effect\": \"{}\"}}", m.id, effect::effect_id(&m.id))));
+    match m.kind {
+        Kind::Filter => {}
+        Kind::Effect => {
+            return Err(bad(C, format!("`{}` is a live effect: apply it with effect.apply {{\"effect\": \"{}\"}}", m.id, effect::effect_id(&m.id))));
+        }
+        Kind::Exporter => {
+            return Err(bad(C, format!("`{}` is an exporter: export with document.export {{\"format\": \"{}\"}}", m.id, export::format_id(&m.id))));
+        }
     }
     // Bad parameters fail before anything runs.
     let mut params = Value::Object(m.resolve_params(&plugin_params(p)).map_err(|e| bad(C, e.to_string()))?);
@@ -85,19 +98,20 @@ const MAX_DATA_CHARS: usize = (32 << 20) / 3 * 4 + 4;
 /// The `.wasm` extension plug-in files have (File › Open installs them).
 pub const EXTS: &[&str] = &["wasm"];
 
-fn install(_: &mut Session, p: &Value) -> Result<Value> {
+fn install(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "plugin.install";
-    let plugin = match (str_param(p, "path").filter(|s| !s.is_empty()), str_param(p, "dataBase64")) {
+    let (plugin, bytes) = match (str_param(p, "path").filter(|s| !s.is_empty()), str_param(p, "dataBase64")) {
         (_, Some(data)) => {
             if data.len() > MAX_DATA_CHARS {
                 return Err(bad(C, "`dataBase64` is larger than the module limit"));
             }
             let bytes = vectorcraft_format::base64_decode(data).ok_or_else(|| bad(C, "`dataBase64` is not valid base64"))?;
             let plugin = Plugin::load(&bytes, vectorcraft_plugins::Limits::default()).map_err(err)?;
-            match str_param(p, "name") {
+            let plugin = match str_param(p, "name") {
                 Some(name) => plugin.with_source(name),
                 None => plugin,
-            }
+            };
+            (plugin, bytes)
         }
         (Some(path), None) => load_path(path)?,
         (None, None) => return Err(bad(C, "give `path` (a .wasm file) or `dataBase64` (the module)")),
@@ -105,17 +119,22 @@ fn install(_: &mut Session, p: &Value) -> Result<Value> {
     if !p.get("replace").and_then(Value::as_bool).unwrap_or(true) && registry::get(plugin.id()).is_some() {
         return Err(bad(C, format!("a plug-in with id {:?} is already installed", plugin.id())));
     }
+    // Installed plug-ins stay installed after a restart (#2541).
+    s.store_plugin(plugin.id(), &bytes);
     Ok(describe(&registry::install(plugin)))
 }
 
+/// The plug-in in the `.wasm` file `path`, and its module.
 #[cfg(not(target_arch = "wasm32"))]
-fn load_path(path: &str) -> Result<Plugin> {
+fn load_path(path: &str) -> Result<(Plugin, Vec<u8>)> {
     crate::file_access::check_read(path).map_err(EngineError::Other)?;
-    registry::load_file(std::path::Path::new(path), vectorcraft_plugins::Limits::default()).map_err(err)
+    let limits = vectorcraft_plugins::Limits::default();
+    let bytes = crate::store::read_capped(std::path::Path::new(path), limits.max_module_bytes as u64).map_err(EngineError::Other)?;
+    Ok((Plugin::load(&bytes, limits).map_err(err)?.with_source(path), bytes))
 }
 
 #[cfg(target_arch = "wasm32")]
-fn load_path(_: &str) -> Result<Plugin> {
+fn load_path(_: &str) -> Result<(Plugin, Vec<u8>)> {
     Err(EngineError::Other("installing from a path is not available on the web; pass the module as `dataBase64`".into()))
 }
 
@@ -186,8 +205,9 @@ fn info(_: &mut Session, p: &Value) -> Result<Value> {
     Ok(v)
 }
 
-fn remove(_: &mut Session, p: &Value) -> Result<Value> {
+fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     let id = str_param(p, "id").ok_or_else(|| bad("plugin.remove", "missing `id`"))?;
+    s.unstore_plugin(id);
     if registry::remove(id) { Ok(json!({"removed": id})) } else { Err(err(vectorcraft_plugins::Error::NotFound(id.into()))) }
 }
 
@@ -198,7 +218,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "List Plug-ins",
             [],
             None,
-            "{} → {plugins: [{id, name, version, kind: \"filter\"|\"effect\", author, description, params (doc), paramsSchema, effect? (the effect id of a live effect: plugin.<id>), size, source}], folder: the Additional Plug-ins Folder load report {folder, loaded, failed: [{file, error}]} | null}",
+            "{} → {plugins: [{id, name, version, kind: \"filter\"|\"effect\"|\"exporter\", author, description, params (doc), paramsSchema, effect? (the effect id of a live effect: plugin.<id>), format? and extensions? (an exporter's format id, plugin.<id>, for document.export, and its file extensions), size, source}], folder: the Additional Plug-ins Folder load report {folder, loaded, failed: [{file, error}]} | null}",
             always,
             list
         ),
@@ -216,7 +236,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Run Plug-in",
             [],
             None,
-            "{id, params?: {…} (the plug-in's parameters; or give them as top-level keys; missing ones take their defaults, see plugin.info), ids?: [..] (default: the selection)} run an object filter on the selected paths and compound paths (inside selected groups and layers too; hidden, locked, guide and clipping paths are left out): it may change, delete or add objects, as one undo step; the result is selected. With nothing selected it gets no objects (generators add theirs to the current layer) → {plugin, ids}",
+            "{id, params?: {…} (the plug-in's parameters; or give them as top-level keys; missing ones take their defaults, see plugin.info), ids?: [..] (default: the selection), …the plug-in's parameters as top-level keys} run an object filter on the selected paths and compound paths (inside selected groups and layers too; hidden, locked, guide and clipping paths are left out): it may change, delete or add objects, as one undo step; the result is selected. With nothing selected it gets no objects (generators add theirs to the current layer) → {plugin, ids}",
             has_doc,
             run
         ),
@@ -225,7 +245,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Install Plug-in",
             [],
             None,
-            "{path: a .wasm file (desktop) | dataBase64: the module (+ name?: shown as its source), replace?: bool (true: a plug-in with the same id is replaced)} validate and install a WebAssembly plug-in for this session → its plugin.list entry",
+            "{path: a .wasm file (desktop) | dataBase64: the module (+ name?: shown as its source), replace?: bool (true: a plug-in with the same id is replaced), name?: file name (with dataBase64)} validate and install a WebAssembly plug-in for this session → its plugin.list entry",
             always,
             install
         ),

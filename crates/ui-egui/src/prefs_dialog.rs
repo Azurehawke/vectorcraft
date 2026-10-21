@@ -9,7 +9,7 @@ use vectorcraft_engine::Prefs;
 use vectorcraft_engine::cmd::prefscmds::{GPU_PREFERENCES, PREF_CATEGORIES, PREF_GROUPS, PREF_SPECS, PrefKind};
 
 use crate::state::Dialog;
-use crate::theme::{self, Brightness, Tokens};
+use crate::theme::{self, Accent, Brightness, Scheme, Tokens};
 use crate::{VectorcraftApp, widgets};
 
 /// UI-only fields shown in the dialog (backed by `UiState`, not engine prefs).
@@ -45,6 +45,7 @@ pub fn confirm(app: &mut VectorcraftApp) -> Result<Value, String> {
     app.ui.task_bar = d.fields.get("__taskBar").and_then(Value::as_bool).unwrap_or(app.ui.task_bar);
     app.ui.dialog = None;
     app.ui.engine_prefs = app.session.prefs.to_json();
+    app.prefs_changed = true;
     Ok(Value::Null)
 }
 
@@ -80,6 +81,8 @@ pub fn restore(app: &mut VectorcraftApp) {
 #[derive(Clone, Copy, PartialEq)]
 struct Applied {
     brightness: Brightness,
+    accent: Accent,
+    scheme: Scheme,
     /// User Interface › Canvas Color, unless it matches the interface brightness.
     canvas: Option<egui::Color32>,
     threads: i32,
@@ -110,6 +113,8 @@ pub fn apply_runtime(app: &mut VectorcraftApp, ctx: &egui::Context) {
     }
     let want = Applied {
         brightness: app.ui.brightness,
+        accent: Accent::parse(&p.ui_accent).unwrap_or_default(),
+        scheme: Scheme::parse(&p.ui_color_scheme).unwrap_or_default(),
         canvas: canvas_color(&p.canvas_color),
         threads: p.render_threads,
         tool_tips: p.show_tool_tips,
@@ -119,7 +124,7 @@ pub fn apply_runtime(app: &mut VectorcraftApp, ctx: &egui::Context) {
     let id = egui::Id::new("dc-applied-prefs");
     let prev: Option<Applied> = ctx.data(|d| d.get_temp::<Option<Applied>>(id)).flatten();
     if prev != Some(want) {
-        theme::apply(ctx, want.brightness);
+        theme::apply_with(ctx, want.brightness, want.accent, want.scheme);
         // General › Show Tool Tips: off, no button or field shows its tool tip (they never come
         // due), whichever widget asks for one.
         let delay = if want.tool_tips { egui::style::Interaction::default().tooltip_delay } else { f32::INFINITY };
@@ -166,7 +171,7 @@ pub fn show(app: &mut VectorcraftApp, ctx: &egui::Context) {
                     for c in PREF_CATEGORIES {
                         let sel = *c == cat;
                         let text = egui::RichText::new(tl!(*c)).size(12.5).color(if sel { t.text_strong } else { t.text });
-                        let b = egui::Button::selectable(sel, text).frame_when_inactive(false).min_size(egui::vec2(184.0, 24.0));
+                        let b = egui::Button::selectable(sel, text).min_size(egui::vec2(184.0, 24.0));
                         if ui.add(b).clicked() {
                             d.fields.insert("__category".into(), json!(c));
                         }
@@ -274,7 +279,7 @@ fn category_fields(ui: &mut egui::Ui, d: &mut Dialog, cat: &str) {
                 labeled(ui, sp.label, |ui| {
                     let mut x = v.as_f64().unwrap_or(min);
                     let new = if sp.key == "uiScaling" {
-                        ui.add(egui::Slider::new(&mut x, min..=max).step_by(0.05).text(tl!("Smaller ↔ Larger"))).changed().then_some(x)
+                        widgets::slider(ui, egui::Slider::new(&mut x, min..=max).step_by(0.05).text(tl!("Smaller ↔ Larger"))).changed().then_some(x)
                     } else {
                         widgets::range_field(ui, sp.key, x, min..=max, &format!(" {unit}"), 3, 110.0)
                     };
@@ -297,7 +302,7 @@ fn category_fields(ui: &mut egui::Ui, d: &mut Dialog, cat: &str) {
                 labeled(ui, sp.label, |ui| {
                     let mut x = v.as_i64().unwrap_or(min);
                     let new = if sp.key == "anchorSize" {
-                        ui.add(egui::Slider::new(&mut x, min..=max).show_value(false).text(tl!("Size"))).changed().then_some(x)
+                        widgets::slider(ui, egui::Slider::new(&mut x, min..=max).show_value(false).text(tl!("Size"))).changed().then_some(x)
                     } else {
                         widgets::range_field(ui, sp.key, x as f64, min as f64..=max as f64, "", 0, 110.0).map(|x| x as i64)
                     };
@@ -306,18 +311,26 @@ fn category_fields(ui: &mut egui::Ui, d: &mut Dialog, cat: &str) {
                     }
                 });
             }
+            // Linux only: the other platforms have a single display server.
+            PrefKind::Choice(_) if sp.key == "linuxDisplayServer" && !cfg!(target_os = "linux") => {}
+            // The Classic colour scheme has its own accent: dimmed while it is chosen.
+            PrefKind::Choice(opts) if sp.key == "uiAccent" => {
+                let modern = Scheme::parse(&d.str("uiColorScheme")).unwrap_or_default() == Scheme::Modern;
+                ui.add_enabled_ui(modern, |ui| choice_row(ui, d, sp.key, sp.label, opts, &v));
+            }
             PrefKind::Choice(opts) => {
-                labeled(ui, sp.label, |ui| {
-                    let cur = v.as_str().unwrap_or("");
-                    let cur_label = opts.iter().find(|o| o.0 == cur).map(|o| o.1).unwrap_or(cur);
-                    let labels: Vec<&str> = opts.iter().map(|o| o.1).collect();
-                    if let Some(i) = widgets::dropdown(ui, sp.key, cur_label, &labels, 260.0) {
-                        d.fields.insert(sp.key.into(), json!(opts[i].0));
-                    }
-                });
-                if sp.key == "gpuPreference" {
-                    // The window's graphics device is chosen once, when the app starts.
+                choice_row(ui, d, sp.key, sp.label, opts, &v);
+                if sp.key == "gpuPreference" || sp.key == "linuxDisplayServer" {
+                    // The window's graphics device and display server are chosen once, when the app starts.
                     ui.label(egui::RichText::new(tl!("Applies the next time VectorCraft starts.")).color(t.text_dim).size(11.0));
+                }
+                if sp.key == "linuxDisplayServer" {
+                    // Many Wayland desktops give a drawing tablet's pen to the window only through XWayland (#2028).
+                    ui.label(
+                        egui::RichText::new(tl!("If a drawing tablet's pen doesn't draw, choose an X11 (XWayland) option."))
+                            .color(t.text_dim)
+                            .size(11.0),
+                    );
                 }
             }
             PrefKind::Color => {
@@ -360,6 +373,19 @@ fn category_fields(ui: &mut egui::Ui, d: &mut Dialog, cat: &str) {
 /// Is one of the dialog's Units (General, Stroke, Type, East Asian Type) Picas?
 fn picas_in_use(d: &Dialog) -> bool {
     ["unitsGeneral", "unitsStroke", "unitsType", "unitsAsianType"].iter().any(|k| d.str(k) == vectorcraft_doc::Unit::Picas.key())
+}
+
+fn choice_row(ui: &mut egui::Ui, d: &mut Dialog, key: &str, label: &str, opts: &[(&str, &str)], v: &Value) {
+    labeled(ui, label, |ui| {
+        let cur = v.as_str().unwrap_or("");
+        let cur_label = opts.iter().find(|o| o.0 == cur).map(|o| o.1).unwrap_or(cur);
+        let labels: Vec<&str> = opts.iter().map(|o| o.1).collect();
+        if let Some(i) = widgets::dropdown(ui, key, cur_label, &labels, 260.0)
+            && let Some(o) = opts.get(i)
+        {
+            d.fields.insert(key.into(), json!(o.0));
+        }
+    });
 }
 
 fn bool_row(ui: &mut egui::Ui, d: &mut Dialog, key: &str, label: &str) {
@@ -555,7 +581,10 @@ mod tests {
         assert!(shown.iter().any(|t| t == "Automatic"), "{shown:?}");
         assert!(shown.iter().any(|t| t == "Applies the next time VectorCraft starts."), "{shown:?}");
         a.ui.dialog.as_mut().unwrap().fields.insert("gpuPreference".into(), json!("highPerformance"));
+        assert!(!a.take_prefs_changed(), "nothing to write before OK");
         confirm(&mut a).unwrap();
+        assert!(a.take_prefs_changed(), "OK asks the host to write the preferences file");
+        assert!(!a.take_prefs_changed());
         assert_eq!(a.session.prefs.gpu_preference, "highPerformance");
         let saved: Value = serde_json::from_slice(&serde_json::to_vec(&a.ui).unwrap()).unwrap();
         assert_eq!(saved["engine_prefs"]["gpuPreference"], json!("highPerformance"));
@@ -583,13 +612,76 @@ mod tests {
         out.textures_delta.clear();
         let mut shown = vec![];
         out.shapes.iter().for_each(|c| texts(&c.shape, &mut shown));
-        assert!(shown.iter().any(|t| t == "System Title Bar"), "{shown:?}");
-        assert!(shown.iter().any(|t| t == "Applies the next time VectorCraft starts."), "{shown:?}");
+        let supported = cfg!(all(not(target_arch = "wasm32"), not(target_os = "macos")));
+        assert_eq!(shown.iter().any(|t| t == "System Title Bar"), supported, "{shown:?}");
+        assert_eq!(shown.iter().any(|t| t == "Applies the next time VectorCraft starts."), supported, "{shown:?}");
         a.ui.dialog.as_mut().unwrap().fields.insert("systemTitleBar".into(), json!(true));
         confirm(&mut a).unwrap();
         assert!(a.session.prefs.system_title_bar);
         let saved: Value = serde_json::from_slice(&serde_json::to_vec(&a.ui).unwrap()).unwrap();
         assert_eq!(saved["engine_prefs"]["systemTitleBar"], json!(true));
+    }
+
+    /// Performance › Linux Display Server (#2028): on Linux it shows the drawing-tablet note, and
+    /// X11 (XWayland) When a Pen Is Attached is applied by OK and saved under the key the desktop
+    /// app reads before the window opens.
+    #[test]
+    fn linux_display_server_offers_the_pen_choice() {
+        fn texts(s: &egui::Shape, out: &mut Vec<String>) {
+            match s {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+                _ => {}
+            }
+        }
+        let mut a = app();
+        open(&mut a, Some("Performance"));
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        // The window sizes itself on the first frame and draws on the second.
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| show(&mut a, ui.ctx()));
+        out.textures_delta.clear();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| show(&mut a, ui.ctx()));
+        out.textures_delta.clear();
+        let mut shown = vec![];
+        out.shapes.iter().for_each(|c| texts(&c.shape, &mut shown));
+        let linux = cfg!(target_os = "linux");
+        assert_eq!(shown.iter().any(|t| t.starts_with("Linux Display Server")), linux, "{shown:?}");
+        let note = "If a drawing tablet's pen doesn't draw, choose an X11 (XWayland) option.";
+        assert_eq!(shown.iter().any(|t| t == note), linux, "{shown:?}");
+        a.ui.dialog.as_mut().unwrap().fields.insert("linuxDisplayServer".into(), json!("x11WithPen"));
+        confirm(&mut a).unwrap();
+        assert_eq!(a.session.prefs.linux_display_server, "x11WithPen");
+        let saved: Value = serde_json::from_slice(&serde_json::to_vec(&a.ui).unwrap()).unwrap();
+        assert_eq!(saved["engine_prefs"]["linuxDisplayServer"], json!("x11WithPen"));
+    }
+
+    /// #1866: the category shown is highlighted in the list while the pointer is elsewhere.
+    #[test]
+    fn the_category_shown_is_highlighted() {
+        fn rects(s: &egui::Shape, out: &mut Vec<(egui::Rect, egui::Color32)>) {
+            match s {
+                egui::Shape::Rect(r) => out.push((r.rect, r.fill)),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| rects(s, out)),
+                _ => {}
+            }
+        }
+        let mut a = app();
+        open(&mut a, Some("Units"));
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        // The window sizes itself on the first frame and draws on the second.
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| show(&mut a, ui.ctx()));
+        out.textures_delta.clear();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| show(&mut a, ui.ctx()));
+        out.textures_delta.clear();
+        let mut shown = vec![];
+        out.shapes.iter().for_each(|c| rects(&c.shape, &mut shown));
+        // The list's rows, top to bottom: only the fourth (Units) is filled.
+        let rows: Vec<_> = shown.iter().filter(|(r, _)| r.width() == 184.0 && r.height() < 30.0).collect();
+        assert_eq!(rows.len(), PREF_CATEGORIES.len(), "{shown:?}");
+        let filled: Vec<usize> = rows.iter().enumerate().filter(|(_, (_, c))| c.a() > 0).map(|(i, _)| i).collect();
+        assert_eq!(filled, vec![3], "{rows:?}");
     }
 
     /// Units › Numbers Without Units Are Points (#394): the preference reaches the fields when it

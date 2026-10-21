@@ -144,6 +144,28 @@ fn options_leave_out_links_fonts_and_the_report() {
 }
 
 #[test]
+fn a_package_never_replaces_its_source_or_its_links() {
+    let dir = Folder::new("package-overwrite");
+    let mut s = poster(&dir);
+    let doc = dir.file("poster.vectorcraft");
+    let (saved, red) = (std::fs::read(&doc).unwrap(), std::fs::read(dir.file("art/red.png")).unwrap());
+    let parent = dir.0.parent().unwrap();
+    let name = dir.0.file_name().unwrap().to_string_lossy().into_owned();
+    // The document's own folder, named directly and through `..`.
+    for folder in [parent.to_path_buf(), dir.0.join("art").join("..").join("..")] {
+        let e = s.execute("file.package", &json!({"folder": folder, "name": name})).unwrap_err().to_string();
+        assert!(e.contains("would be overwritten"), "{e}");
+    }
+    // The folder of its linked files, with the links beside the packaged document.
+    let e = s.execute("file.package", &json!({"folder": dir.0, "name": "art", "linksFolder": false})).unwrap_err().to_string();
+    assert!(e.contains("red.png"), "{e}");
+    // Nothing was written.
+    assert_eq!(std::fs::read(&doc).unwrap(), saved);
+    assert_eq!(std::fs::read(dir.file("art/red.png")).unwrap(), red);
+    assert!(!dir.0.join("art/poster.vectorcraft").exists() && !dir.0.join("poster Report.txt").exists());
+}
+
+#[test]
 fn a_missing_link_is_reported_not_copied() {
     let dir = Folder::new("package-missing");
     let mut s = poster(&dir);
@@ -197,6 +219,7 @@ fn the_document_info_report_has_every_category() {
         "DOCUMENT",
         "OBJECTS",
         "GRAPHIC STYLES",
+        "BRUSHES",
         "SPOT COLORS",
         "PATTERN OBJECTS",
         "GRADIENT SWATCHES",
@@ -216,8 +239,10 @@ fn the_document_info_report_has_every_category() {
     assert_eq!((i["sections"].as_array().unwrap().len(), i["sections"][0]["id"].as_str()), (1, Some("linkedImages")));
     assert_eq!(i["sections"][0]["rows"].as_array().unwrap().len(), 2);
     let all = run(&mut s, "document.info", json!({}));
-    assert_eq!(all["sections"].as_array().unwrap().len(), 11);
-    assert!(s.execute("document.info", &json!({"category": "brushes"})).is_err());
+    assert_eq!(all["sections"].as_array().unwrap().len(), 12);
+    let i = run(&mut s, "document.info", json!({"category": "brushes"}));
+    assert_eq!((i["sections"].as_array().unwrap().len(), i["sections"][0]["id"].as_str()), (1, Some("brushes")));
+    assert!(s.execute("document.info", &json!({"category": "strokes"})).is_err());
     assert!(s.execute("document.info", &json!({"format": "xml"})).is_err());
     // The bundled fonts allow embedding.
     let face = vectorcraft_text::FontDb::global().face("Source Sans 3", "Regular").unwrap();

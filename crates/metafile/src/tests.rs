@@ -4,7 +4,9 @@
 use std::sync::Arc;
 
 use vectorcraft_color::{Color, Gradient, GradientPaint, Paint};
-use vectorcraft_doc::{Appearance, CharStyle, Dash, Document, ImageBlob, ImageObject, LineCap, LineJoin, Node, NodeId, NodeKind, TextObject};
+use vectorcraft_doc::{
+    Appearance, CharStyle, Dash, Document, ImageBlob, ImageObject, LineCap, LineJoin, Node, NodeId, NodeKind, PatternDef, TextObject,
+};
 use vectorcraft_geom::{Affine, PathData, Point, Rect, shapes};
 
 use crate::*;
@@ -49,7 +51,7 @@ pub(crate) fn image_node(d: &mut Document, bytes: Vec<u8>, w: u32, h: u32, xf: A
     let blob = ImageBlob::new("image/png", bytes);
     let key = blob.content_key();
     d.images.insert(key.clone(), blob);
-    Node::new(NodeId(0), NodeKind::Image(ImageObject { key, width: w, height: h, xf, link: None, placement: Default::default() }))
+    Node::new(NodeId(0), NodeKind::Image(Box::new(ImageObject { key, width: w, height: h, xf, link: None, placement: Default::default() })))
 }
 
 pub(crate) fn u32_at(b: &[u8], at: usize) -> u32 {
@@ -327,4 +329,47 @@ fn hidden_and_offboard_art_is_left_out() {
     let k = kinds(&emf_records(&emf(&d).bytes));
     assert!(!k.contains(&62) && !k.contains(&39));
     assert!(export(&d, Rect::new(0.0, 0.0, 0.0, 10.0), Kind::Emf).is_err(), "an empty region");
+}
+
+#[test]
+fn an_instance_whose_art_reaches_the_artboard_is_written() {
+    // The symbol's red rectangle, (100, 100) to (140, 140), drawn from (-50, -50): on the artboard,
+    // while the 20 × 20 square around the origin, moved to (-60, -60) to (-40, -40), is off it.
+    let inst = Node::new(NodeId(0), NodeKind::SymbolInstance { symbol: "Far".into(), xf: Affine::translate((-50.0, -50.0)) });
+    let mut d = doc_with(100.0, 100.0, vec![inst]);
+    let art = path(shapes::rectangle(Rect::new(100.0, 100.0, 140.0, 140.0)), red(), Paint::None, 0.0);
+    d.symbols.push(vectorcraft_doc::Symbol { name: "Far".into(), art: Arc::new(art) });
+    let k = kinds(&emf_records(&emf(&d).bytes));
+    assert!(k.contains(&39), "a brush fills the art: {k:?}");
+}
+
+/// A pattern `name` repeating `art` every point.
+fn point_tiles(name: &str, art: Node) -> PatternDef {
+    let mut def = PatternDef::new(name, vec![Arc::new(art)]);
+    def.tile = Rect::new(0.0, 0.0, 1.0, 1.0);
+    def
+}
+
+fn pattern(name: &str) -> Paint {
+    Paint::Pattern { pattern: name.into(), xf: Affine::IDENTITY }
+}
+
+#[test]
+fn patterns_inside_pattern_tiles_share_one_tile_budget() {
+    // About 3,700 tiles of a 12 pt square, each filled with about 140 tiles of a dot: over half a
+    // million fills when every tile is written.
+    let square = path(shapes::rectangle(Rect::new(0.0, 0.0, 12.0, 12.0)), pattern("dots"), Paint::None, 0.0);
+    let mut d = doc_with(50.0, 50.0, vec![path(shapes::rectangle(Rect::new(0.0, 0.0, 50.0, 50.0)), pattern("squares"), Paint::None, 0.0)]);
+    d.patterns.push(point_tiles("dots", path(shapes::rectangle(Rect::new(0.0, 0.0, 1.0, 1.0)), red(), Paint::None, 0.0)));
+    d.patterns.push(point_tiles("squares", square));
+    let (ops, warnings) = crate::scene::Scene::new(&d, d.artboards[0].rect, true).run();
+    assert!(ops.len() < 300_000, "{} operations", ops.len());
+    assert!(warnings.iter().any(|w| w.contains("one colour")), "{warnings:?}");
+
+    // A tile filled with its own pattern multiplies at every level down to the nesting limit.
+    let square = path(shapes::rectangle(Rect::new(0.0, 0.0, 4.0, 4.0)), pattern("self"), Paint::None, 0.0);
+    let mut d = doc_with(10.0, 10.0, vec![path(shapes::rectangle(Rect::new(0.0, 0.0, 10.0, 10.0)), pattern("self"), Paint::None, 0.0)]);
+    d.patterns.push(point_tiles("self", square));
+    let (ops, _) = crate::scene::Scene::new(&d, d.artboards[0].rect, true).run();
+    assert!(ops.len() < 300_000, "{} operations", ops.len());
 }

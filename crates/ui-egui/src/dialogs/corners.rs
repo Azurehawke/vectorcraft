@@ -46,7 +46,7 @@ pub fn open(app: &mut VectorcraftApp, p: &Value) -> Result<Value, String> {
     };
     // Every corner given is one of the path's: none is left out of the edit.
     if corners.is_empty() || !corners.iter().all(|k| live.corner(*k).is_some()) {
-        return Err("give corners of the path: anchors between two straight sides".into());
+        return Err("give corners of the path: anchors where its sides meet at an angle".into());
     }
     let (radius, kind) = live.style(&corners);
     let mut fields = json!({"id": id.0, "corners": corners});
@@ -120,7 +120,7 @@ mod tests {
         let Some(NodeKind::Path { live: Some(l), .. }) = app.session.active().unwrap().doc.node(NodeId(id)).map(|n| n.kind.clone()) else {
             panic!("not live")
         };
-        l
+        *l
     }
 
     fn corners(app: &VectorcraftApp, id: u64) -> ([f64; 4], [CornerKind; 4]) {
@@ -239,7 +239,7 @@ mod tests {
         d.fields.insert("radius".into(), json!(5));
         super::super::confirm(&mut app).unwrap();
         let n = app.session.active().unwrap().doc.node(NodeId(id)).unwrap().clone();
-        assert!(matches!(&n.kind, NodeKind::Path { live: Some(LiveShape::Path { .. }), .. }));
+        assert!(matches!(&n.kind, NodeKind::Path { live: Some(l), .. } if matches!(**l, LiveShape::Path { .. })));
         assert_eq!(crate::panels::corner_radius(&app, &n), Some(5.0));
     }
 }

@@ -3,6 +3,7 @@
 
 use serde_json::{Value, json};
 
+use super::shapes::grid_pin_to_anchor;
 use crate::VectorcraftApp;
 use crate::state::Dialog;
 
@@ -10,22 +11,41 @@ use crate::state::Dialog;
 pub fn open_tool_dialog(app: &mut VectorcraftApp, kind: &str, p: Value) {
     let x = p.get("x").and_then(Value::as_f64).unwrap_or(0.0);
     let y = p.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+    let alt = p.get("alt").and_then(Value::as_bool).unwrap_or(false);
     let d = match kind {
-        "rectangle" | "ellipse" => Dialog::new(kind, json!({"x": x, "y": y, "width": "100 pt", "height": "100 pt"})),
-        "roundedRectangle" => Dialog::new(kind, json!({"x": x, "y": y, "width": "100 pt", "height": "100 pt", "radius": "12 pt"})),
-        "polygon" => Dialog::new(kind, json!({"x": x, "y": y, "radius": "50 pt", "sides": 6})),
-        "star" => Dialog::new(kind, json!({"x": x, "y": y, "radius1": "50 pt", "radius2": "25 pt", "points": 5})),
+        "rectangle" | "ellipse" => Dialog::new(kind, json!({"x": x, "y": y, "alt": alt, "width": "100 pt", "height": "100 pt"})),
+        "roundedRectangle" => Dialog::new(kind, json!({"x": x, "y": y, "alt": alt, "width": "100 pt", "height": "100 pt", "radius": "12 pt"})),
+        "polygon" => Dialog::new(kind, json!({"x": x, "y": y, "radius": "50 pt", "sides": app.session.tool_options_of(kind)["sides"]})),
+        "star" => {
+            Dialog::new(kind, json!({"x": x, "y": y, "radius1": "50 pt", "radius2": "25 pt", "points": app.session.tool_options_of(kind)["points"]}))
+        }
         "lineSegment" => Dialog::new(kind, json!({"x": x, "y": y, "length": "100 pt", "angle": 0})),
+        // The grids: the tool's stored options (divider counts and skews, switches) at the default size.
+        "rectangularGrid" | "polarGrid" => {
+            let mut obj = match app.session.tool_options_of(kind) {
+                Value::Object(o) => o,
+                _ => serde_json::Map::new(),
+            };
+            for (key, value) in [("__anchorX", json!(x)), ("__anchorY", json!(y)), ("width", json!("100 pt")), ("height", json!("100 pt"))] {
+                obj.insert(key.into(), value);
+            }
+            obj.insert("reference".into(), json!(0));
+            let mut d = Dialog::new(kind, Value::Object(obj));
+            grid_pin_to_anchor(&mut d);
+            d
+        }
         // Graph tool click: the graph's size.
         "graph" => Dialog::new(
             "command",
             json!({"__command": "graph.create", "__label": "Graph", "type": p.get("type").cloned().unwrap_or(json!("column")), "x": x, "y": y, "width": 200, "height": 150}),
         ),
-        // After drawing a graph: Graph Data (CSV: header row of series, then category, values…).
-        "graphData" => match app.session.execute("graph.setData", &json!({})) {
-            Ok(v) => Dialog::new("command", json!({"__command": "graph.setData", "__label": "Graph Data", "csv": v["csv"]})),
-            Err(_) => return,
-        },
+        "graphData" => {
+            // After drawing a graph: Graph Data, its worksheet.
+            if let Err(e) = super::graph_data::open(app) {
+                app.status(e);
+            }
+            return;
+        }
         // A Flare tool click: the Flare Tool Options, with the tool's values; OK draws a flare there.
         "flare" => {
             super::flare_options::open(app, Some(vectorcraft_geom::Point::new(x, y)));
@@ -34,7 +54,7 @@ pub fn open_tool_dialog(app: &mut VectorcraftApp, kind: &str, p: Value) {
         "rotate" | "reflect" | "scale" | "shear" | "artboardOptions" => {
             let mut base = match kind {
                 "rotate" => json!({"angle": 0}),
-                "reflect" => json!({"axis": "vertical"}),
+                "reflect" => json!({"axis": "vertical", "angle": 90}),
                 "scale" => json!({"sx": 100, "sy": 100, "uniform": true}),
                 "shear" => json!({"angle": 0, "axis": "horizontal"}),
                 _ => json!({}),

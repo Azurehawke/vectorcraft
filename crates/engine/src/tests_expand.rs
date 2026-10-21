@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use vectorcraft_color::BlendMode;
 use vectorcraft_doc::{Node, NodeKind};
 
+use super::tests_menucmds::{place_undecodable_png, warns_undecoded};
 use super::*;
 
 fn session() -> Session {
@@ -118,6 +119,16 @@ fn a_blur_turns_the_object_into_an_image() {
 }
 
 #[test]
+fn expanding_a_blur_says_when_an_image_could_not_be_decoded() {
+    let mut s = session();
+    let cut = place_undecodable_png(&mut s);
+    run(&mut s, "effect.apply", json!({"effect": "blur.gaussian", "params": {"radius": 3}, "ids": [cut.0]}));
+    let r = run(&mut s, "effect.expandAppearance", json!({"ids": [cut.0]}));
+    assert!(warns_undecoded(&r), "{r}");
+    assert!(matches!(node(&s, cut).kind, NodeKind::Image(_)));
+}
+
+#[test]
 fn an_art_brush_becomes_a_group_of_its_art() {
     let mut s = session();
     let id = NodeId(run(&mut s, "shape.line", json!({"x1": 20, "y1": 100, "x2": 180, "y2": 100}))["id"].as_u64().unwrap());
@@ -179,6 +190,19 @@ fn type_with_a_shadow_stays_type_and_type_with_its_own_stroke_is_outlined() {
     node(&s, u).walk(&mut |c| text |= matches!(c.kind, NodeKind::Text(_)));
     assert!(!text, "the type is outlined");
     assert!(!expandable(&s));
+}
+
+#[test]
+fn type_with_its_own_stroke_expands_with_its_underline() {
+    let mut s = session();
+    let t = NodeId(run(&mut s, "text.create", json!({"x": 20, "y": 160, "text": "Hi", "size": 48}))["id"].as_u64().unwrap());
+    run(&mut s, "select.set", json!({"ids": [t.0]}));
+    run(&mut s, "text.setFormat", json!({"underline": true}));
+    run(&mut s, "appearance.addStroke", json!({}));
+    run(&mut s, "effect.expandAppearance", json!({}));
+    // "Hi" has no ink below its baseline (y 160): the pieces reach the bar under it.
+    let b = node(&s, t).geometric_bounds().unwrap();
+    assert!(b.y1 > 162.0, "{b:?}");
 }
 
 #[test]

@@ -8,24 +8,41 @@
 pub mod appearance;
 pub mod assets;
 pub mod blend;
+pub mod cancel;
 pub mod clipnest;
 pub mod cmyk;
 pub mod corners;
+pub mod depth;
+pub mod dimension;
 pub mod graph;
 pub mod hit;
+mod id_index;
 pub mod inks;
 mod inline;
+pub mod intertwine;
+pub mod shared;
+mod symbol_export_type;
+mod symbol_nine_slice;
+mod symbol_registration;
 pub use inline::{SYMBOL_HALF, SYMBOL_SIZES};
+pub use shared::Shared;
+pub use symbol_export_type::{SYMBOL_EXPORT_TYPE, SymbolExportType};
+pub use symbol_nine_slice::{SYMBOL_NINE_SLICE, SymbolNineSlice};
+pub use symbol_registration::{SYMBOL_REGISTRATION, SymbolRegistration};
 pub mod links;
 pub mod live;
+pub mod live_paint;
 pub mod marks;
+mod mem;
 pub mod metadata;
 pub mod node;
+pub mod objects_on_path;
 pub mod orient;
 pub mod overprint;
 pub mod pattern;
 pub mod perspective;
 mod pixels;
+pub use pixels::MAX_RASTER_ALLOC;
 pub mod placed_document;
 pub mod profiles;
 pub mod puppet;
@@ -39,9 +56,12 @@ pub mod shaper;
 pub mod slices;
 pub mod style_libs;
 pub mod swatches;
+mod symbols;
+pub use symbols::SymbolBoxes;
 pub mod text;
 pub mod trace;
 pub mod variables;
+pub mod xml_id;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -57,6 +77,12 @@ pub(crate) mod skip {
     pub fn is_one(v: &f32) -> bool {
         *v == 1.0
     }
+    pub fn is_empty_vec<T>(v: &[T]) -> bool {
+        v.is_empty()
+    }
+    pub fn is_empty_map(v: &serde_json::Map<String, serde_json::Value>) -> bool {
+        v.is_empty()
+    }
 }
 
 pub use appearance::StrokeGradientMode;
@@ -66,15 +92,20 @@ pub use appearance::{
 };
 pub use assets::ExportAsset;
 pub use corners::LiveCorners;
-pub use graph::{GraphKind, GraphSpec, MAX_GRAPH_CATEGORIES, MAX_GRAPH_SERIES, SeriesPaint, TickLength, ValueAxisSide};
+pub use depth::MAX_DEPTH;
+pub use graph::{
+    ColumnDesign, ColumnType, Fractions, GraphDesign, GraphKind, GraphSpec, LabelStyles, MAX_GRAPH_CATEGORIES, MAX_GRAPH_SERIES, PiePosition,
+    PieSort, SeriesPaint, TickLength, ValueAxisSide,
+};
 pub use hit::{Hit, HitKind};
 pub use links::{LinkInfo, PlacementOptions};
 pub use live::{BlendOrientation, BlendSpacing, BlendSpec, EnvelopeKind, GradientMesh, MeshPoint};
+pub use live_paint::{GapOptions, GapSize};
 pub use metadata::{CopyrightStatus, DocMetadata};
 pub use node::Knockout;
 pub use node::Scaling;
-pub use node::{ImageMap, ObjectAttributes};
-pub use node::{ImageObject, LAYER_COLORS, LayerColor, LiveShape, Node, NodeId, NodeKind, OpacityMask};
+pub use node::{Extras, ExtrasMut, ImageObject, LAYER_COLORS, LayerColor, LiveShape, Node, NodeExtras, NodeId, NodeKind, OpacityMask};
+pub use node::{ImageMap, MAX_SVG_SCRIPTS, ObjectAttributes, SVG_EVENTS};
 pub use orient::OrientedBox;
 pub use pattern::{Overlap, PatternDef, PatternEdit, RepeatKind, RepeatSpec, TileType};
 pub use perspective::PerspectiveAttachment;
@@ -82,14 +113,14 @@ pub use placed_document::PlacedDocument;
 pub use profiles::ColorProfiles;
 pub use puppet::{PuppetPin, PuppetPins};
 pub use rastersettings::{RasterColorModel, RasterEffectsSettings};
-pub use selection::{AnchorRef, Selection};
+pub use selection::{AnchorRef, SegmentRef, Selection};
 pub use setup::{Background, DocSetup, ExportText, GridSize, Quotes};
 pub use slices::{CellAlign, CellVAlign, Slice, SliceArea, SliceKind, SliceOptions, SliceSource};
 pub use style_libs::StyleLibrary;
 pub use text::{
-    AreaFit, AreaOptions, Burasagari, CharAlign, CharPosition, CharStyle, Composer, FirstBaseline, InlineArt, Justify, Kinsoku, LeadingModel,
-    Mojikumi, ParaDirection, ParaStyle, PathAlign, PathEffect, ScriptMetrics, TabAlign, TabStop, TextKind, TextObject, TextRun, TextStyleDef,
-    TextWrap, VerticalAlign, WrapShape,
+    AreaFit, AreaOptions, Burasagari, CharAlign, CharPosition, CharStyle, Composer, Digits, FirstBaseline, HyphenationOptions, InlineArt,
+    JustificationOptions, Justify, Kinsoku, LeadingModel, Mojikumi, ParaDirection, ParaStyle, PathAlign, PathEffect, ScriptMetrics,
+    SingleWordJustify, TabAlign, TabStop, TextKind, TextObject, TextRun, TextStyleDef, TextWrap, VerticalAlign, WrapShape,
 };
 pub use trace::TraceView;
 pub use variables::{DataSet, DataValue, Variable, VariableKind, Variables};
@@ -99,6 +130,9 @@ pub use vectorcraft_geom as geom;
 use serde::{Deserialize, Serialize};
 use vectorcraft_color::{Swatch, SwatchGroup};
 use vectorcraft_geom::{Affine, Point, Rect, Vec2};
+
+/// Coordinates beyond this many points exceed the supported document range.
+pub const MAX_COORD: f64 = 4.0e6;
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum DocError {
@@ -182,13 +216,33 @@ impl Unit {
     /// The rulers' label step at `zoom` (screen pixels per point), in this unit: the first of
     /// 1, 2, 5 × 10ⁿ that puts labels at least 50 pixels apart. Ticks mark every tenth of it.
     pub fn ruler_step(self, zoom: f64) -> f64 {
-        const STEPS: [f64; 19] =
+        const DECIMAL: [f64; 19] =
             [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0];
-        STEPS.iter().copied().find(|s| s * self.points() * zoom >= 50.0).unwrap_or(10000.0)
+        // An inch is divided in half, not in ten: a tenth of an inch is not a mark an inch ruler
+        // carries, so below an inch the steps are binary fractions (#2827). Labelling stops at a
+        // sixteenth; zooming in past that leaves the labels where they are and only the ticks
+        // between them grow denser, down to a hundred and twenty-eighth
+        // ([`Self::ruler_minor`]). A label is at most six characters that way ("0.0625"), which
+        // the left ruler has room for when it spells one down the ruler a character at a time.
+        // From an inch up the ladder is the shared one.
+        const BINARY: [f64; 15] = [1.0 / 16.0, 0.125, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 10000.0];
+        let steps: &[f64] = if self.ruler_halves() { &BINARY } else { &DECIMAL };
+        steps.iter().copied().find(|s| s * self.points() * zoom >= 50.0).unwrap_or(10000.0)
+    }
+    /// Does this unit's ruler divide a step in half rather than in ten? Inches do; the metric
+    /// units, points, pixels and picas are read in tenths.
+    fn ruler_halves(self) -> bool {
+        matches!(self, Unit::Inches)
+    }
+    /// The unlabelled ticks between two labels, `step` apart ([`Self::ruler_step`]): an eighth of
+    /// the step on an inch ruler, so every tick is a binary fraction of an inch and they stay about
+    /// as dense as the tenths elsewhere; a tenth of it otherwise.
+    pub fn ruler_minor(self, step: f64) -> f64 {
+        if self.ruler_halves() { step / 8.0 } else { step / 10.0 }
     }
     /// `v` (points) on the nearest ruler tick at `zoom` ([`Self::ruler_step`]).
     pub fn snap_to_ruler_tick(self, v: f64, zoom: f64) -> f64 {
-        let tick = self.ruler_step(zoom) / 10.0 * self.points();
+        let tick = self.ruler_minor(self.ruler_step(zoom)) * self.points();
         (v / tick).round() * tick
     }
     pub fn from_pt(self, v: f64) -> f64 {
@@ -213,7 +267,10 @@ impl Unit {
     /// Parse `12`, `12pt`, `1in`, `3 mm`, `2p6` (picas+points), simple `+ - * /` arithmetic.
     ///
     /// A unit after a `*` or `/` operand measures the whole expression (`1080/2 px` is 540 px), so
-    /// math typed before a field's unit suffix works.
+    /// math typed before a field's unit suffix works. After `*` or `/`, a percentage scales the term
+    /// before it (`3cm*50%` is 1.5 cm, `3cm/50%` is 6 cm). After `+` or `-`, it adds or takes away
+    /// that share of everything before it (`50pt+25%` is 62.5 pt, `100pt+20pt-50%` is 60 pt). A
+    /// percentage on its own (`50%`) reads as nothing.
     pub fn parse(self, s: &str) -> Option<f64> {
         parse_measure(s, self).filter(|v| v.is_finite())
     }
@@ -238,7 +295,12 @@ impl Unit {
     pub fn named(name: &str) -> Option<Unit> {
         let letters = |s: &'static str| s.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase());
         let given = || name.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase());
-        Unit::ALL.into_iter().find(|u| letters(u.label()).eq(given()) || u.suffix().chars().eq(given()))
+        // Feet and Feet & Inches share the suffix `ft`: it names the plain unit, so Feet & Inches
+        // is left to its label and key.
+        Unit::ALL
+            .into_iter()
+            .find(|u| letters(u.label()).eq(given()))
+            .or_else(|| Unit::ALL.into_iter().filter(|u| *u != Unit::FeetInches).find(|u| u.suffix().chars().eq(given())))
     }
     /// A point value as the canvas measurement labels show it: two decimals and the suffix
     /// (`12.50 mm`).
@@ -250,20 +312,41 @@ impl Unit {
 fn parse_measure(s: &str, default: Unit) -> Option<f64> {
     let s = s.trim();
     // Simple arithmetic on the right (Illustrator fields accept "10+5", "100/2", "3in*2").
-    for op in ['+', '-', '*', '/'] {
+    // `+` and `-` share one precedence level, as do `*` and `/`, so each level splits at the last
+    // of its operators (left to right).
+    for ops in [&['+', '-'][..], &['*', '/'][..]] {
         // Past the first character, so a leading sign isn't an operator.
         let skip = s.chars().next().map_or(0, char::len_utf8);
-        if let Some(i) = s[skip..].rfind(op).map(|i| i + skip) {
+        // A `+` or `-` right after another operator is the sign of its operand (`10*-2`, `5--3`).
+        let is_sign = |i: usize| {
+            s.get(i..).and_then(|r| r.chars().next()).is_some_and(|c| matches!(c, '+' | '-'))
+                && s.get(..i).and_then(|l| l.trim_end().chars().last()).is_some_and(|c| "+-*/".contains(c))
+        };
+        let found = s.char_indices().rev().find(|&(i, c)| i >= skip && ops.contains(&c) && !is_sign(i));
+        if let Some(i) = found.map(|(i, _)| i) {
             let (l, r) = (&s[..i], &s[i + 1..]);
             if l.trim().is_empty() {
                 continue;
             }
+            let Some(op) = s[i..].chars().next() else { continue };
             return match op {
-                '+' => Some(parse_measure(l, default)? + parse_measure(r, default)?),
-                '-' => Some(parse_measure(l, default)? - parse_measure(r, default)?),
+                '+' | '-' => {
+                    let a = parse_measure(l, default)?;
+                    // A percentage added or taken away is a share of everything before it:
+                    // `50pt+25%` is 62.5 pt, `100pt+20%-10pt` is 110 pt.
+                    let b = match percent(r) {
+                        Some(k) => a * k,
+                        None => parse_measure(r, default)?,
+                    };
+                    Some(if op == '+' { a + b } else { a - b })
+                }
                 _ => {
-                    // A factor or divisor is a plain number; a unit after it is the expression's.
-                    let (k, unit) = number_unit(r)?;
+                    // A factor or divisor is a plain number or a percentage (`3cm*50%` is 1.5 cm);
+                    // a unit after it is the expression's.
+                    let (k, unit) = match percent(r) {
+                        Some(k) => (k, None),
+                        None => number_unit(r)?,
+                    };
                     let a = parse_measure(l, unit.unwrap_or(default))?;
                     if op == '*' {
                         Some(a * k)
@@ -283,7 +366,10 @@ fn parse_measure(s: &str, default: Unit) -> Option<f64> {
         && !s.ends_with("pt")
         && !s.ends_with("px")
     {
-        return Some(p.trim().parse::<f64>().ok()? * 12.0 + pt.trim().parse::<f64>().unwrap_or(0.0));
+        // The sign belongs to the whole value: `-2p6` is -(2 picas + 6 points).
+        let sign = if p.trim_start().starts_with('-') { -1.0 } else { 1.0 };
+        let picas = p.trim().parse::<f64>().ok()?.abs();
+        return Some(sign * (picas * 12.0 + pt.trim().parse::<f64>().unwrap_or(0.0)));
     }
     let (v, unit) = number_unit(s)?;
     Some(unit.unwrap_or(default).to_pt(v))
@@ -308,6 +394,14 @@ fn number_unit(s: &str) -> Option<(f64, Option<Unit>)> {
         _ => return None,
     };
     Some((v, unit))
+}
+
+/// A number followed by `%` (`50%`, `12.5 %`) → its fraction (`0.5`, `0.125`).
+fn percent(s: &str) -> Option<f64> {
+    match number_unit(s.trim().strip_suffix('%')?)? {
+        (p, None) => Some(p / 100.0),
+        _ => None,
+    }
 }
 
 /// A unitless field value (percent, degrees, counts) with the same `+ - * /` arithmetic as
@@ -348,6 +442,12 @@ pub struct Artboard {
     pub show_center_mark: bool,
     #[serde(default)]
     pub show_cross_hairs: bool,
+    /// Background color (Properties › Artboards › Fill, Artboard Options). The canvas draws the
+    /// artboard's paper in it, multiplied with the Simulate Colored Paper color while that is on;
+    /// without one the paper is white, or the Simulate Colored Paper color. Exports and print leave
+    /// it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<vectorcraft_color::Color>,
 }
 
 /// Opacity-mask editing mode: `object`'s mask art lives on the temporary `layer` while editing.
@@ -528,6 +628,23 @@ pub struct ImageBlob {
     pub proxy: Option<Arc<Vec<u8>>>,
 }
 
+/// What the rulers measure from (View › Rulers): the active artboard's origin, the default of a
+/// new document, or one origin for the whole document.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RulerMode {
+    #[default]
+    Artboard,
+    Global,
+}
+
+impl RulerMode {
+    /// The mode of a document saved before the choice existed: global, as its rulers measured.
+    pub fn legacy() -> Self {
+        Self::Global
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Document {
     pub version: u32,
@@ -538,39 +655,57 @@ pub struct Document {
     pub template: bool,
     #[serde(default)]
     pub units: Unit,
+    /// The rulers' zero point in document coordinates. Moving it changes measurements, never art.
+    #[serde(default, skip_serializing_if = "skip::is_default")]
+    pub ruler_origin: Point,
+    /// View › Rulers › Change to Global / Artboard Rulers: whether the rulers and position fields
+    /// measure from [`Self::ruler_origin`] (global) or from the active artboard's own origin.
+    /// Documents saved before the choice existed measured globally and open that way.
+    #[serde(default = "RulerMode::legacy")]
+    pub rulers: RulerMode,
+    /// Artboard rulers' zero point of each artboard (by [`Artboard::id`]), as an offset from its
+    /// top-left corner; an artboard not listed measures from that corner.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub artboard_ruler_origins: BTreeMap<u32, Vec2>,
     #[serde(default)]
     pub color_mode: ColorMode,
     pub artboards: Vec<Artboard>,
     /// Top-level layers, bottom first.
     pub layers: Vec<Arc<Node>>,
+    // The document-wide resources below are [`Shared`]: an edit copies the document (copy-on-write)
+    // and the undo history keeps every version, so what an edit doesn't change stays one copy.
+    // Reads, writes and the saved form are those of the value itself.
     #[serde(default)]
-    pub swatches: Vec<Swatch>,
+    pub swatches: Shared<Vec<Swatch>>,
     #[serde(default)]
-    pub swatch_groups: Vec<SwatchGroup>,
+    pub swatch_groups: Shared<Vec<SwatchGroup>>,
     #[serde(default)]
-    pub graphic_styles: Vec<GraphicStyle>,
+    pub graphic_styles: Shared<Vec<GraphicStyle>>,
     /// Character styles (besides the built-in [Normal Character Style], which may be redefined here).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub char_styles: Vec<TextStyleDef>,
+    #[serde(default, skip_serializing_if = "skip::is_empty_vec")]
+    pub char_styles: Shared<Vec<TextStyleDef>>,
     /// Paragraph styles (besides the built-in [Normal Paragraph Style]).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub para_styles: Vec<TextStyleDef>,
+    #[serde(default, skip_serializing_if = "skip::is_empty_vec")]
+    pub para_styles: Shared<Vec<TextStyleDef>>,
     /// Threaded text: area-type frames one story flows through, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub text_threads: Vec<Vec<NodeId>>,
     #[serde(default)]
     pub symbols: Vec<Symbol>,
+    /// Object › Graph › Design…: art graphs can draw as markers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graph_designs: Vec<GraphDesign>,
     #[serde(default)]
     pub guides: Vec<Guide>,
     /// View → New View… (up to 25, like Illustrator).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub views: Vec<SavedView>,
     /// Select → Save Selection… (at most [`SavedSelection::MAX`]); saved with the document.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub saved_selections: Vec<SavedSelection>,
+    #[serde(default, skip_serializing_if = "skip::is_empty_vec")]
+    pub saved_selections: Shared<Vec<SavedSelection>>,
     /// Variables (data merge): named values bound to objects, applied per dataset.
     #[serde(default, skip_serializing_if = "crate::skip::is_default")]
-    pub variables: Variables,
+    pub variables: Shared<Variables>,
     #[serde(default)]
     pub grid: GridPrefs,
     #[serde(default = "ppi72")]
@@ -589,8 +724,8 @@ pub struct Document {
     pub mask_edit: Option<MaskEdit>,
     next_id: u64,
     /// Foreign data preserved on round-trip.
-    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
-    pub unknown: serde_json::Map<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "skip::is_empty_map")]
+    pub unknown: Shared<serde_json::Map<String, serde_json::Value>>,
     /// Transparency panel → Page Isolated Blending: the page is an isolated transparency group,
     /// so top-level blend modes don't blend with what lies under the page.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -622,6 +757,10 @@ pub struct Document {
     /// save time only, so changing the view never marks the document modified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_view: Option<SavedView>,
+    /// View → Show Transparency Grid when the document was saved. Written at save time only,
+    /// like [`Document::last_view`]; older files open with the grid hidden.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transparency_grid: bool,
     /// The layers, sublayers and groups open in the Layers panel when the document was saved; they
     /// reopen that way. `None`: the default, only the top-level layers open. Written at save time
     /// only, like [`Document::last_view`].
@@ -654,10 +793,21 @@ pub struct Document {
     /// export settings are Export for Screens' ([`Document::export_settings`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assets: Vec<ExportAsset>,
+    /// Window › SVG Interactivity › Link JavaScript Files: the JavaScript files (paths or URLs, as
+    /// given) SVG export links with `<script>` elements, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub svg_scripts: Vec<String>,
     /// Puppet Warp pins on the selected artwork while the tool edits it ([`PuppetPins`]): editing
     /// state, never saved.
     #[serde(skip)]
     pub puppet: Option<Arc<PuppetPins>>,
+    /// Some object is a dimension (the Dimension tool): edits refresh dimensions only while this
+    /// is set, so documents without any pay nothing for them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dimensions: bool,
+    /// Where each node is in the tree, for lookups by id ([`id_index`]): a cache, never saved.
+    #[serde(skip)]
+    index: id_index::IdIndex,
 }
 
 fn ppi72() -> f64 {
@@ -668,9 +818,55 @@ fn yes() -> bool {
     true
 }
 
+/// Is point `p` on the artboard at `rect`, its edges included, within a millionth of a point? This
+/// is the rule [`Document::art_on_artboard`] applies to art flush with an edge (#890), where
+/// `Rect::contains` leaves out the right and bottom edges.
+pub fn artboard_holds(rect: Rect, p: Point) -> bool {
+    let r = rect.inflate(1e-6, 1e-6);
+    r.x0 <= p.x && p.x <= r.x1 && r.y0 <= p.y && p.y <= r.y1
+}
+
+/// Listed nodes by parent: the parent's index path (empty for the top-level layers), then the index
+/// of each listed child in it, in order, with the child's place in the list.
+type Places = BTreeMap<Vec<usize>, Vec<(usize, usize)>>;
+
 pub const FORMAT_VERSION: u32 = 1;
 
 impl Document {
+    /// Document Raster Effects Settings › Resolution in ppi, 1 to 2400 (72 when the stored value
+    /// isn't a number).
+    pub fn raster_ppi(&self) -> f64 {
+        Some(self.raster_effects_ppi).filter(|v| v.is_finite()).unwrap_or(72.0).clamp(1.0, 2400.0)
+    }
+
+    /// The ruler zero point, or zero on both axes when either stored coordinate is invalid.
+    /// Rulers, coordinate fields and guide snapping use the same supported range.
+    pub fn ruler_origin_or_zero(&self) -> Point {
+        let origin = self.ruler_origin;
+        if origin.is_finite() && origin.x.abs() <= MAX_COORD && origin.y.abs() <= MAX_COORD { origin } else { Point::ZERO }
+    }
+
+    /// Where the rulers measure from with artboard `index` active: [`Self::ruler_origin_or_zero`]
+    /// with global rulers; with artboard rulers that artboard's top-left corner moved by its own
+    /// offset (the first artboard's when `index` is out of range, the global zero point when the
+    /// document has no artboard or the result is out of the supported range).
+    pub fn ruler_origin_for(&self, index: usize) -> Point {
+        if self.rulers == RulerMode::Global {
+            return self.ruler_origin_or_zero();
+        }
+        let Some(ab) = self.artboards.get(index).or_else(|| self.artboards.first()) else { return self.ruler_origin_or_zero() };
+        let corner = Point::new(ab.rect.x0, ab.rect.y0);
+        let offset = self.artboard_ruler_origins.get(&ab.id).copied().unwrap_or(Vec2::ZERO);
+        let origin = corner + offset;
+        if origin.is_finite() && origin.x.abs() <= MAX_COORD && origin.y.abs() <= MAX_COORD {
+            origin
+        } else if corner.is_finite() && corner.x.abs() <= MAX_COORD && corner.y.abs() <= MAX_COORD {
+            corner
+        } else {
+            Point::ZERO
+        }
+    }
+
     /// A new RGB document with one artboard of `size` and one layer ("Layer 1").
     pub fn new(width: f64, height: f64) -> Self {
         Self::new_with_mode(width, height, ColorMode::Rgb)
@@ -684,6 +880,9 @@ impl Document {
             title: "Untitled-1".into(),
             template: false,
             units: Unit::Points,
+            ruler_origin: Point::ZERO,
+            rulers: RulerMode::Artboard,
+            artboard_ruler_origins: BTreeMap::new(),
             color_mode: mode,
             artboards: vec![Artboard {
                 id: 1,
@@ -691,19 +890,21 @@ impl Document {
                 rect: Rect::new(0.0, 0.0, width, height),
                 show_center_mark: false,
                 show_cross_hairs: false,
+                color: None,
             }],
             layers: vec![],
-            swatches,
-            swatch_groups,
-            graphic_styles: default_graphic_styles(),
-            char_styles: vec![],
-            para_styles: vec![],
+            swatches: swatches.into(),
+            swatch_groups: swatch_groups.into(),
+            graphic_styles: default_graphic_styles().into(),
+            char_styles: Default::default(),
+            para_styles: Default::default(),
             text_threads: vec![],
             symbols: vec![],
+            graph_designs: vec![],
             guides: vec![],
             views: vec![],
-            saved_selections: vec![],
-            variables: Variables::default(),
+            saved_selections: Default::default(),
+            variables: Default::default(),
             grid: GridPrefs::default(),
             raster_effects_ppi: 72.0,
             images: BTreeMap::new(),
@@ -720,6 +921,7 @@ impl Document {
             metadata: DocMetadata::default(),
             raster_effects: RasterEffectsSettings::default(),
             last_view: None,
+            transparency_grid: false,
             layers_open: None,
             color_profiles: ColorProfiles::default(),
             export_settings: Default::default(),
@@ -728,7 +930,10 @@ impl Document {
             slices_clip_to_artboard: true,
             print_setup: None,
             assets: vec![],
+            svg_scripts: vec![],
             puppet: None,
+            dimensions: false,
+            index: Default::default(),
         };
         let id = d.alloc_id();
         d.layers.push(Arc::new(Node::layer(id, "Layer 1", LayerColor::Preset(0))));
@@ -738,7 +943,9 @@ impl Document {
     /// Allocate a fresh node id.
     pub fn alloc_id(&mut self) -> NodeId {
         let id = NodeId(self.next_id);
-        self.next_id += 1;
+        // Never reached from a counter [`Self::fix_next_id`] has seen (it stays under
+        // [`MAX_NEXT_ID`]); saturating so that no counter can overflow.
+        self.next_id = self.next_id.saturating_add(1);
         id
     }
     pub fn peek_next_id(&self) -> u64 {
@@ -746,36 +953,71 @@ impl Document {
     }
     /// Ensure `next_id` is above every id in the tree (after deserializing foreign data).
     pub fn fix_next_id(&mut self) {
+        // Ids from [`MAX_NEXT_ID`] up (a damaged or hand-made file: #1718) are left out, as is a
+        // counter up there: new ids start under them and never reach them, where counting on from
+        // the largest would run out and hand out ids the document already uses.
         let mut max = 0;
+        let mut see = |id: u64| {
+            if id < MAX_NEXT_ID {
+                max = max.max(id);
+            }
+        };
         for l in &self.layers {
-            l.walk(&mut |n| max = max.max(n.id.0));
+            l.walk(&mut |n| see(n.id.0));
         }
-        max = self.slices.iter().fold(max, |m, s| m.max(s.id.0));
-        max = self.assets.iter().fold(max, |m, a| m.max(a.id));
-        // An id of u64::MAX (a damaged file) can't overflow: ids after it are reused at worst.
-        self.next_id = self.next_id.max(max.saturating_add(1));
+        self.slices.iter().for_each(|s| see(s.id.0));
+        self.assets.iter().for_each(|a| see(a.id));
+        let counter = Some(self.next_id).filter(|n| *n <= MAX_NEXT_ID).unwrap_or(0);
+        self.next_id = counter.max(max.saturating_add(1));
     }
 
     /// Find a node anywhere in the tree.
     pub fn node(&self, id: NodeId) -> Option<&Node> {
-        fn find(nodes: &[Arc<Node>], id: NodeId) -> Option<&Node> {
-            for n in nodes {
-                if n.id == id {
-                    return Some(n);
-                }
-                if let Some(ch) = n.children()
-                    && let Some(f) = find(ch, id)
-                {
-                    return Some(f);
-                }
-            }
-            None
-        }
-        find(&self.layers, id)
+        self.index_path(id).and_then(|p| self.node_at(&p))
     }
 
-    /// Index path from the top-level layer list to `id` (e.g. `[0, 3, 1]`).
+    /// [`Document::node`] without building the lookup cache when there is none: for a look at a
+    /// document kept in the undo history ([`Document::drop_lookup_cache`]).
+    pub fn node_uncached(&self, id: NodeId) -> Option<&Node> {
+        match self.index.is_built() {
+            true => self.node(id),
+            false => self.walk_index_path(id).and_then(|p| self.node_at(&p)),
+        }
+    }
+
+    /// Let go of the lookup cache ([`id_index`]), as a document kept in the undo history does: a
+    /// table per step would add up. Lookups still work; the first one builds the cache again.
+    pub fn drop_lookup_cache(&self) {
+        self.index.clear();
+    }
+
+    /// Whether the lookup cache ([`id_index`]) is built (see [`Document::drop_lookup_cache`]).
+    pub fn has_lookup_cache(&self) -> bool {
+        self.index.is_built()
+    }
+
+    /// Index path from the top-level layer list to `id` (e.g. `[0, 3, 1]`): the first place in
+    /// tree order where `id` appears.
     pub fn index_path(&self, id: NodeId) -> Option<Vec<usize>> {
+        // The cached path, while the node there still has the id ([`id_index`]).
+        let cached = self.index.get();
+        match cached.as_ref().and_then(|m| m.get(&id)) {
+            Some(Some(p)) if self.node_at(&p).is_some_and(|n| n.id == id) => return Some(p),
+            Some(None) => return self.walk_index_path(id),
+            _ => {}
+        }
+        // A stale path (the tree changed), an id the cache doesn't have (deleted or added since),
+        // or no cache yet: walk, and rebuild now and then.
+        let found = self.walk_index_path(id);
+        let stale = cached.as_ref().is_some_and(|m| m.contains_key(&id));
+        if cached.is_none() || ((stale || found.is_some()) && self.index.missed()) {
+            self.index.rebuild(&self.layers);
+        }
+        found
+    }
+
+    /// [`Document::index_path`] by walking the tree.
+    fn walk_index_path(&self, id: NodeId) -> Option<Vec<usize>> {
         fn find(nodes: &[Arc<Node>], id: NodeId, path: &mut Vec<usize>) -> bool {
             for (i, n) in nodes.iter().enumerate() {
                 path.push(i);
@@ -793,6 +1035,85 @@ impl Document {
         }
         let mut p = vec![];
         find(&self.layers, id, &mut p).then_some(p)
+    }
+
+    /// [`Document::index_path`] of every id in `ids` that is in the tree, in one walk of it: an
+    /// edit of many objects looks them all up for the cost of one search instead of one each. Like
+    /// `index_path`, an id that appears twice maps to its first place in tree order.
+    pub fn index_paths(&self, ids: impl IntoIterator<Item = NodeId>) -> std::collections::HashMap<NodeId, Vec<usize>> {
+        use std::collections::{HashMap, HashSet};
+        fn walk(nodes: &[Arc<Node>], want: &HashSet<NodeId>, path: &mut Vec<usize>, out: &mut HashMap<NodeId, Vec<usize>>) -> bool {
+            for (i, n) in nodes.iter().enumerate() {
+                path.push(i);
+                if want.contains(&n.id) && !out.contains_key(&n.id) {
+                    out.insert(n.id, path.clone());
+                    if out.len() == want.len() {
+                        return true;
+                    }
+                }
+                if let Some(ch) = n.children()
+                    && walk(ch, want, path, out)
+                {
+                    return true;
+                }
+                path.pop();
+            }
+            false
+        }
+        let mut want: HashSet<NodeId> = ids.into_iter().collect();
+        let mut out = HashMap::with_capacity(want.len());
+        // Cached paths that still check out ([`id_index`]); the rest take one walk. For a good
+        // share of the document, one walk is quicker than checking each cached path.
+        if let Some(cache) = self.index.get().filter(|c| want.len().saturating_mul(8) < c.len()) {
+            want.retain(|id| match cache.get(id) {
+                Some(Some(p)) if self.node_at(&p).is_some_and(|n| n.id == *id) => {
+                    out.insert(*id, p);
+                    false
+                }
+                _ => true,
+            });
+        }
+        if !want.is_empty() {
+            let mut rest = HashMap::with_capacity(want.len());
+            walk(&self.layers, &want, &mut Vec::new(), &mut rest);
+            out.extend(rest);
+        }
+        out
+    }
+
+    /// The node at index path `path` (as [`Document::index_path`] gives it).
+    pub fn node_at(&self, path: &[usize]) -> Option<&Node> {
+        let (first, rest) = path.split_first()?;
+        let mut cur: &Node = self.layers.get(*first)?;
+        for &i in rest {
+            cur = cur.children()?.get(i)?;
+        }
+        Some(cur)
+    }
+
+    /// Mutable access to the node at index path `path`; clones the Arc path (copy-on-write), as
+    /// [`Document::node_mut`] does.
+    pub fn node_mut_at(&mut self, path: &[usize]) -> Option<&mut Node> {
+        let (first, rest) = path.split_first()?;
+        let mut cur: &mut Arc<Node> = self.layers.get_mut(*first)?;
+        for &i in rest {
+            cur = Arc::make_mut(cur).children_mut()?.get_mut(i)?;
+        }
+        Some(Arc::make_mut(cur))
+    }
+
+    /// [`Document::ancestry`] of the node at index path `path`.
+    pub fn ancestry_at(&self, path: &[usize]) -> Option<Vec<NodeId>> {
+        let mut out = Vec::with_capacity(path.len());
+        let mut nodes = &self.layers;
+        for &i in path {
+            let n = nodes.get(i)?;
+            out.push(n.id);
+            if let Some(ch) = n.children() {
+                nodes = ch;
+            }
+        }
+        Some(out)
     }
 
     /// Ids from the top-level layer down to `id` inclusive.
@@ -887,6 +1208,128 @@ impl Document {
         Some((parent, idx, n))
     }
 
+    /// Remove the nodes `ids` names and return them in the order of `ids`, in one pass over the
+    /// children of each parent. Each id is listed once and none lies inside another listed node, as
+    /// in a list of top-level objects. For an id that is not in the tree, is listed twice or lies
+    /// inside another listed node, it fails with `NoNode` and leaves the document as it was.
+    pub fn remove_many(&mut self, ids: &[NodeId]) -> Result<Vec<Arc<Node>>, DocError> {
+        let places = self.places(ids)?;
+        let removed = self.take(places, ids.len())?;
+        self.index.clear();
+        Ok(removed)
+    }
+
+    /// Remove the nodes `ids` names, as [`Document::remove_many`] does, and put the node that `make`
+    /// builds from them (in the order of `ids`) in the parent of the last of them, at that node's
+    /// index less the number of listed nodes below it there. Returns the new node's id.
+    pub fn wrap(&mut self, ids: &[NodeId], make: impl FnOnce(Vec<Arc<Node>>) -> Node) -> Result<NodeId, DocError> {
+        let places = self.places(ids)?;
+        let last = ids.len().checked_sub(1);
+        let found = places.iter().find_map(|(up, kids)| kids.iter().find(|(_, k)| Some(*k) == last).map(|(i, _)| (up.clone(), *i)));
+        let Some((up, i)) = found else { return Err(DocError::Invalid("nothing to wrap".into())) };
+        // The parent and each node it is in move down by the listed nodes before them.
+        let below = |parent: &[usize], index: usize| places.get(parent).map_or(0, |kids| kids.partition_point(|(j, _)| *j < index));
+        let to: Vec<usize> = up.iter().enumerate().map(|(l, &j)| j.saturating_sub(below(&up[..l], j))).collect();
+        let at = i.saturating_sub(below(&up, i));
+        let node = make(self.take(places, ids.len())?);
+        let id = node.id;
+        let children = self.children_at(&to).ok_or_else(|| DocError::Invalid("the container of the listed objects is gone".into()))?;
+        let at = at.min(children.len());
+        children.insert(at, Arc::new(node));
+        self.index.clear();
+        Ok(id)
+    }
+
+    /// Put each list of nodes in `items` directly above its anchor (`replace`: in its place), in
+    /// list order, in one pass over the children of each parent. Each anchor is listed once and none
+    /// lies inside another. For an anchor that is not in the tree, is listed twice or lies inside
+    /// another listed anchor, it fails with `NoNode` and leaves the document as it was.
+    pub fn insert_beside(&mut self, items: Vec<(NodeId, Vec<Node>)>, replace: bool) -> Result<(), DocError> {
+        let anchors: Vec<NodeId> = items.iter().map(|(id, _)| *id).collect();
+        let places = self.places(&anchors)?;
+        let mut lists: Vec<Vec<Node>> = items.into_iter().map(|(_, nodes)| nodes).collect();
+        self.edit_children(places, |k, anchor, children| {
+            if !replace {
+                children.push(anchor);
+            }
+            let nodes = lists.get_mut(k).map(std::mem::take).unwrap_or_default();
+            children.extend(nodes.into_iter().map(Arc::new));
+        })?;
+        self.index.clear();
+        Ok(())
+    }
+
+    /// Where each of `ids` is ([`Places`]). Fails with `NoNode` for an id that is not in the tree,
+    /// is listed twice or lies inside another listed node.
+    fn places(&self, ids: &[NodeId]) -> Result<Places, DocError> {
+        let paths = self.index_paths(ids.iter().copied());
+        let mut places = Places::new();
+        for (k, id) in ids.iter().enumerate() {
+            let (&i, up) = paths.get(id).and_then(|p| p.split_last()).ok_or(DocError::NoNode(*id))?;
+            match places.get_mut(up) {
+                Some(kids) => kids.push((i, k)),
+                None => {
+                    places.insert(up.to_vec(), vec![(i, k)]);
+                }
+            }
+        }
+        for kids in places.values_mut() {
+            kids.sort_unstable();
+        }
+        // An id listed twice has one path, so its parent lists the same child twice. A listed node
+        // lies inside another when its parent's path, or a part of it from the top, is the path of a
+        // listed node.
+        let twice = places.values().flat_map(|kids| kids.windows(2)).find(|w| w[0].0 == w[1].0).map(|w| w[1].1);
+        let listed = |path: &[usize]| {
+            path.split_last().is_some_and(|(i, up)| places.get(up).is_some_and(|kids| kids.binary_search_by_key(i, |(j, _)| *j).is_ok()))
+        };
+        let nested = places.iter().find(|(up, _)| (1..=up.len()).any(|l| listed(&up[..l])));
+        let inner = nested.and_then(|(_, kids)| kids.first()).map(|(_, k)| *k);
+        if let Some(id) = twice.or(inner).and_then(|k| ids.get(k)) {
+            return Err(DocError::NoNode(*id));
+        }
+        Ok(places)
+    }
+
+    /// Take the nodes `places` lists out of their parents and return them in the order of the list,
+    /// which is `len` long.
+    fn take(&mut self, places: Places, len: usize) -> Result<Vec<Arc<Node>>, DocError> {
+        let mut taken = vec![None; len];
+        self.edit_children(places, |k, node, _| {
+            if let Some(t) = taken.get_mut(k) {
+                *t = Some(node);
+            }
+        })?;
+        Ok(taken.into_iter().flatten().collect())
+    }
+
+    /// Rebuild the children of each parent in `places` once, the parents later in tree order
+    /// first. `each` gets each listed child, its place in the list and the parent's new children,
+    /// onto which it pushes what takes the child's place.
+    fn edit_children(&mut self, places: Places, mut each: impl FnMut(usize, Arc<Node>, &mut Vec<Arc<Node>>)) -> Result<(), DocError> {
+        for (up, kids) in places.into_iter().rev() {
+            let children = self.children_at(&up).ok_or_else(|| DocError::Invalid("a container of the listed objects is gone".into()))?;
+            let old = std::mem::take(children);
+            children.reserve(old.len());
+            let mut kids = kids.into_iter().peekable();
+            for (i, node) in old.into_iter().enumerate() {
+                match kids.next_if(|(j, _)| *j == i) {
+                    Some((_, k)) => each(k, node, children),
+                    None => children.push(node),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The children of the node at index path `path`, or the top-level layers for an empty path.
+    fn children_at(&mut self, path: &[usize]) -> Option<&mut Vec<Arc<Node>>> {
+        match path {
+            [] => Some(&mut self.layers),
+            _ => self.node_mut_at(path)?.children_mut(),
+        }
+    }
+
     /// Default target layer: the topmost visible, unlocked layer.
     pub fn default_layer(&self) -> Option<NodeId> {
         self.layers.iter().rev().find(|l| l.visible && !l.locked).or(self.layers.last()).map(|l| l.id)
@@ -947,30 +1390,51 @@ impl Document {
             _ => LAYER_COLORS[0].1,
         }
     }
-    /// Union of the geometric bounds of `ids`.
+    /// Union of the geometric bounds of `ids` (their visual bounds when `visual`), with symbol
+    /// instances measured by their art ([`Node::geometric_bounds_with`]).
     pub fn bounds_of(&self, ids: &[NodeId], visual: bool) -> Option<Rect> {
-        ids.iter()
-            .filter_map(|id| self.node(*id))
-            .fold(None, |acc, n| vectorcraft_geom::union_opt(acc, if visual { n.visual_bounds() } else { n.geometric_bounds() }))
+        let symbols = self.symbol_boxes();
+        ids.iter().filter_map(|id| self.node(*id)).fold(None, |acc, n| {
+            vectorcraft_geom::union_opt(acc, if visual { n.visual_bounds_with(&symbols) } else { n.geometric_bounds_with(&symbols) })
+        })
     }
-    /// Bounds of all art.
+    /// Visual bounds of all art, with symbol instances measured by their art.
     pub fn art_bounds(&self) -> Option<Rect> {
-        self.layers.iter().fold(None, |acc, l| vectorcraft_geom::union_opt(acc, l.visual_bounds()))
+        let symbols = self.symbol_boxes();
+        self.layers.iter().fold(None, |acc, l| vectorcraft_geom::union_opt(acc, l.visual_bounds_with(&symbols)))
     }
-    /// Artboard index containing point `p` (topmost = last).
+    /// Artboard index containing point `p` (topmost = last), its edges included
+    /// ([`Document::artboard_holding`]).
     pub fn artboard_at(&self, p: Point) -> Option<usize> {
-        self.artboards.iter().rposition(|a| a.rect.contains(p))
+        self.artboard_holding(p, true)
+    }
+    /// Index of the artboard that holds point `p`: the first (the last when `topmost`) that holds it
+    /// inside or on its left or top edge, else the first (the last) that holds it by
+    /// [`artboard_holds`]: on its right or bottom edge, or within a millionth of a point outside an
+    /// edge. On an edge two artboards share, the artboard to the right of it or below it holds the
+    /// point, except at the end of the edge that lies on that artboard's bottom or right edge, such
+    /// as the point where both artboards' bottom edges meet; there the first (the last) holds it.
+    pub fn artboard_holding(&self, p: Point, topmost: bool) -> Option<usize> {
+        let pick = |on: &dyn Fn(Rect) -> bool| {
+            let on = |i: &usize| self.artboards.get(*i).is_some_and(|a| on(a.rect));
+            let mut all = 0..self.artboards.len();
+            if topmost { all.rfind(on) } else { all.find(on) }
+        };
+        pick(&|r| r.contains(p)).or_else(|| pick(&|r| artboard_holds(r, p)))
     }
     /// The art that moves with an artboard at `rect`: top-level objects (children of layers and
-    /// sublayers) lying entirely inside it. Locked and hidden objects and layers stay put unless
-    /// `locked_and_hidden` (Selection & Anchor Display › Move Locked and Hidden Artwork with
-    /// Artboard).
+    /// sublayers) lying entirely inside it, with symbol instances measured by their art. Locked and
+    /// hidden objects and layers stay put unless `locked_and_hidden` (Selection & Anchor Display ›
+    /// Move Locked and Hidden Artwork with Artboard).
     pub fn art_on_artboard(&self, rect: Rect, locked_and_hidden: bool) -> Vec<NodeId> {
-        fn collect(n: &Node, rect: Rect, all: bool, out: &mut Vec<NodeId>) {
+        // Art drawn flush with the artboard can end up a rounding error outside it (a background
+        // 3e-14 pt past the top edge, #1295): a millionth of a point is far below anything visible.
+        let rect = rect.inflate(1e-6, 1e-6);
+        fn collect(n: &Node, s: &SymbolBoxes, rect: Rect, all: bool, out: &mut Vec<NodeId>) {
             for c in n.children().into_iter().flatten().filter(|c| c.rides_with_artboard(all)) {
                 if c.is_layer() {
-                    collect(c, rect, all, out);
-                } else if let Some(b) = c.geometric_bounds()
+                    collect(c, s, rect, all, out);
+                } else if let Some(b) = c.geometric_bounds_with(s)
                     // Inside it, edges included: art flush with the right or bottom edge is on it too
                     // (`Rect::contains` leaves those out, #890).
                     && b.x0 >= rect.x0
@@ -982,9 +1446,10 @@ impl Document {
                 }
             }
         }
+        let symbols = self.symbol_boxes();
         let mut art = vec![];
         for l in self.layers.iter().filter(|l| l.rides_with_artboard(locked_and_hidden)) {
-            collect(l, rect, locked_and_hidden, &mut art);
+            collect(l, &symbols, rect, locked_and_hidden, &mut art);
         }
         art
     }
@@ -1078,6 +1543,7 @@ impl Document {
             n += usize::from(*k);
         }
         sel.guides = sel.guides.iter().filter_map(|i| to.get(*i).copied().flatten()).collect();
+        sel.key_guide = sel.key_guide.and_then(|i| to.get(i).copied().flatten());
         let before = self.guides.len();
         let mut flags = kept.into_iter();
         self.guides.retain(|_| flags.next().unwrap_or(true));
@@ -1104,7 +1570,7 @@ impl Document {
         self.guides.extend(copies);
     }
     pub fn next_artboard_id(&self) -> u32 {
-        self.artboards.iter().map(|a| a.id).max().unwrap_or(0) + 1
+        free_id(self.artboards.iter().map(|a| a.id))
     }
     pub fn pattern(&self, name: &str) -> Option<&PatternDef> {
         self.patterns.iter().find(|p| p.name == name)
@@ -1116,9 +1582,24 @@ impl Document {
     pub fn reid(&mut self, node: &Node) -> Node {
         let mut n = node.clone();
         n.id = self.alloc_id();
+        // A copied annotation must never bind its source ids to unrelated art in a different
+        // document. Keep the measured geometry; new measurements can be linked after pasting.
+        if let Some(e) = n.extras_if_any()
+            && let Some(dimension) = &mut e.dimension
+        {
+            dimension.source = None;
+        }
+        let mut renamed = std::collections::HashMap::new();
         if let Some(ch) = n.children_mut() {
             let old: Vec<Arc<Node>> = std::mem::take(ch);
             *ch = old.iter().map(|c| Arc::new(self.reid(c))).collect();
+            renamed.extend(old.iter().zip(ch.iter()).map(|(o, c)| (o.id, c.id)));
+        }
+        // An Objects on Path group names its path and its objects by id: the copy names the copies.
+        if let Some(e) = n.extras_if_any()
+            && let Some(on_path) = &mut e.objects_on_path
+        {
+            on_path.rename(&renamed);
         }
         n
     }
@@ -1149,7 +1630,7 @@ impl Document {
             let objects = s.objects.into_iter().filter(|id| ids.contains(id) && seen.insert(*id)).collect();
             kept.push(SavedSelection { name, objects });
         }
-        self.saved_selections = kept;
+        self.saved_selections = kept.into();
     }
 
     /// Leave opacity-mask editing: drop the temporary editing layer, a working copy of art the
@@ -1188,7 +1669,7 @@ impl Document {
     }
     /// An id no graphic style has.
     pub fn next_graphic_style_id(&self) -> u32 {
-        self.graphic_styles.iter().map(|g| g.id).max().unwrap_or(0) + 1
+        free_id(self.graphic_styles.iter().map(|g| g.id))
     }
     /// The id of graphic style `index`, assigning one if it has none yet.
     pub fn graphic_style_id(&mut self, index: usize) -> u32 {
@@ -1201,6 +1682,115 @@ impl Document {
     /// from the number of styles.
     pub fn new_graphic_style_name(&self) -> String {
         (self.graphic_styles.len() + 1..).map(|i| format!("Graphic Style {i}")).find(|n| self.graphic_style(n).is_none()).unwrap_or_default()
+    }
+    /// `base`, or the first free "`base` N" (N from 2) when a symbol already has that name.
+    pub fn unique_symbol_name(&self, base: &str) -> String {
+        let taken = |n: &str| self.symbols.iter().any(|s| s.name == n);
+        if !taken(base) {
+            return base.to_string();
+        }
+        (2..).map(|i| format!("{base} {i}")).find(|n| !taken(n)).unwrap_or_else(|| base.to_string())
+    }
+
+    /// Symbol Options › Registration for `name` (default: centre).
+    pub fn symbol_registration(&self, name: &str) -> SymbolRegistration {
+        self.unknown
+            .get(SYMBOL_REGISTRATION)
+            .and_then(|m| m.get(name))
+            .and_then(|v| v.as_u64())
+            .and_then(SymbolRegistration::from_u64)
+            .unwrap_or_default()
+    }
+
+    /// Set or clear (when centre) the registration point stored for `name`.
+    pub fn set_symbol_registration(&mut self, name: &str, reg: SymbolRegistration) {
+        let m = self.unknown.entry(SYMBOL_REGISTRATION.to_string()).or_insert_with(|| serde_json::json!({}));
+        let Some(o) = m.as_object_mut() else { return };
+        if reg.is_center() {
+            o.remove(name);
+            if o.is_empty() {
+                self.unknown.remove(SYMBOL_REGISTRATION);
+            }
+        } else {
+            o.insert(name.into(), serde_json::json!(reg.0));
+        }
+    }
+
+    /// Move the stored registration when a symbol is renamed.
+    pub fn rename_symbol_registration(&mut self, from: &str, to: &str) {
+        if from == to {
+            return;
+        }
+        let reg = self.symbol_registration(from);
+        self.set_symbol_registration(from, SymbolRegistration::CENTER);
+        self.set_symbol_registration(to, reg);
+    }
+
+    /// Symbol Options › Export Type for `name` (default: Movie Clip).
+    pub fn symbol_export_type(&self, name: &str) -> SymbolExportType {
+        self.unknown.get(SYMBOL_EXPORT_TYPE).and_then(|m| m.get(name)).and_then(SymbolExportType::from_value).unwrap_or_default()
+    }
+
+    /// Set or clear (when Movie Clip, the default) the export type stored for `name`.
+    pub fn set_symbol_export_type(&mut self, name: &str, kind: SymbolExportType) {
+        if kind.is_default() {
+            self.clear_symbol_export_type(name);
+            return;
+        }
+        let m = self.unknown.entry(SYMBOL_EXPORT_TYPE.to_string()).or_insert_with(|| serde_json::json!({}));
+        let Some(o) = m.as_object_mut() else { return };
+        o.insert(name.into(), serde_json::json!(kind.id()));
+    }
+
+    /// Drop any stored export type for `name` (Movie Clip default).
+    pub fn clear_symbol_export_type(&mut self, name: &str) {
+        let Some(m) = self.unknown.get_mut(SYMBOL_EXPORT_TYPE) else { return };
+        let Some(o) = m.as_object_mut() else { return };
+        o.remove(name);
+        if o.is_empty() {
+            self.unknown.remove(SYMBOL_EXPORT_TYPE);
+        }
+    }
+
+    /// Move the stored export type when a symbol is renamed.
+    pub fn rename_symbol_export_type(&mut self, from: &str, to: &str) {
+        if from == to {
+            return;
+        }
+        let kind = self.symbol_export_type(from);
+        self.clear_symbol_export_type(from);
+        self.set_symbol_export_type(to, kind);
+    }
+
+    /// Symbol Options › 9-slice guides for `name`: `None` when 9-slice scaling is off (default).
+    pub fn symbol_nine_slice(&self, name: &str) -> Option<SymbolNineSlice> {
+        self.unknown.get(SYMBOL_NINE_SLICE).and_then(|m| m.get(name)).and_then(SymbolNineSlice::from_value)
+    }
+
+    /// Turn 9-slice scaling on with `guides`, or off with `None`, for `name`.
+    pub fn set_symbol_nine_slice(&mut self, name: &str, guides: Option<SymbolNineSlice>) {
+        let Some(g) = guides else {
+            let Some(o) = self.unknown.get_mut(SYMBOL_NINE_SLICE).and_then(|m| m.as_object_mut()) else { return };
+            o.remove(name);
+            if o.is_empty() {
+                self.unknown.remove(SYMBOL_NINE_SLICE);
+            }
+            return;
+        };
+        let m = self.unknown.entry(SYMBOL_NINE_SLICE.to_string()).or_insert_with(|| serde_json::json!({}));
+        if let Some(o) = m.as_object_mut() {
+            o.insert(name.into(), g.to_value());
+        }
+    }
+
+    /// Move the stored 9-slice guides when a symbol is renamed.
+    pub fn rename_symbol_nine_slice(&mut self, from: &str, to: &str) {
+        if from == to {
+            return;
+        }
+        let g = self.symbol_nine_slice(from);
+        self.set_symbol_nine_slice(from, None);
+        self.set_symbol_nine_slice(to, g);
     }
 }
 
@@ -1219,11 +1809,29 @@ fn default_graphic_styles() -> Vec<GraphicStyle> {
     .collect()
 }
 
+/// Node, slice and asset ids are handed out below this: no document gets near it by counting, so
+/// larger ids in a file are damage (or made by hand) and the counter never follows them (#1718).
+const MAX_NEXT_ID: u64 = 1 << 62;
+
+/// An id (never 0) none of `used` has: one past the largest, or, when that is the largest there
+/// is (a damaged file), the smallest one free.
+fn free_id(used: impl Iterator<Item = u32>) -> u32 {
+    let mut used: Vec<u32> = used.collect();
+    if let Some(next) = used.iter().max().copied().unwrap_or(0).checked_add(1) {
+        return next;
+    }
+    used.sort_unstable();
+    used.dedup();
+    // Ids 1, 2, 3… as far as they are all taken: the first that isn't follows them.
+    let taken = used.iter().filter(|&&id| id != 0).zip(1u32..).take_while(|&(&id, n)| id == n).count();
+    u32::try_from(taken).map_or(u32::MAX, |n| n.saturating_add(1))
+}
+
 impl Document {
     /// Make the next id allocated at least `next`: ids handed out outside the layer tree (such
     /// as an importer's opacity mask and pattern art), which [`Document::fix_next_id`] doesn't see.
     pub fn reserve_ids(&mut self, next: u64) {
-        self.next_id = self.next_id.max(next);
+        self.next_id = self.next_id.max(next.min(MAX_NEXT_ID));
     }
 }
 
@@ -1231,6 +1839,46 @@ impl Document {
 mod tests {
     use super::*;
     use vectorcraft_geom::shapes;
+
+    /// Zooming in on an inch ruler divided the inch into tenths (#2827). Its steps below an inch
+    /// are binary fractions now, and the minor ticks between them stay binary too; every other
+    /// unit is still read in tenths.
+    #[test]
+    fn an_inch_ruler_steps_in_binary_fractions() {
+        let step = |u: Unit, zoom: f64| u.ruler_step(zoom);
+        // Every inch step at or below an inch is 1/2^k, never a tenth or a fifth.
+        for zoom in [1.0, 2.0, 5.0, 7.5, 10.0, 20.0, 40.0, 100.0, 400.0] {
+            let s = step(Unit::Inches, zoom);
+            if s <= 1.0 {
+                let k = s.recip();
+                assert_eq!(k, k.round(), "{s} at zoom {zoom} is 1/k for a whole k");
+                assert!((k.round() as u64).is_power_of_two(), "{s} at zoom {zoom} is 1/2^k");
+            }
+            // A label step always leaves at least 50 px, which is what the ladder is picked for.
+            assert!(s * Unit::Inches.points() * zoom >= 50.0, "zoom {zoom}");
+        }
+        // The steps the report named: tenths became quarters, eighths and sixteenths.
+        assert_eq!(step(Unit::Inches, 5.0), 0.25);
+        assert_eq!(step(Unit::Inches, 10.0), 0.125);
+        assert_eq!(step(Unit::Inches, 20.0), 0.0625);
+        // An inch and wider is unchanged.
+        assert_eq!(step(Unit::Inches, 1.0), 1.0);
+        // Labelling stops at a sixteenth, as the report says Illustrator's does, so zooming in
+        // further only adds ticks. A label therefore never needs more than the six characters of
+        // "0.0625", which the left ruler has room for when it spells one out a character per line.
+        for zoom in [20.0, 50.0, 100.0, 400.0, 1600.0] {
+            assert_eq!(step(Unit::Inches, zoom), 0.0625, "zoom {zoom}");
+        }
+        // The unlabelled ticks go on down to a hundred and twenty-eighth: the 32nds, 64ths and
+        // 128ths the report expects to appear unlabelled when zoomed in close.
+        assert_eq!(Unit::Inches.ruler_minor(0.0625), 1.0 / 128.0);
+        // The minor ticks: an eighth of the step on an inch ruler, a tenth elsewhere.
+        assert_eq!(Unit::Inches.ruler_minor(0.25), 0.03125);
+        assert_eq!(Unit::Millimeters.ruler_minor(25.0), 2.5);
+        assert_eq!(Unit::Points.ruler_minor(100.0), 10.0);
+        // Other units keep the decimal ladder, so a tenth and a fifth still appear.
+        assert!([0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0].contains(&step(Unit::Millimeters, 5.0)), "{}", step(Unit::Millimeters, 5.0));
+    }
 
     fn doc_with_rects() -> (Document, NodeId, NodeId) {
         let mut d = Document::new(612.0, 792.0);
@@ -1269,6 +1917,75 @@ mod tests {
         Arc::make_mut(&mut d.layers[0]).locked = true;
         assert!(d.art_on_artboard(wide, false).is_empty());
         assert_eq!(d.art_on_artboard(wide, true), vec![a, b], "a locked layer's art too");
+    }
+
+    #[test]
+    fn art_on_artboard_tolerates_roundoff_at_each_edge() {
+        let (d, a, _) = doc_with_rects();
+        let roundoff = 1e-12;
+        for board in [
+            Rect::new(roundoff, 0.0, 10.0, 10.0),
+            Rect::new(0.0, roundoff, 10.0, 10.0),
+            Rect::new(0.0, 0.0, 10.0 - roundoff, 10.0),
+            Rect::new(0.0, 0.0, 10.0, 10.0 - roundoff),
+        ] {
+            assert_eq!(d.art_on_artboard(board, false), vec![a], "roundoff at {board:?}");
+        }
+        // A real overhang remains outside.
+        for board in
+            [Rect::new(0.001, 0.0, 10.0, 10.0), Rect::new(0.0, 0.001, 10.0, 10.0), Rect::new(0.0, 0.0, 9.999, 10.0), Rect::new(0.0, 0.0, 10.0, 9.999)]
+        {
+            assert!(d.art_on_artboard(board, false).is_empty(), "overhang at {board:?}");
+        }
+    }
+
+    #[test]
+    fn art_on_artboard_measures_a_symbol_instance_by_its_art() {
+        let mut d = Document::new(612.0, 792.0);
+        let art = Node::path(d.alloc_id(), shapes::rectangle(Rect::new(0.0, 0.0, 10.0, 10.0)), Appearance::default_art());
+        d.symbols.push(Symbol { name: "Box".into(), art: Arc::new(art) });
+        let (layer, id) = (d.layers[0].id, d.alloc_id());
+        d.insert(Some(layer), 0, Node::new(id, NodeKind::SymbolInstance { symbol: "Box".into(), xf: Affine::translate((2.0, 2.0)) })).unwrap();
+        // The art, (2, 2) to (12, 12), lies inside; the 20 × 20 square, (-8, -8) to (12, 12), doesn't.
+        assert_eq!(d.art_on_artboard(Rect::new(0.0, 0.0, 15.0, 15.0), false), vec![id]);
+    }
+
+    #[test]
+    fn artboard_at_counts_the_right_and_bottom_edges() {
+        // Artboard 0 is (0, 0) to (100, 100), artboard 1 is to its right and artboard 2 below it.
+        let mut d = Document::new(100.0, 100.0);
+        for rect in [Rect::new(100.0, 0.0, 200.0, 100.0), Rect::new(0.0, 100.0, 100.0, 200.0)] {
+            let mut a = d.artboards[0].clone();
+            a.rect = rect;
+            d.artboards.push(a);
+        }
+        let held = |d: &Document, x: f64, y: f64| (d.artboard_at(Point::new(x, y)), d.artboard_holding(Point::new(x, y), false));
+        // Each artboard's own right and bottom edges, edges with roundoff, and points beyond them.
+        assert_eq!(held(&d, 200.0, 50.0), (Some(1), Some(1)), "right edge");
+        assert_eq!(held(&d, 150.0, 100.0), (Some(1), Some(1)), "bottom edge");
+        assert_eq!(held(&d, 200.0, 100.0), (Some(1), Some(1)), "bottom right corner");
+        assert_eq!(held(&d, 100.0, 150.0), (Some(2), Some(2)), "right edge");
+        assert_eq!(held(&d, 50.0, 200.0 + 1e-9), (Some(2), Some(2)), "roundoff past the bottom edge");
+        assert_eq!(held(&d, -1e-9, 50.0), (Some(0), Some(0)), "roundoff past the left edge");
+        assert_eq!(held(&d, 200.001, 50.0), (None, None));
+        assert_eq!(held(&d, 50.0, 200.001), (None, None));
+        // On an edge two artboards share, the artboard to the right of it or below it holds the
+        // point, in either list order, except at the end of the edge that lies on that artboard's
+        // bottom or right edge.
+        assert_eq!(held(&d, 100.0, 50.0), (Some(1), Some(1)));
+        assert_eq!(held(&d, 50.0, 100.0), (Some(2), Some(2)));
+        // The bottom edges of artboards 0 and 1 meet at (100, 100), which is also artboard 2's top
+        // right corner: the first holds the point, or the last when `topmost`.
+        assert_eq!(held(&d, 100.0, 100.0), (Some(2), Some(0)), "shared corner");
+        d.artboards.swap(0, 1);
+        assert_eq!(held(&d, 100.0, 50.0), (Some(0), Some(0)));
+        // Where two artboards overlap, the topmost holds the point, or the first one when not
+        // `topmost`.
+        let mut inner = d.artboards[1].clone();
+        inner.rect = Rect::new(10.0, 10.0, 90.0, 90.0);
+        d.artboards.push(inner);
+        assert_eq!(held(&d, 50.0, 50.0), (Some(3), Some(1)));
+        assert_eq!(held(&d, 90.0, 50.0), (Some(1), Some(1)), "inside artboard 1, on the right edge of artboard 3");
     }
 
     #[test]
@@ -1315,6 +2032,45 @@ mod tests {
         assert_eq!(d.node(l2).unwrap().display_name(), "Layer 2");
         assert_eq!(d.default_layer(), Some(l2));
         assert_eq!(d.layer_color(l2), LAYER_COLORS[1].1);
+    }
+
+    /// #1718: a file whose ids or counters are at their type's largest value still hands out ids
+    /// nothing in it uses (and never 0), instead of overflowing.
+    #[test]
+    fn exhausted_ids_in_a_file_dont_run_out() {
+        let (d, a, b) = doc_with_rects();
+        let mut v = serde_json::to_value(&d).unwrap();
+        v["next_id"] = serde_json::json!(u64::MAX);
+        // Object `a` gets the largest id there is.
+        fn renumber(v: &mut serde_json::Value, from: u64) {
+            match v {
+                serde_json::Value::Object(o) => {
+                    if o.get("id").and_then(serde_json::Value::as_u64) == Some(from) {
+                        o.insert("id".into(), serde_json::json!(u64::MAX));
+                    }
+                    o.values_mut().for_each(|c| renumber(c, from));
+                }
+                serde_json::Value::Array(a) => a.iter_mut().for_each(|c| renumber(c, from)),
+                _ => {}
+            }
+        }
+        renumber(&mut v["layers"], a.0);
+        let mut d: Document = serde_json::from_value(v).unwrap();
+        assert!(d.node(NodeId(u64::MAX)).is_some(), "the file's largest id is kept");
+        d.fix_next_id();
+        let fresh: Vec<NodeId> = (0..3).map(|_| d.alloc_id()).collect();
+        assert!(fresh.iter().all(|id| d.node(*id).is_none() && id.0 > b.0 && id.0 < MAX_NEXT_ID), "{fresh:?}");
+        assert!(fresh[0] != fresh[1] && fresh[1] != fresh[2]);
+        // A counter left at the end by other means stays there rather than wrapping to 0.
+        d.next_id = u64::MAX;
+        assert_eq!((d.alloc_id(), d.peek_next_id()), (NodeId(u64::MAX), u64::MAX));
+        d.reserve_ids(u64::MAX);
+        // Artboards and graphic styles: one past the largest, else the smallest id free.
+        assert_eq!(free_id([1, 2, 7].into_iter()), 8);
+        assert_eq!(free_id([u32::MAX, 0, 1, 2, 4].into_iter()), 3);
+        assert_eq!(free_id([u32::MAX].into_iter()), 1);
+        d.artboards[0].id = u32::MAX;
+        assert_eq!(d.next_artboard_id(), 1);
     }
 
     #[test]
@@ -1389,8 +2145,18 @@ mod tests {
         assert_eq!(Unit::Points.format(12.5), "12.5 pt");
         assert_eq!(Unit::Inches.format(144.0), "2 in");
     }
+
+    #[test]
+    fn negative_picas_and_points_sign_applies_to_whole_value() {
+        assert_eq!(Unit::Points.parse("-2p6"), Some(-30.0));
+        assert_eq!(Unit::Points.parse("-0p6"), Some(-6.0));
+        assert_eq!(Unit::Points.parse("-2p"), Some(-24.0));
+        assert_eq!(Unit::Points.parse("2p6"), Some(30.0));
+    }
 }
 
+#[cfg(test)]
+mod tests_lookups;
 #[cfg(test)]
 mod tests_slices;
 #[cfg(test)]

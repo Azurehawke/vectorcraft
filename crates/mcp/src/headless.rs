@@ -35,9 +35,9 @@ const HOST_COMMANDS: &[(&str, &str, &str)] = &[
     (
         "file.save",
         "Save",
-        "{path?, format?, options?, svg?: {…SVG options}} = document.save: .vectorcraft, .ai (a PDF that reopens editable), .pdf, .svg or .svgz (default: the document's own path and format)",
+        "{…as document.save} = document.save {path?, format?, options?, svg?: {…SVG options}}: .vectorcraft, .ai (a PDF that reopens editable), .pdf, .svg or .svgz (default: the document's own path and format)",
     ),
-    ("file.export", "Export…", "{path?, format?, artboard?, range?, scale?, …} = document.export (no path → dataBase64)"),
+    ("file.export", "Export…", "{…as document.export} = document.export {path?, format?, artboard?, range?, scale?, …} (no path → dataBase64)"),
     (
         "file.exportForScreens",
         "Export for Screens…",
@@ -47,7 +47,7 @@ const HOST_COMMANDS: &[(&str, &str, &str)] = &[
     (
         "tool.setOption",
         "Tool Option",
-        "{key, value} | {values: {key: value…}}, tool?: id (default: the active tool) → the tool's options (`{}` reads them); kept options last across tool switches",
+        "{key?, value? | values?: {key: value…}, tool?: id (default: the active tool)} → the tool's options (`{}` reads them); kept options last across tool switches",
     ),
 ];
 
@@ -79,6 +79,7 @@ fn tool_key(name: &str) -> Option<ToolKey> {
         "[" | "bracketleft" | "openbracket" => ToolKey::BracketLeft,
         "]" | "bracketright" | "closebracket" => ToolKey::BracketRight,
         "tab" => ToolKey::Tab,
+        k if k.len() == 1 && k.bytes().all(|b| b.is_ascii_lowercase()) => ToolKey::Letter(k.chars().next()?),
         k if k.len() == 1 => ToolKey::Digit(k.parse().ok()?),
         _ => return None,
     })
@@ -125,6 +126,12 @@ impl Headless {
     }
 
     fn exec(&mut self, id: &str, params: &Value) -> Result<Value, String> {
+        // A key the command's description doesn't name is an error, not a default (#1442).
+        match HOST_COMMANDS.iter().find(|c| c.0 == id) {
+            Some((_, _, doc)) => vectorcraft_engine::check_keys(id, doc, params),
+            None => self.session.check_params(id, params),
+        }
+        .map_err(|e| e.to_string())?;
         match id {
             "file.open" => self.open(params),
             "file.save" => self.save(params),
@@ -190,14 +197,22 @@ impl Headless {
             }
         }
         let sel = self.session.active().map(|d| d.selection.objects.iter().map(|i| i.0).collect::<Vec<_>>()).unwrap_or_default();
-        Ok(json!({"selection": sel, "tool": self.session.tool_id(), "requests": requests}))
+        let key = self.session.active().and_then(|d| d.selection.key).map(|k| k.0);
+        Ok(json!({"selection": sel, "key": key, "tool": self.session.tool_id(), "requests": requests}))
     }
 
     fn key(&mut self, p: &Value) -> Result<Value, String> {
         let key = s(p, "key").ok_or("missing `key`")?;
         let b = |n: &str| p.get(n).and_then(Value::as_bool).unwrap_or(false);
         let mods = Mods { shift: b("shift"), alt: b("alt"), cmd: b("cmd"), ctrl: b("ctrl"), ..Mods::default() };
-        let tk = tool_key(key);
+        // A letter reaches the tool only when the tool claims it without Cmd, Ctrl or Alt (E while
+        // a selection marquee is dragged); otherwise it is a shortcut.
+        let mut tk = tool_key(key);
+        if let Some(k @ ToolKey::Letter(_)) = tk
+            && (mods.cmd || mods.ctrl || mods.alt || !self.session.tool_claims_key(k, self.view))
+        {
+            tk = None;
+        }
         // A busy tool (pen path in progress, shape being dragged) gets its keys first, as do keys
         // the tool claims (the Gradient tool's selected stop takes Delete and the arrows).
         if let Some(k) = tk
@@ -238,6 +253,8 @@ impl Headless {
         let scale = p.get("scale").and_then(Value::as_f64).unwrap_or(1.0).clamp(0.01, 16.0);
         vectorcraft_render::raster_size(r, scale)?;
         let img = self.renderer.render_region(&doc, r, scale, true);
+        // A cancelled render stops drawing: the picture is not whole and is not written.
+        vectorcraft_engine::cancel::check().map_err(|e| e.to_string())?;
         let png = img.to_png()?;
         let mut out = json!({"width": img.width, "height": img.height});
         match s(p, "path") {

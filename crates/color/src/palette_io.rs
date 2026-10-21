@@ -57,6 +57,19 @@ impl PaletteFormat {
     pub fn binary(self) -> bool {
         self == PaletteFormat::Ase
     }
+    /// Does [`write`] keep a swatch with `paint` in a file of this format? None and patterns are
+    /// never written; `.gpl` and `.ase` hold solid colors only, and CSS holds no freeform gradients.
+    pub fn holds(self, paint: &Paint) -> bool {
+        match paint {
+            Paint::Solid { .. } => true,
+            Paint::Gradient(g) => match self {
+                PaletteFormat::Native => true,
+                PaletteFormat::Css => g.gradient.kind != GradientKind::Freeform,
+                PaletteFormat::Gpl | PaletteFormat::Ase => false,
+            },
+            Paint::None | Paint::Pattern { .. } => false,
+        }
+    }
 }
 
 /// The native file: a header around the library.
@@ -88,7 +101,7 @@ const ACB_CUT_SHORT: &str = "the color book is cut short";
 /// colors in their own model. Writing `.ase` fails for a library with more colors and groups than
 /// [`read_bytes`] reads from one file.
 pub fn write(lib: &SwatchLibrary, format: PaletteFormat) -> Result<Vec<u8>, String> {
-    let keep = |w: &&Swatch| matches!(w.paint, Paint::Solid { .. } | Paint::Gradient(_));
+    let keep = |w: &&Swatch| format.holds(&w.paint);
     let text = match format {
         PaletteFormat::Native => {
             let strip = |list: &[Swatch]| list.iter().filter(keep).cloned().collect::<Vec<_>>();
@@ -175,7 +188,7 @@ fn write_css(lib: &SwatchLibrary, keep: impl Fn(&&Swatch) -> bool) -> String {
                 Paint::Solid { color, .. } => css_color(color, 1.0),
                 Paint::Gradient(g) if g.gradient.kind != GradientKind::Freeform => {
                     let stops: Vec<String> =
-                        g.gradient.stops.iter().map(|s| format!("{} {}%", css_color(&s.color, s.opacity), (s.offset * 100.0).round())).collect();
+                        g.gradient.stops.iter().map(|s| format!("{} {}%", css_color(&s.color, s.opacity), s.offset * 100.0)).collect();
                     match g.gradient.kind {
                         GradientKind::Radial => format!("radial-gradient(circle, {})", stops.join(", ")),
                         _ => format!("linear-gradient({}deg, {})", (90.0 - g.angle).rem_euclid(360.0).round(), stops.join(", ")),
@@ -358,7 +371,9 @@ fn read_gpl(text: &str, fallback: &str) -> SwatchLibrary {
             continue;
         }
         if let Some(n) = line.strip_prefix("Name:") {
-            lib.name = n.trim().to_string();
+            if !n.trim().is_empty() {
+                lib.name = n.trim().to_string();
+            }
             continue;
         }
         // Comments, headers (`Columns: 4`) and anything else that isn't a colour are skipped.
@@ -635,6 +650,14 @@ mod tests {
     use crate::{Gradient, GradientPaint, GradientStop};
     use proptest::prelude::*;
 
+    #[test]
+    fn gpl_blank_name_keeps_fallback() {
+        let blank = "GIMP Palette\nName: \nColumns: 0\n#\n  1   2   3\tx\n";
+        assert_eq!(read(blank, "fallback").unwrap().name, "fallback");
+        let named = "GIMP Palette\nName: Warm\n  1   2   3\tx\n";
+        assert_eq!(read(named, "fallback").unwrap().name, "Warm");
+    }
+
     /// A color book's string: a `u32` count of UTF-16 code units, then the units.
     fn acb_str(out: &mut Vec<u8>, s: &str) {
         let units: Vec<u16> = s.encode_utf16().collect();
@@ -790,6 +813,49 @@ mod tests {
         let text = written(&lib, PaletteFormat::Css);
         assert!(text.contains("--red: #000000;") && text.contains("--red-2: #000000;"));
         assert!(read(&text, "x").is_err(), "CSS is written only");
+    }
+
+    #[test]
+    fn css_preserves_fractional_gradient_stop_positions() {
+        for kind in [GradientKind::Linear, GradientKind::Radial] {
+            let lib = SwatchLibrary {
+                name: "Positions".into(),
+                swatches: vec![Swatch {
+                    name: "Ramp".into(),
+                    paint: Paint::Gradient(Box::new(GradientPaint::new(Gradient {
+                        kind,
+                        stops: vec![
+                            GradientStop::new(0.0, Color::BLACK),
+                            GradientStop::new(0.125, Color::rgb8(255, 0, 0)),
+                            GradientStop::new(0.12890625, Color::WHITE),
+                            GradientStop::new(1.0, Color::rgb8(0, 0, 255)),
+                        ],
+                    }))),
+                    global: false,
+                    spot: false,
+                }],
+                groups: vec![],
+            };
+            let text = written(&lib, PaletteFormat::Css);
+            assert!(text.contains("#000000 0%, #ff0000 12.5%, #ffffff 12.890625%, #0000ff 100%"), "{kind:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn holds_counts_the_swatches_each_format_writes() {
+        // `sample()` holds the spot color Ink, the linear gradient Fade, the pattern Tiles and two solid colors in a group.
+        let mut lib = sample();
+        let Paint::Gradient(mut mesh) = lib.swatches[1].paint.clone() else { panic!("Fade is a gradient") };
+        mesh.gradient.kind = GradientKind::Freeform;
+        lib.swatches.push(Swatch { name: "Mesh".into(), paint: Paint::Gradient(mesh), global: false, spot: false });
+        lib.swatches.push(Swatch { name: "[None]".into(), paint: Paint::None, global: false, spot: false });
+        let held = |f: PaletteFormat| lib.iter().filter(|w| f.holds(&w.paint)).count();
+        assert_eq!(PaletteFormat::ALL.map(held), [5, 3, 3, 4], "vcswatches, gpl, ase, css");
+        for f in [PaletteFormat::Native, PaletteFormat::Gpl, PaletteFormat::Ase] {
+            assert_eq!(read_bytes(&write(&lib, f).unwrap(), "x").unwrap().len(), held(f), "{f:?}");
+        }
+        let css = written(&lib, PaletteFormat::Css);
+        assert_eq!(css.lines().filter(|l| l.starts_with("  --")).count(), held(PaletteFormat::Css), "one property each: {css}");
     }
 
     /// A swatch exchange file of `blocks` (type, body).
@@ -1086,6 +1152,16 @@ mod tests {
             for (g, want) in back.groups.iter().zip(&lib.groups) {
                 prop_assert_eq!(&g.name, &want.name);
                 prop_assert!(same_swatches(&g.swatches, &ase_expected(&want.swatches)), "{}: {:?}", g.name, g.swatches);
+            }
+        }
+
+        /// A written `.vcswatches`, `.gpl` or `.ase` file reads back with as many swatches as
+        /// [`PaletteFormat::holds`] counts.
+        #[test]
+        fn written_files_read_back_with_the_swatches_holds_counts(lib in arb_library()) {
+            for f in [PaletteFormat::Native, PaletteFormat::Gpl, PaletteFormat::Ase] {
+                let back = read_bytes(&write(&lib, f).unwrap(), &lib.name).unwrap();
+                prop_assert_eq!(back.len(), lib.iter().filter(|w| f.holds(&w.paint)).count(), "{:?}", f);
             }
         }
     }

@@ -57,6 +57,48 @@ fn serialize(s: &mut Session, format: &str) -> Vec<u8> {
     vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap()
 }
 
+fn eps_of(s: &mut Session) -> Vec<u8> {
+    let v = s.execute("document.exportEps", &json!({})).unwrap();
+    vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap()
+}
+
+/// `file.place.info`'s width and height for `bytes` named `name`, with `extra` params.
+fn info_size(s: &mut Session, name: &str, bytes: &[u8], extra: Value) -> (f64, f64) {
+    let mut p = file(name, bytes);
+    if let (Some(o), Value::Object(e)) = (p.as_object_mut(), extra) {
+        o.extend(e);
+    }
+    let r = s.execute("file.place.info", &p).unwrap();
+    (r["width"].as_f64().unwrap(), r["height"].as_f64().unwrap())
+}
+
+/// The bounds of what the active document's art draws ([`vectorcraft_render::encode::art_bounds`])
+/// lie within a millionth of a point of `want`.
+fn drawn_at(s: &Session, want: Rect) -> bool {
+    let b = vectorcraft_render::encode::art_bounds(&s.doc().unwrap().doc).unwrap_or_default();
+    [b.x0 - want.x0, b.y0 - want.y0, b.x1 - want.x1, b.y1 - want.y1].iter().all(|d| d.abs() < 1e-6)
+}
+
+/// A 400 × 300 pt document holding one group: a 40 × 40 pt square at (20, 20) and, hidden, a
+/// 170 × 42 pt rectangle at (100, 100). Returns it with the square's visual bounds.
+fn group_with_a_hidden_member() -> (Session, Rect) {
+    let mut s = session();
+    let square = s.execute("shape.rectangle", &json!({"x": 20, "y": 20, "width": 40, "height": 40})).unwrap()["id"].clone();
+    let wide = s.execute("shape.rectangle", &json!({"x": 100, "y": 100, "width": 170, "height": 42})).unwrap()["id"].clone();
+    s.execute("object.group", &json!({"ids": [square, wide]})).unwrap();
+    s.execute("object.hide", &json!({"ids": [wide]})).unwrap();
+    assert!(!node(&s, &wide).visible);
+    let shown = node(&s, &square).visual_bounds().unwrap();
+    (s, shown)
+}
+
+/// How many of `n` and the objects in it are hidden.
+fn hidden_in(n: &Node) -> usize {
+    let mut hidden = 0;
+    n.walk(&mut |c| hidden += usize::from(!c.visible));
+    hidden
+}
+
 #[test]
 fn malformed_place_coordinates_are_rejected_instead_of_silently_changed() {
     let mut s = session();
@@ -218,6 +260,120 @@ fn pdf_pages_and_native_artboards_place_as_clipped_groups() {
     }
 }
 
+/// With crop "bounding", the art's box is the box of what shows, as an export measures it: a hidden
+/// member of a group does not count, and is still placed, hidden.
+#[test]
+fn bounding_box_placement_measures_only_the_art_that_shows() {
+    let (mut src, shown) = group_with_a_hidden_member();
+    let eps = eps_of(&mut src);
+    let native = serialize(&mut src, "vectorcraft");
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300"><g><rect x="20" y="20" width="40" height="40"/><rect x="100" y="100" width="170" height="42" style="display:none"/></g></svg>"#;
+    // The sample's group `Pair` has a hidden member 42 pt tall; what shows is 170 × 40 pt.
+    let sample = vectorcraft_testkit::ai::eps(&vectorcraft_testkit::ai::sample_data(), vectorcraft_testkit::ai::page_ps());
+    let cases: [(&str, &[u8], (f64, f64)); 4] = [
+        ("pair.eps", &eps, (shown.width(), shown.height())),
+        ("pair.vectorcraft", &native, (shown.width(), shown.height())),
+        ("pair.svg", svg, (40.0, 40.0)),
+        ("art.eps", &sample, (170.0, 40.0)),
+    ];
+    for (name, bytes, (w, h)) in cases {
+        let mut s = session();
+        let (iw, ih) = info_size(&mut s, name, bytes, json!({"crop": "bounding"}));
+        assert!(close(iw, w) && close(ih, h), "{name}: {iw} × {ih}, not {w} × {h}");
+        // `rect` fits what shows, centered.
+        let r = place(&mut s, name, bytes, json!({"crop": "bounding", "rect": [100, 100, 80, 80]}));
+        let k = (80.0 / w).min(80.0 / h);
+        let want = Rect::from_center_size((140.0, 140.0), (w * k, h * k));
+        assert!(drawn_at(&s, want), "{name}: not {want:?}");
+        assert_eq!(hidden_in(&node(&s, &r["ids"][0])), 1, "{name}: the hidden member is placed, hidden");
+    }
+}
+
+/// With crop "bounding", an effect's reach counts in the art's box, as in an export of the art.
+#[test]
+fn bounding_box_placement_counts_a_drop_shadow() {
+    let mut src = session();
+    let id = src.execute("shape.rectangle", &json!({"x": 20, "y": 20, "width": 40, "height": 40})).unwrap()["id"].clone();
+    let square = node(&src, &id).visual_bounds().unwrap();
+    src.execute("effect.apply", &json!({"effect": "stylize.dropShadow", "ids": [id], "params": {"x": 8, "y": 0, "blur": 0}})).unwrap();
+    let export = vectorcraft_render::encode::art_bounds(&src.doc().unwrap().doc).unwrap();
+    assert!(export.width() > square.width() + 7.0, "{export:?}");
+    let eps = eps_of(&mut src);
+    let native = serialize(&mut src, "vectorcraft");
+    let cases: [(&str, &[u8]); 2] = [("shadow.eps", &eps), ("shadow.vectorcraft", &native)];
+    for (name, bytes) in cases {
+        let mut s = session();
+        let (w, h) = info_size(&mut s, name, bytes, json!({"crop": "bounding"}));
+        assert!(close(w, export.width()) && close(h, export.height()), "{name}: {w} × {h}, not {export:?}");
+    }
+}
+
+/// A symbol instance in the placed art is measured by its symbol's art, for the art's box and for
+/// the size `file.place` answers.
+#[test]
+fn a_placed_symbol_instance_is_measured_by_its_art() {
+    let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="400" height="300"><defs><symbol id="s"><rect width="100" height="10"/></symbol></defs><use xlink:href="#s" x="50" y="50"/></svg>"##;
+    let mut s = session();
+    assert_eq!(info_size(&mut s, "bar.svg", svg, json!({"crop": "bounding"})), (100.0, 10.0));
+    let r = place(&mut s, "bar.svg", svg, json!({"crop": "bounding", "rect": [100, 100, 200, 200]}));
+    assert!(close(r["width"].as_f64().unwrap(), 200.0) && close(r["height"].as_f64().unwrap(), 20.0), "{r}");
+    assert!(drawn_at(&s, Rect::new(100.0, 190.0, 300.0, 210.0)));
+    // Replace centers an image on it and gives a text file its size.
+    let r = place(&mut s, "dot.png", &png(10, 10, [0, 0, 0, 255], None), json!({"replace": true}));
+    let c = node(&s, &r["ids"][0]).geometric_bounds().unwrap().center();
+    assert!(close(c.x, 200.0) && close(c.y, 200.0), "{c:?}");
+    let r = place(&mut s, "bar.svg", svg, json!({"crop": "bounding", "rect": [100, 100, 200, 200]}));
+    assert!(close(r["width"].as_f64().unwrap(), 200.0), "{r}");
+    let r = place(&mut s, "note.txt", b"Hello", json!({"replace": true}));
+    let NodeKind::Text(t) = &node(&s, &r["ids"][0]).kind else { panic!("area type") };
+    let frame = t.area_frame().and_then(|f| f.bounds()).unwrap();
+    assert!(close(frame.width(), 200.0) && close(frame.height(), 20.0), "{frame:?}");
+}
+
+/// Crop "crop" still frames the art by its artboard (an SVG by its viewBox), hidden members or not.
+#[test]
+fn crop_placement_keeps_the_artboard_with_a_hidden_member() {
+    let (mut src, _) = group_with_a_hidden_member();
+    let eps = eps_of(&mut src);
+    let native = serialize(&mut src, "vectorcraft");
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300"><g><rect x="20" y="20" width="40" height="40"/><rect x="100" y="100" width="170" height="42" style="display:none"/></g></svg>"#;
+    let cases: [(&str, &[u8]); 3] = [("pair.eps", &eps), ("pair.vectorcraft", &native), ("pair.svg", svg)];
+    for (name, bytes) in cases {
+        let mut s = session();
+        assert_eq!(info_size(&mut s, name, bytes, json!({"crop": "crop"})), (400.0, 300.0), "{name}");
+        let r = place(&mut s, name, bytes, json!({"crop": "crop"}));
+        assert_eq!((r["width"].as_f64(), r["height"].as_f64()), (Some(400.0), Some(300.0)), "{name}: {r}");
+    }
+}
+
+/// A page's or artboard's art is the objects whose visible art lies on it: a group whose only part
+/// on the artboard is hidden stays out, and a hidden object on the artboard is still placed, hidden.
+#[test]
+fn a_group_whose_only_part_on_the_artboard_is_hidden_is_left_out() {
+    let mut src = session();
+    let off = src.execute("shape.rectangle", &json!({"x": -300, "y": 20, "width": 40, "height": 40})).unwrap()["id"].clone();
+    let under = src.execute("shape.rectangle", &json!({"x": 100, "y": 100, "width": 170, "height": 42})).unwrap()["id"].clone();
+    src.execute("object.group", &json!({"ids": [off, under]})).unwrap();
+    src.execute("object.hide", &json!({"ids": [under]})).unwrap();
+    let dot = src.execute("shape.ellipse", &json!({"x": 50, "y": 50, "width": 30, "height": 30})).unwrap()["id"].clone();
+    let shown = node(&src, &dot).visual_bounds().unwrap();
+    let ghost = src.execute("shape.rectangle", &json!({"x": 300, "y": 200, "width": 20, "height": 20})).unwrap()["id"].clone();
+    src.execute("object.hide", &json!({"ids": [ghost]})).unwrap();
+    let eps = eps_of(&mut src);
+    let native = serialize(&mut src, "vectorcraft");
+    let cases: [(&str, &[u8]); 2] = [("parts.eps", &eps), ("parts.vectorcraft", &native)];
+    for (name, bytes) in cases {
+        let mut s = session();
+        let (w, h) = info_size(&mut s, name, bytes, json!({"crop": "bounding"}));
+        assert!(close(w, shown.width()) && close(h, shown.height()), "{name}: {w} × {h}");
+        let r = place(&mut s, name, bytes, json!({"crop": "bounding"}));
+        let g = node(&s, &r["ids"][0]);
+        let kids = g.children().unwrap();
+        assert_eq!(kids.len(), 2, "{name}: the circle and the hidden square");
+        assert!(kids[0].visible && !kids[1].visible, "{name}");
+    }
+}
+
 #[test]
 fn placed_art_brings_its_symbols_and_swatches_renaming_on_conflict() {
     // The file: a global "Brand" red rectangle and a "Star" symbol instance.
@@ -345,4 +501,50 @@ fn bad_place_params_are_errors() {
     assert!(s.execute("file.place.queue", &json!({"files": [{"name": "notes.txt", "dataBase64": ""}]})).is_err());
     assert_eq!(s.tool_id(), "selection", "a failed queue leaves the tool alone");
     assert!(top_children(&s).is_empty());
+}
+
+/// An SVG placed with `crop: "crop"` given is framed and clipped by its viewBox, as a PDF by its
+/// page, so art drawn on a shared canvas keeps its place and scale; by default (and with
+/// "bounding") it is fitted by its art's bounds (#788).
+#[test]
+fn an_svg_placed_with_crop_is_framed_by_its_viewbox() {
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1000"><path d="M200 300 L600 300 L600 800 L200 800 Z"/></svg>"#;
+    let path_bounds = |s: &Session, id: &Value| {
+        let mut b = None;
+        node(s, id).walk(&mut |n| {
+            if let NodeKind::Path { clipping: false, .. } = n.kind {
+                b = n.visual_bounds();
+            }
+        });
+        b.unwrap()
+    };
+    let near = |a: Rect, b: Rect| [a.x0 - b.x0, a.y0 - b.y0, a.x1 - b.x1, a.y1 - b.y1].iter().all(|d| d.abs() < 1e-6);
+    let mut s = session();
+    let r = place(&mut s, "glyph.svg", svg, json!({"rect": [100, 100, 200, 200], "crop": "crop"}));
+    assert_eq!((r["width"].as_f64(), r["height"].as_f64()), (Some(200.0), Some(200.0)), "{r}");
+    let id = &r["ids"][0];
+    assert!(near(path_bounds(&s, id), Rect::new(140.0, 160.0, 220.0, 260.0)), "{:?}", path_bounds(&s, id));
+    assert!(matches!(node(&s, id).kind, NodeKind::Group { clip: true, .. }), "clipped to the viewBox");
+    for extra in [json!({"rect": [100, 100, 200, 200]}), json!({"rect": [100, 100, 200, 200], "crop": "bounding"})] {
+        let mut s = session();
+        let r = place(&mut s, "glyph.svg", svg, extra);
+        assert!(near(path_bounds(&s, &r["ids"][0]), Rect::new(120.0, 100.0, 280.0, 300.0)), "{r}");
+    }
+}
+
+/// An SVG whose top-level group is clipped is placed as one clip group: the clip is kept, and its
+/// clipping path is not left behind as a loose path.
+#[test]
+fn a_clipped_top_level_group_stays_clipped() {
+    let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 200 100">
+  <defs><clipPath id="c"><path d="M0 0 L200 0 L200 100 L0 100 Z"/></clipPath></defs>
+  <g id="Layer_1" clip-path="url(#c)"><path d="M100 -20 L250 -20 L250 40 L100 40 Z" fill="#f00"/></g>
+</svg>"##;
+    let mut s = session();
+    let r = place(&mut s, "c.svg", svg, json!({"link": false}));
+    assert_eq!((r["width"].as_f64().unwrap(), r["height"].as_f64().unwrap()), (200.0, 100.0), "{r}");
+    let placed = node(&s, &r["ids"][0]);
+    let NodeKind::Group { children, clip: false } = &placed.kind else { panic!("{:?}", placed.kind) };
+    let [inner] = children.as_slice() else { panic!("one object: {children:?}") };
+    assert!(matches!(&inner.kind, NodeKind::Group { children, clip: true } if children.len() == 2), "{:?}", inner.kind);
 }

@@ -24,6 +24,8 @@ pub struct Done {
     pub key: CacheKey,
     pub img: Rendered,
     pub ms: f64,
+    /// [`vectorcraft_render::FrameStats::moved`] of the frame.
+    pub moved: usize,
 }
 
 pub struct Worker {
@@ -51,7 +53,7 @@ impl Worker {
                     }
                     let t0 = crate::now_ms();
                     let img = r.render(&job.doc, job.w, job.h, job.view, &job.opts);
-                    if done_tx.send(Done { key: job.key, img, ms: crate::now_ms() - t0 }).is_err() {
+                    if done_tx.send(Done { key: job.key, img, ms: crate::now_ms() - t0, moved: r.stats.moved }).is_err() {
                         break;
                     }
                     ctx.request_repaint();
@@ -59,6 +61,14 @@ impl Worker {
             })
             .ok()?;
         Some(Self { tx, rx, pending: None })
+    }
+
+    /// A controlled worker: tests receive jobs and decide when a frame completes.
+    #[cfg(test)]
+    pub(crate) fn test_channel() -> (Self, Receiver<Job>, Sender<Done>) {
+        let (tx, jobs) = channel();
+        let (done_tx, rx) = channel();
+        (Self { tx, rx, pending: None }, jobs, done_tx)
     }
 
     pub fn submit(&mut self, job: Job) {

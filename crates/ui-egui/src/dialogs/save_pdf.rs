@@ -272,11 +272,17 @@ pub(super) fn choice<T: Choice>(d: &Dialog, path: &str) -> Option<T> {
 /// A dropdown of the choices `T` (options for which `enabled` is false are greyed).
 pub(super) fn pick<T: Choice>(ui: &mut egui::Ui, d: &mut Dialog, path: &str, width: f32, enabled: impl Fn(T) -> bool) -> bool {
     let current = choice_index::<T>(d, path);
-    let label = current.and_then(|i| T::LABELS.get(i)).copied().unwrap_or_default();
-    let chosen = widgets::dropdown_with(ui, path, label, T::LABELS, width, |i| T::ALL.get(i).is_some_and(|c| enabled(*c)));
+    let labels: Vec<_> = T::LABELS.iter().map(|label| choice_label(crate::i18n::current(), path, label)).collect();
+    let label = current.and_then(|i| labels.get(i)).copied().unwrap_or_default();
+    let chosen = widgets::dropdown_with(ui, path, label, &labels, width, |i| T::ALL.get(i).is_some_and(|c| enabled(*c)));
     let Some(id) = chosen.and_then(|i| T::IDS.get(i)) else { return false };
     set(d, path, json!(id));
     true
+}
+
+/// Printer mark styles use adjectives, separately from interface language names.
+pub(super) fn choice_label<'a>(lang: crate::i18n::Lang, path: &str, label: &'a str) -> &'a str {
+    if path == "marks.kind" { crate::i18n::tr_ctx(lang, "mark-style", label) } else { crate::i18n::tr(lang, label) }
 }
 
 pub(super) fn number(ui: &mut egui::Ui, d: &mut Dialog, path: &str, suffix: &str, enabled: bool) {
@@ -371,7 +377,7 @@ pub(super) fn section_list(ui: &mut egui::Ui, d: &mut Dialog, sections: &[&str],
     for s in sections {
         let sel = *s == section;
         let label = egui::RichText::new(tl!(*s)).size(12.5).color(if sel { t.text_strong } else { t.text });
-        if ui.add(egui::Button::selectable(sel, label).frame_when_inactive(false).min_size(egui::vec2(LIST_WIDTH - 12.0, 24.0))).clicked() {
+        if ui.add(egui::Button::selectable(sel, label).min_size(egui::vec2(LIST_WIDTH - 12.0, 24.0))).clicked() {
             d.fields.insert("__section".into(), json!(s));
         }
     }
@@ -593,7 +599,12 @@ fn output(ui: &mut egui::Ui, d: &mut Dialog) {
     });
     // PDF/X-1a converts to CMYK even without a conversion.
     let converting = get(d, "output.conversion") != ColorConversion::None.id() || standard.cmyk_only();
-    row(ui, tl!("Destination:"), |ui| profile_pick(ui, d, "output.destination", &names(DOCUMENT_PROFILE), 1, converting));
+    // The document's own profile (blank), the CMYK profile in effect, then every profile.
+    let destinations: Vec<&str> = std::iter::once(DOCUMENT_PROFILE)
+        .chain(std::iter::once(vectorcraft_pdf::DOCUMENT_CMYK))
+        .chain(profiles.iter().map(|p| p.name.as_str()))
+        .collect();
+    row(ui, tl!("Destination:"), |ui| profile_pick(ui, d, "output.destination", &destinations, 2, converting));
     row(ui, tl!("Profile inclusion:"), |ui| {
         // A standard decides whether colours are tagged.
         ui.add_enabled_ui(standard == Standard::None, |ui| pick::<ProfileInclusion>(ui, d, "output.profiles", 300.0, |_| true));
@@ -785,6 +796,7 @@ pub(super) fn option_rows<'a>(ui: &mut egui::Ui, changed: impl IntoIterator<Item
     for c in changed {
         let value = match &c["value"] {
             Value::Bool(b) => if *b { tl!("On") } else { tl!("Off") }.to_string(),
+            Value::String(s) if c["option"] == "marks.kind" => choice_label(crate::i18n::current(), "marks.kind", s).to_string(),
             Value::String(s) => s.clone(),
             other => other.to_string(),
         };
@@ -931,6 +943,26 @@ mod tests {
         let r = app.run("file.export.pdf", json!({"path": "/tmp/direct.pdf", "range": "2"})).unwrap();
         assert_eq!(r["path"], "/tmp/direct.pdf");
         assert!(r["warnings"].is_array());
+    }
+
+    /// A placed image whose pixel data can't be decoded is left out of the PDF, and the status bar
+    /// shows the note raster exports give.
+    #[test]
+    fn an_image_that_couldnt_be_decoded_is_named_in_the_status() {
+        let (mut app, written, _) = app();
+        // A PNG whose header reads (so it places at its size) but whose pixel data is cut short.
+        let mut cut = vec![];
+        image::RgbaImage::from_pixel(64, 32, image::Rgba([200, 30, 30, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut cut), image::ImageFormat::Png)
+            .unwrap();
+        let idat = cut.windows(4).position(|w| w == b"IDAT").unwrap();
+        cut.truncate(idat + 8);
+        // The image is placed on the first artboard.
+        app.run("file.place", json!({"name": "cut.png", "dataBase64": vectorcraft_format::base64_encode(&cut), "at": [60, 50]})).unwrap();
+        app.run("ui.savePdfDialog", json!({"path": "/tmp/cut.pdf"})).unwrap();
+        super::super::confirm(&mut app).unwrap();
+        assert_eq!(app.ui.status, "Saved /tmp/cut.pdf with 1 note(s): an image couldn't be decoded and is missing from the picture");
+        assert_eq!(written.borrow().len(), 1);
     }
 
     #[test]

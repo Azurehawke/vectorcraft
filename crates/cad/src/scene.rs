@@ -8,7 +8,7 @@ use std::io::Cursor;
 
 use kurbo::PathEl;
 use vectorcraft_color::Paint;
-use vectorcraft_doc::{AppearanceItem, Dash, Document, ImageObject, Node, NodeKind, StrokeLayer, TextKind, TextObject, Unit};
+use vectorcraft_doc::{AppearanceItem, Dash, Document, ImageObject, Node, NodeKind, StrokeLayer, SymbolBoxes, TextKind, TextObject, Unit};
 use vectorcraft_effects::stroke;
 use vectorcraft_geom::{Affine, BezPath, FillRule, PathData, Point, Rect};
 
@@ -54,6 +54,84 @@ struct Sub {
     start: Point,
     segs: Vec<Seg>,
     closed: bool,
+}
+
+/// A subpath close enough to a circle to preserve as a native DXF CIRCLE/ARC. VectorCraft's
+/// ellipse helper uses the standard four-cubic circle approximation, so recognition needs a small
+/// relative tolerance rather than exact control-point tests.
+struct CircularSub {
+    centre: Point,
+    radius: f64,
+    samples: Vec<Point>,
+}
+
+fn cubic_point(p0: Point, p1: Point, p2: Point, p3: Point, t: f64) -> Point {
+    let u = 1.0 - t;
+    let a = u * u * u;
+    let b = 3.0 * u * u * t;
+    let c = 3.0 * u * t * t;
+    let d = t * t * t;
+    Point::new(a * p0.x + b * p1.x + c * p2.x + d * p3.x, a * p0.y + b * p1.y + c * p2.y + d * p3.y)
+}
+
+/// Conservatively fit a curved subpath to one circle. Straight segments are never promoted. The
+/// 5e-4 radial tolerance is just above the maximum radial error of the usual kappa cubic circle
+/// approximation (~2.7e-4 r), while rejecting visibly elliptical or arbitrary cubic curves.
+fn circular_subpath(sub: &Sub) -> Option<CircularSub> {
+    if sub.segs.is_empty() || sub.segs.iter().any(|s| matches!(s, Seg::Line(_))) {
+        return None;
+    }
+    let mut samples = vec![sub.start];
+    let mut from = sub.start;
+    for seg in &sub.segs {
+        let Seg::Cubic(a, b, to) = *seg else { return None };
+        for i in 1..=8 {
+            samples.push(cubic_point(from, a, b, to, f64::from(i) / 8.0));
+        }
+        from = to;
+    }
+    if samples.len() < 4 {
+        return None;
+    }
+    let mut anchors = vec![sub.start];
+    anchors.extend(sub.segs.iter().map(|s| s.end()));
+    if sub.closed && anchors.last().is_some_and(|p| p.distance(sub.start) <= 1e-9) {
+        anchors.pop();
+    }
+    let (p0, p1, p2) = if anchors.len() >= 3 {
+        (anchors[0], anchors[anchors.len() / 3], anchors[anchors.len() * 2 / 3])
+    } else {
+        (samples[0], samples[samples.len() / 2], *samples.last()?)
+    };
+    let d = 2.0 * (p0.x * (p1.y - p2.y) + p1.x * (p2.y - p0.y) + p2.x * (p0.y - p1.y));
+    let scale2 = p0.distance(p1).max(p1.distance(p2)).max(p2.distance(p0)).powi(2);
+    if !d.is_finite() || d.abs() <= scale2 * 1e-9 {
+        return None;
+    }
+    let q0 = p0.x * p0.x + p0.y * p0.y;
+    let q1 = p1.x * p1.x + p1.y * p1.y;
+    let q2 = p2.x * p2.x + p2.y * p2.y;
+    let centre = Point::new(
+        (q0 * (p1.y - p2.y) + q1 * (p2.y - p0.y) + q2 * (p0.y - p1.y)) / d,
+        (q0 * (p2.x - p1.x) + q1 * (p0.x - p2.x) + q2 * (p1.x - p0.x)) / d,
+    );
+    let radius = centre.distance(p0);
+    if !centre.x.is_finite() || !centre.y.is_finite() || !radius.is_finite() || radius <= 1e-9 {
+        return None;
+    }
+    let tolerance = (radius * 5e-4).max(1e-6);
+    if samples.iter().any(|p| (centre.distance(*p) - radius).abs() > tolerance) {
+        return None;
+    }
+    Some(CircularSub { centre, radius, samples })
+}
+
+fn angle_deg(p: Point, centre: Point) -> f64 {
+    (p.y - centre.y).atan2(p.x - centre.x).to_degrees().rem_euclid(360.0)
+}
+
+fn on_ccw_arc(start: f64, end: f64, angle: f64) -> bool {
+    (angle - start).rem_euclid(360.0) <= (end - start).rem_euclid(360.0) + 1e-7
 }
 
 /// The subpaths of `bp` (quadratics raised to cubics).
@@ -158,6 +236,9 @@ struct LayerFlags {
 
 pub(crate) struct Scene<'a> {
     doc: &'a Document,
+    /// The art boxes of `doc`'s symbols, which the walk measures symbol instances by when it
+    /// crops to the region ([`SymbolBoxes::quick`]).
+    symbols: SymbolBoxes<'a>,
     o: &'a DxfOptions,
     /// Document space → drawing units (y up, origin at the region's bottom-left).
     to_dxf: Affine,
@@ -192,6 +273,7 @@ impl<'a> Scene<'a> {
         let r = o.region;
         Self {
             doc,
+            symbols: doc.symbol_boxes().quick(),
             o,
             to_dxf: Affine::new([k, 0.0, 0.0, -k, -r.x0 * k, r.y1 * k]),
             k,
@@ -271,7 +353,7 @@ impl<'a> Scene<'a> {
             return;
         }
         if self.o.crop && !layer {
-            match n.visual_bounds() {
+            match n.visual_bounds_with(&self.symbols) {
                 Some(b) if !overlaps(b, self.o.region) => return,
                 None if !n.is_container() => return,
                 _ => {}
@@ -316,7 +398,12 @@ impl<'a> Scene<'a> {
                 }
             }
             // Live blends, envelopes, meshes and repeats are written as their evaluated art.
-            NodeKind::Blend { .. } | NodeKind::Envelope { .. } | NodeKind::Mesh(_) | NodeKind::Repeat(_) | NodeKind::PlacedDocument(_) => {
+            NodeKind::Blend { .. }
+            | NodeKind::Envelope { .. }
+            | NodeKind::Mesh(_)
+            | NodeKind::Repeat(_)
+            | NodeKind::PlacedDocument(_)
+            | NodeKind::Intertwine { .. } => {
                 let g = vectorcraft_effects::expand_live_deep(Some(self.doc), n);
                 for c in g.children().into_iter().flatten() {
                     self.node(c, false);
@@ -349,7 +436,7 @@ impl<'a> Scene<'a> {
         if n.blend != vectorcraft_color::BlendMode::Normal {
             self.warn("blending modes are left out");
         }
-        if n.mask.as_ref().is_some_and(|m| !m.disabled) {
+        if n.extras().mask.as_ref().is_some_and(|m| !m.disabled) {
             self.warn("opacity masks are left out");
         }
         let raster = |fx: &[vectorcraft_doc::Effect]| fx.iter().any(|e| e.visible && vectorcraft_effects::is_raster(&e.id));
@@ -502,7 +589,7 @@ impl<'a> Scene<'a> {
         let doc = self.doc;
         let brushes = self.brushes.get_or_insert_with(|| vectorcraft_brush::library(doc));
         let b = st.brush.as_deref().and_then(|name| brushes.iter().find(|b| b.name == name))?;
-        Some(vectorcraft_brush::stroke_pieces(b, bp, st))
+        Some(vectorcraft_brush::stroke_pieces(doc, b, bp, st))
     }
 
     /// A filled area as its outlines followed by a solid hatch (R12: the outlines alone). Laser
@@ -567,6 +654,10 @@ impl<'a> Scene<'a> {
                     pts.pop();
                 }
                 self.polyline(&pts, sub.closed, style, width);
+            } else if (v.handles() || width.is_none()) && self.circular(&sub, style) {
+                // Native circles/arcs are preferred by CAD/CAM software. In R12, however, a
+                // stroked curve must stay on the flattened POLYLINE path so groups 40/41 retain
+                // its width. Non-circular curves continue through the existing fallback.
             } else if v.handles() {
                 self.spline(&sub, style);
             } else {
@@ -627,6 +718,73 @@ impl<'a> Scene<'a> {
         self.e.entity("SEQEND", end, h, &layer, style, "");
     }
 
+    /// Write a safely recognized circular subpath as a native DXF CIRCLE or ARC. Returns false
+    /// when the curve is not circular enough, leaving the caller to write it as a spline/polyline.
+    fn circular(&mut self, sub: &Sub, style: &EntityStyle) -> bool {
+        let Some(last) = sub.segs.last().map(|s| s.end()) else { return false };
+        let geometrically_closed = last.distance(sub.start) <= 1e-9;
+        // ClosePath can add an implicit straight closing edge. Do not replace that geometry with
+        // a full CIRCLE; likewise, an open curve that returns to its start is not an ARC. Check
+        // before fitting, updating extents or allocating an entity handle.
+        if sub.closed != geometrically_closed {
+            return false;
+        }
+        let Some(circle) = circular_subpath(sub) else { return false };
+        let centre = self.to_dxf * circle.centre;
+        let radius = circle.radius * self.k.abs();
+        if !centre.x.is_finite() || !centre.y.is_finite() || !radius.is_finite() || radius <= 1e-12 {
+            return false;
+        }
+
+        // Count sampled points in the drawing extents. For a full circle include all cardinal
+        // points exactly; for an arc, the dense samples conservatively cover its visible span.
+        if sub.closed {
+            let r = circle.radius;
+            for p in [
+                Point::new(circle.centre.x - r, circle.centre.y),
+                Point::new(circle.centre.x + r, circle.centre.y),
+                Point::new(circle.centre.x, circle.centre.y - r),
+                Point::new(circle.centre.x, circle.centre.y + r),
+            ] {
+                self.pt(p);
+            }
+        } else {
+            for p in &circle.samples {
+                self.pt(*p);
+            }
+        }
+
+        let layer = self.layer.clone();
+        let h = self.handle();
+        if sub.closed {
+            self.e.entity("CIRCLE", h, fixed::MODEL_RECORD, &layer, style, "AcDbCircle");
+            self.e.xyz(10, centre.x, centre.y);
+            self.e.num(40, radius);
+            self.e.normal();
+            return true;
+        }
+
+        let start = self.to_dxf * sub.start;
+        let end = self.to_dxf * last;
+        let middle = self.to_dxf * circle.samples[circle.samples.len() / 2];
+        let mut a0 = angle_deg(start, centre);
+        let mut a1 = angle_deg(end, centre);
+        let am = angle_deg(middle, centre);
+        if !on_ccw_arc(a0, a1, am) {
+            std::mem::swap(&mut a0, &mut a1);
+        }
+        self.e.entity("ARC", h, fixed::MODEL_RECORD, &layer, style, "AcDbCircle");
+        self.e.xyz(10, centre.x, centre.y);
+        self.e.num(40, radius);
+        self.e.normal();
+        if self.o.version.handles() {
+            self.e.raw(100, "AcDbArc");
+        }
+        self.e.num(50, a0);
+        self.e.num(51, a1);
+        true
+    }
+
     /// A curved subpath as one cubic B-spline whose clamped knots repeat at every joint, so it
     /// passes through every anchor (straight segments become straight cubics).
     fn spline(&mut self, sub: &Sub, style: &EntityStyle) {
@@ -652,8 +810,10 @@ impl<'a> Scene<'a> {
         let h = self.handle();
         self.e.entity("SPLINE", h, fixed::MODEL_RECORD, &layer, style, "AcDbSpline");
         self.e.normal();
-        // Planar.
-        self.e.int(70, 8);
+        // Planar (bit 3) and, if the subpath is closed, also closed (bit 0). A geometrically
+        // closed cut needs the closed flag set so CAM/CAM tools (e.g. VCarve) treat it as a
+        // pocket/profile rather than asking the operator to join endpoints. (#1299)
+        self.e.int(70, if sub.closed { 8 | 1 } else { 8 });
         self.e.int(71, 3);
         self.e.int(72, knots.len() as i64);
         self.e.int(73, ctrl.len() as i64);
@@ -702,7 +862,8 @@ impl<'a> Scene<'a> {
                 let Some(rgb) = self.paint_rgb(paint) else { continue };
                 let style = self.style(rgb, 1.0, None, None);
                 let text_style = self.text_style(&cs.font_family);
-                let height = cs.size * cs.v_scale / 100.0 * CAP_HEIGHT * across;
+                // The height is that of the size the layout draws: Shrink Text to Fit scales the size by `layout.fit_scale`.
+                let height = cs.size * layout.fit_scale * cs.v_scale / 100.0 * CAP_HEIGHT * across;
                 let width = if cs.v_scale > 0.0 { cs.h_scale / cs.v_scale } else { 1.0 };
                 let origin = run.iter().map(|g| g.origin).min_by(|p, q| p.x.total_cmp(&q.x)).unwrap_or(first.origin);
                 let p = self.pt(t.xf * origin);

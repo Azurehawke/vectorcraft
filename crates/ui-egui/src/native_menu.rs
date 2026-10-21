@@ -458,7 +458,31 @@ fn take_submenu(bar: &mut MenuBar, command: &str) -> Option<Node> {
 
 /// VectorCraft's menus as a Mac menu bar, as they show now.
 pub fn layout(app: &VectorcraftApp) -> Layout {
-    mac_layout(app, &from_tree(app, &menus::menu_tree_named(app.session.prefs.font_names_in_english)), crate::i18n::current())
+    let mut layout = mac_layout(app, &from_tree(app, &menus::menu_tree_named(app.session.prefs.font_names_in_english)), crate::i18n::current());
+    if app.file_dialog_open() {
+        for menu in &mut layout.bar.menus {
+            inert(&mut menu.children);
+        }
+    }
+    layout
+}
+
+/// While a file dialog is open (a sheet on the window, [`crate::picks`]) the menu bar does
+/// nothing, as under the modal dialog before: what asked for the dialog runs again when it
+/// answers, on the document as it was. Hide and Minimize still work.
+fn modal_allows(item: &Item) -> bool {
+    matches!(item.command, Some(HIDE | HIDE_OTHERS | MINIMIZE))
+}
+
+/// Disable every item of `nodes` (and their submenus) [`modal_allows`] doesn't keep.
+fn inert(nodes: &mut [Node]) {
+    for node in nodes {
+        match node {
+            Node::Item(item) => item.enabled &= modal_allows(item),
+            Node::Submenu { children, .. } => inert(children),
+            Node::Separator | Node::Header(_) | Node::Standard(_) => {}
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------- the app's side
@@ -516,8 +540,13 @@ impl NativeMenu {
 
 /// Run the items clicked in the native menu since the last frame, like in-window menu clicks.
 pub fn run(app: &mut VectorcraftApp, ctx: &egui::Context) {
+    let picking = app.file_dialog_open();
     let Some(menu) = app.services.native_menu.as_mut() else { return };
     for it in std::mem::take(&mut menu.clicks) {
+        // A click that raced the menu going inert under a file dialog.
+        if picking && !modal_allows(&it) {
+            continue;
+        }
         match it.command {
             Some(MINIMIZE) => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
             Some(command) => {
@@ -531,7 +560,9 @@ pub fn run(app: &mut VectorcraftApp, ctx: &egui::Context) {
 
 /// Bring the native menu up to date when anything it shows may have changed: a command ran, the
 /// document, its history or selection changed, the user clicked or pressed a key. Reading the rows
-/// asks every command whether it is enabled, so frames that only animate or scroll skip it.
+/// asks every command whether it is enabled, so frames that only animate or scroll skip it, and so
+/// do the previews of an open interaction (the steps of a move, scale or shape drag, a dialog's
+/// preview), whose new revisions [`state_hash`] leaves out.
 pub fn sync(app: &mut VectorcraftApp, ctx: &egui::Context) {
     let Some(menu) = app.services.native_menu.as_ref() else { return };
     let input = ctx
@@ -555,8 +586,11 @@ pub fn sync(app: &mut VectorcraftApp, ctx: &egui::Context) {
 
 /// What the menus' rows depend on, cheaply (no allocation): commands run, the active document,
 /// its revision (edits, selection and view changes), history and clipboard, the language,
-/// shortcuts and plug-ins. `input` forces a change on frames with a click or a key press, which
-/// covers what the hash doesn't list (panels shown, a tool picked).
+/// shortcuts, plug-ins and an open file dialog. `input` forces a change on frames with a click or
+/// a key press, which covers what the hash doesn't list (panels shown, a tool picked). While an
+/// interaction is open (for example a move, scale or shape drag, a dialog's or the font menu's
+/// preview, or a typing session), the revision, which each of its previews changes, is left out:
+/// the hash changes as the interaction begins and as it ends.
 fn state_hash(app: &VectorcraftApp, input: Option<u64>) -> u64 {
     let mut h = DefaultHasher::new();
     input.hash(&mut h);
@@ -564,9 +598,11 @@ fn state_hash(app: &VectorcraftApp, input: Option<u64>) -> u64 {
     let s = &app.session;
     (s.journal.len(), s.active_index(), s.clipboard.is_empty(), s.tool_composing()).hash(&mut h);
     if let Some(d) = s.active() {
-        (d.uid, d.revision, d.history.undo.len(), d.history.redo.len(), d.transparency_grid, d.print_tiling).hash(&mut h);
+        let revision = d.interaction.is_none().then_some(d.revision);
+        (d.uid, revision, d.history.undo.len(), d.history.redo.len(), d.transparency_grid, d.print_tiling).hash(&mut h);
     }
     (app.system_paste, app.last_effect.is_some(), app.ui.recent_files.len(), app.ui.recent_files.first(), app.recent_fonts().len()).hash(&mut h);
+    app.file_dialog_open().hash(&mut h);
     (crate::i18n::current().code(), menus::plugin_revision()).hash(&mut h);
     crate::shortcut_editor::GENERATION.load(std::sync::atomic::Ordering::Relaxed).hash(&mut h);
     h.finish()

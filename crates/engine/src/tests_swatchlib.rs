@@ -189,6 +189,38 @@ fn libraries_saved_in_the_user_folder_are_user_defined() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A library kind whose reader panics on a file that holds `trap`, as a parser bug would.
+#[derive(Default)]
+struct Trap(String);
+
+impl cmd::swatchlib::LibraryFile for Trap {
+    const EXTS: &'static [&'static str] = &["trap"];
+    fn read(bytes: &[u8], stem: &str) -> std::result::Result<Self, String> {
+        if bytes == b"trap" {
+            panic!("a parser bug");
+        }
+        Ok(Self(stem.to_string()))
+    }
+    fn name(&self) -> &str {
+        &self.0
+    }
+}
+
+/// When reading one file of the user library folder panics, `set_user_dir` (as the desktop app
+/// calls it at launch) skips that file and lists the other one.
+#[test]
+fn a_user_library_file_whose_reading_panics_is_skipped() {
+    let dir = temp_dir("user-panic");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Calm.trap"), "calm").unwrap();
+    std::fs::write(dir.join("Loud.trap"), "trap").unwrap();
+    let mut libraries = cmd::swatchlib::Libraries::<Trap>::default();
+    libraries.set_user_dir(Some(dir.to_string_lossy().to_string()));
+    let names: Vec<&str> = libraries.infos().map(|l| l.name.as_str()).collect();
+    assert_eq!(names, ["Calm"]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn another_documents_swatches_load_as_a_library() {
     let mut s = session();
@@ -284,6 +316,26 @@ fn swatch_exchange_files_save_with_models_kinds_and_groups() {
 }
 
 #[test]
+fn save_counts_the_swatches_the_file_holds() {
+    let mut s = session();
+    // A new document has 46 solid colors and 4 linear or radial gradients besides None. Mesh is a freeform gradient.
+    run(&mut s, "swatch.new", json!({"name": "Mesh", "gradient": {"kind": "freeform"}}));
+    let mut counts = vec![];
+    for format in ["vcswatches", "gpl", "ase", "css"] {
+        let r = run(&mut s, "swatch.library.save", json!({ "format": format }));
+        // The libraries load back with that many swatches, and the CSS file has one property for each.
+        let held = if format == "css" {
+            r["data"].as_str().unwrap().lines().filter(|l| l.starts_with("  --")).count() as u64
+        } else {
+            let load = json!({"data": r["data"], "dataBase64": r["dataBase64"], "name": format!("Saved.{format}")});
+            run(&mut s, "swatch.library.load", load)["count"].as_u64().unwrap()
+        };
+        counts.push((format, r["count"].as_u64().unwrap(), held));
+    }
+    assert_eq!(counts, [("vcswatches", 51, 51), ("gpl", 46, 46), ("ase", 46, 46), ("css", 50, 50)]);
+}
+
+#[test]
 fn loaded_libraries_copy_into_the_user_folder_without_replacing_files() {
     use vectorcraft_testkit::ase::{Block, ase, sample};
     let dir = temp_dir("copy");
@@ -369,6 +421,50 @@ fn loaded_libraries_copy_into_the_user_folder_without_replacing_files() {
     let loaded = run(&mut headless, "swatch.library.load", json!({"dataBase64": kit, "name": "Kit.ase"}))["library"].clone();
     let e = headless.execute("swatch.library.copyToUser", &json!({ "library": loaded })).unwrap_err().to_string();
     assert!(e.contains("no user library folder"), "{e}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A color book opened from a host temporary path (macOS sandbox copies) is stored under its title
+/// when copied into the user library folder (#2996).
+#[test]
+fn copying_a_color_book_from_a_temporary_path_uses_its_title() {
+    fn acb_str(out: &mut Vec<u8>, s: &str) {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        out.extend((units.len() as u32).to_be_bytes());
+        units.iter().for_each(|u| out.extend(u.to_be_bytes()));
+    }
+    let mut bytes = b"8BCB".to_vec();
+    bytes.extend(1u16.to_be_bytes());
+    bytes.extend(3000u16.to_be_bytes());
+    for s in ["$$$/colorbook/Test/title=Test Book^R", "TEST ", " C", "a book"] {
+        acb_str(&mut bytes, s);
+    }
+    bytes.extend(1u16.to_be_bytes());
+    bytes.extend(7u16.to_be_bytes());
+    bytes.extend(0u16.to_be_bytes());
+    bytes.extend(0u16.to_be_bytes());
+    acb_str(&mut bytes, "185");
+    bytes.extend(b"TST001");
+    bytes.extend([228, 0, 43]);
+    bytes.extend(b"spflspot");
+
+    let dir = temp_dir("acb-temp");
+    let user = dir.join("user");
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(&user).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let source = elsewhere.join("tmp1F2C.tmp.acb");
+    std::fs::write(&source, &bytes).unwrap();
+    let source = source.to_string_lossy().to_string();
+
+    let mut s = session();
+    s.swatch_libraries.set_user_dir(Some(user.to_string_lossy().to_string()));
+    let loaded = run(&mut s, "swatch.library.load", json!({ "path": source }))["library"].clone();
+    assert_eq!(run(&mut s, "swatch.library.get", json!({ "library": loaded }))["name"], "Test Book®");
+    let r = run(&mut s, "swatch.library.copyToUser", json!({ "library": loaded }));
+    assert_eq!((r["library"].as_str(), r["name"].as_str(), r["copied"].as_bool()), (Some("user/Test Book®.acb"), Some("Test Book®"), Some(true)));
+    assert_eq!(r["path"], user.join("Test Book®.acb").to_string_lossy().to_string());
+    assert_eq!(std::fs::read(user.join("Test Book®.acb")).unwrap(), bytes);
     let _ = std::fs::remove_dir_all(dir);
 }
 

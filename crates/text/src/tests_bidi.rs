@@ -1,6 +1,6 @@
 //! Direction, source-cluster and editing regressions; no RTL font assets required.
 use super::*;
-use kurbo::{Point, Rect, Shape};
+use kurbo::{Affine, BezPath, Point, Rect, Shape};
 use std::sync::Arc;
 use vectorcraft_doc::{CharStyle, TextKind, TextRun};
 
@@ -43,6 +43,26 @@ fn assert_same_shaped_glyphs(left: &TextLayout, right: &TextLayout) {
     }
 }
 
+fn source_clusters(layout: &TextLayout) -> Vec<(usize, usize)> {
+    let mut clusters: Vec<_> = layout.glyphs.iter().map(|glyph| (glyph.byte, glyph.len)).collect();
+    clusters.sort_unstable();
+    clusters.dedup();
+    clusters
+}
+
+fn assert_source_coverage(text: &str, layout: &TextLayout) {
+    for glyph in &layout.glyphs {
+        let end = glyph.byte.checked_add(glyph.len).expect("source cluster end must fit usize");
+        assert!(glyph.len > 0 && text.get(glyph.byte..end).is_some(), "invalid UTF-8 source cluster: {glyph:?}");
+    }
+    let mut covered = 0;
+    for (byte, len) in source_clusters(layout) {
+        assert_eq!(byte, covered, "source clusters must cover {text:?} without gaps or overlaps");
+        covered = byte + len;
+    }
+    assert_eq!(covered, text.len(), "source clusters must cover all of {text:?}");
+}
+
 #[test]
 fn hebrew_and_arabic_are_visually_rtl_with_exact_source_clusters() {
     for s in ["שלום", "مرحبا"] {
@@ -81,6 +101,82 @@ fn rtl_hit_testing_arrows_and_selection_follow_visual_positions() {
     assert_eq!(caret_horizontal(&l, 0, false), 2);
     assert_eq!(caret_horizontal(&l, 2, true), 0);
     assert!(!selection_quads(&l, 0, s.len()).is_empty());
+}
+
+/// Lines of glyphs, one glyph per cluster, each line given in visual order as (byte, len, advance)
+/// and starting at x 0.
+fn lines_of_clusters(lines: &[&[(usize, usize, f64)]], rtl: bool) -> TextLayout {
+    let mut l = TextLayout::default();
+    for (li, clusters) in lines.iter().enumerate() {
+        let (glyph_start, baseline) = (l.glyphs.len(), li as f64 * 20.0);
+        let mut x = 0.0;
+        for &(byte, len, advance) in *clusters {
+            l.glyphs.push(PositionedGlyph {
+                outline: BezPath::new(),
+                run: 0,
+                byte,
+                origin: Point::new(x, baseline),
+                advance,
+                len,
+                angle: 0.0,
+                line: li,
+                font_id: 0,
+                gid: 0,
+                xf: Affine::IDENTITY,
+                rtl,
+                scale: 1.0,
+            });
+            x += advance;
+        }
+        l.lines.push(LineInfo {
+            rtl,
+            baseline,
+            x0: 0.0,
+            x1: x,
+            ascent: 10.0,
+            descent: 3.0,
+            first_baseline: 0.0,
+            start: clusters.iter().map(|c| c.0).min().unwrap_or(0),
+            end: clusters.iter().map(|c| c.0 + c.1).max().unwrap_or(0),
+            glyph_start,
+            glyph_end: l.glyphs.len(),
+            avail: (0.0, x),
+            region: 0,
+        });
+    }
+    l
+}
+
+fn arrow_steps(l: &TextLayout, from: usize, right: bool, steps: usize) -> Vec<usize> {
+    let mut caret = from;
+    (0..steps)
+        .map(|_| {
+            caret = caret_horizontal(l, caret, right);
+            caret
+        })
+        .collect()
+}
+
+#[test]
+fn arrows_step_through_both_caret_stops_of_a_cluster_without_advance() {
+    // A letter (bytes 0..6), a zero width non-joiner drawn as its own glyph with no advance
+    // (6..9) and a letter (9..12): the stops at 6 and 9 share one x.
+    let l = lines_of_clusters(&[&[(0, 6, 10.0), (6, 3, 0.0), (9, 3, 10.0)]], false);
+    assert_eq!(arrow_steps(&l, 0, true, 4), [6, 9, 12, 12]);
+    assert_eq!(arrow_steps(&l, 12, false, 4), [9, 6, 0, 0]);
+    // The same clusters right to left: the glyphs run from byte 9 at the left to byte 0 at the right.
+    let l = lines_of_clusters(&[&[(9, 3, 10.0), (6, 3, 0.0), (0, 6, 10.0)]], true);
+    assert_eq!(arrow_steps(&l, 12, true, 4), [9, 6, 0, 0]);
+    assert_eq!(arrow_steps(&l, 0, false, 4), [6, 9, 12, 12]);
+}
+
+#[test]
+fn arrows_keep_to_their_line_where_a_wrapped_line_starts_at_the_same_x() {
+    // A soft wrap at byte 2: the end of the first line is the start of the second, at the same x
+    // as the start of the first.
+    let l = lines_of_clusters(&[&[(0, 1, 10.0), (1, 1, 10.0)], &[(2, 1, 10.0), (3, 1, 10.0)]], false);
+    assert_eq!(arrow_steps(&l, 0, true, 4), [1, 2, 3, 4]);
+    assert_eq!(caret_horizontal(&l, 1, false), 0);
 }
 
 #[test]
@@ -125,9 +221,15 @@ fn arabic_contextual_forms_and_lam_alef_use_the_shaper() {
     let st = arabic_style(&face);
     let pair = "لا";
     let lam_alef = layout(db, &TextObject::point(Point::ZERO, pair, st.clone()));
-    let ligature = lam_alef.glyphs.iter().find(|g| g.byte == 0 && g.len == pair.len());
-    assert!(ligature.is_some(), "lam-alef must retain one cluster spanning both source letters: {lam_alef:?}");
-    assert_ne!(ligature.unwrap().gid, face.glyph_for('ل'), "lam-alef must use a shaped glyph");
+    // Fonts may use a ligature or separate contextual lam/alef glyphs, with component marks.
+    assert_source_coverage(pair, &lam_alef);
+    for glyph in &lam_alef.glyphs {
+        assert!(glyph.rtl, "lam-alef must be RTL: {glyph:?}");
+        assert_eq!(glyph.font_id, face.id());
+        assert_ne!(glyph.gid, 0, "lam-alef must not use a missing glyph");
+        let source = pair.get(glyph.byte..glyph.byte + glyph.len).expect("validated UTF-8 source cluster");
+        assert!(source.chars().all(|c| glyph.gid != face.glyph_for(c)), "lam-alef must use contextual glyphs rather than nominal glyphs: {glyph:?}");
+    }
 
     for s in ["سلام", "שלום سلام"] {
         let l = layout(db, &TextObject::point(Point::ZERO, s, st.clone()));
@@ -156,10 +258,20 @@ fn identical_style_arabic_run_splits_keep_joining_and_source_attribution() {
     let split = layout(db, &split);
     assert!(single.glyphs.iter().any(|glyph| glyph.gid != face.glyph_for('ب')), "single run must exercise contextual beh forms");
     assert_same_shaped_glyphs(&single, &split);
-    assert_eq!(split.glyphs.len(), 2, "beh-beh should remain two source clusters");
+    let beh_len = "ب".len();
+    assert_eq!(source_clusters(&split), [(0, beh_len), (beh_len, beh_len)], "beh-beh should remain two source clusters");
+    for glyph in &single.glyphs {
+        assert_eq!(glyph.run, 0);
+    }
+    // Every component, including zero-advance dots, belongs to its original source run.
     for glyph in &split.glyphs {
-        let expected_run = usize::from(glyph.byte >= "ب".len());
-        assert_eq!(glyph.run, expected_run, "source byte {} belongs to run {expected_run}", glyph.byte);
+        let expected_run = usize::from(glyph.byte >= beh_len);
+        assert_eq!(
+            (glyph.run, glyph.byte, glyph.len),
+            (expected_run, expected_run * beh_len, beh_len),
+            "source byte {} belongs to run {expected_run}",
+            glyph.byte
+        );
     }
 }
 
@@ -178,13 +290,54 @@ fn different_style_arabic_boundary_receives_joining_context() {
         TextRun { text: "ب".into(), style: CharStyle { size: style.size * 1.5, ..style }, inline: None },
     ];
     let split = layout(db, &split);
-    assert_eq!(joined.glyphs.len(), 2);
-    assert_eq!(split.glyphs.len(), 2);
-    for glyph in &joined.glyphs {
-        let actual = split.glyphs.iter().find(|other| other.byte == glyph.byte).expect("same source cluster");
+    let beh_len = "ب".len();
+    let expected_clusters = [(0, beh_len), (beh_len, beh_len)];
+    assert_eq!(source_clusters(&joined), expected_clusters);
+    assert_eq!(source_clusters(&split), expected_clusters);
+    assert!(joined.glyphs.iter().all(|glyph| glyph.rtl));
+    // Compare the full component sequence; a first match by byte can hide or reuse a dot.
+    assert_eq!(split.glyphs.len(), joined.glyphs.len(), "style boundary must retain every component glyph");
+    for (glyph, actual) in joined.glyphs.iter().zip(&split.glyphs) {
         assert_eq!(actual.gid, glyph.gid, "joining form changed at style boundary for byte {}", glyph.byte);
+        assert_eq!(actual.byte, glyph.byte);
         assert_eq!(actual.len, glyph.len);
-        assert_eq!(actual.run, usize::from(glyph.byte >= "ب".len()));
+        assert_eq!(actual.font_id, glyph.font_id);
+        assert_eq!(actual.rtl, glyph.rtl);
+        assert_eq!(glyph.run, 0);
+        assert_eq!(
+            (actual.run, actual.byte, actual.len),
+            (usize::from(glyph.byte >= beh_len), glyph.byte, beh_len),
+            "every component must retain its source run and cluster"
+        );
+    }
+}
+
+#[test]
+fn a_change_of_paint_in_a_mixed_direction_line_moves_no_glyph() {
+    let db = FontDb::global();
+    let text = "AVAV سلام AVAV";
+    if db.face_covering('س').is_none_or(|face| !face.covers('ل')) {
+        eprintln!("SKIPPED: a_change_of_paint_in_a_mixed_direction_line_moves_no_glyph; no font covers Arabic seen and lam");
+        return;
+    }
+    let plain = layout(db, &TextObject::point(Point::ZERO, text, CharStyle::default()));
+    assert!(plain.glyphs.iter().any(|g| g.rtl) && plain.glyphs.iter().any(|g| !g.rtl), "{plain:?}");
+    let seen = text.find('س').unwrap_or_default();
+    let mut restyled = TextObject::point(Point::ZERO, text, CharStyle::default());
+    for byte in [1, seen] {
+        let end = byte + text[byte..].chars().next().map_or(1, char::len_utf8);
+        edit::style_range(&mut restyled.runs, byte, end, |s| s.fill = Default::default());
+    }
+    assert_eq!(restyled.runs.len(), 5);
+    let restyled_layout = layout(db, &restyled);
+    assert_same_shaped_glyphs(&plain, &restyled_layout);
+    for glyph in &restyled_layout.glyphs {
+        let run_ends = restyled.runs.iter().scan(0, |end, r| {
+            *end += r.text.len();
+            Some(*end)
+        });
+        let expected = run_ends.take_while(|end| *end <= glyph.byte).count();
+        assert_eq!(glyph.run, expected, "glyph {glyph:?}");
     }
 }
 
@@ -361,4 +514,40 @@ fn craft_arabic_fonts_load_and_noto_sans_arabic_is_the_arabic_fallback() {
     // Latin still falls back to a bundled face, not to one of the Arabic families.
     let a = db.face_covering('a').expect("some face covers 'a'");
     assert!(!arabic.iter().any(|f| f.family == a.family), "Latin now falls back to {}", a.family);
+}
+
+/// Digits (Character panel menu): the style's numeral system draws every digit, whatever was
+/// typed, while the text and its clusters stay as typed. Needs an installed font with the
+/// Arabic-Indic digits.
+#[test]
+fn digits_draw_every_digit_in_the_styles_numeral_system() {
+    use vectorcraft_doc::Digits;
+    let db = FontDb::global();
+    let Some(face) = ["Arial", "Noto Sans Arabic", "Geeza Pro", "Segoe UI", "DejaVu Sans"]
+        .into_iter()
+        .filter_map(|name| db.face(name, "Regular"))
+        .find(|face| face.covers('3') && face.covers('٣') && face.covers('۳'))
+    else {
+        eprintln!("SKIPPED: digits_draw_every_digit_in_the_styles_numeral_system; no installed font covers 3, ٣ and ۳");
+        return;
+    };
+    eprintln!("ASSERTIONS RUN: digits_draw_every_digit_in_the_styles_numeral_system; {} {}", face.family, face.style);
+    let st = |digits: Digits| CharStyle { digits, ..arabic_style(&face) };
+    let lay = |s: &str, digits: Digits| layout(db, &TextObject::point(Point::ZERO, s, st(digits)));
+    let gids = |l: &TextLayout| l.glyphs.iter().map(|g| (g.gid, g.font_id)).collect::<Vec<_>>();
+    let clusters = |l: &TextLayout| l.glyphs.iter().map(|g| (g.byte, g.len)).collect::<Vec<_>>();
+    // Typed Western, drawn Arabic-Indic (Hindi) or Eastern Arabic-Indic (Farsi): the glyphs of
+    // the typed Arabic-Indic digits, on the typed text's clusters.
+    let typed = lay("page 3", Digits::Default);
+    let hindi = lay("page 3", Digits::Hindi);
+    assert_eq!(gids(&hindi), gids(&lay("page ٣", Digits::Default)));
+    assert_ne!(gids(&hindi), gids(&typed));
+    assert_eq!(clusters(&hindi), clusters(&typed));
+    assert_eq!(gids(&lay("page 3", Digits::Farsi)), gids(&lay("page ۳", Digits::Default)));
+    // Typed Arabic-Indic, drawn Western (Arabic): the Western glyphs on the 2-byte clusters.
+    let arabic = lay("صفحة ٣", Digits::Arabic);
+    assert_eq!(gids(&arabic), gids(&lay("صفحة 3", Digits::Default)));
+    assert_eq!(clusters(&arabic), clusters(&lay("صفحة ٣", Digits::Default)));
+    // Default leaves each digit as typed.
+    assert_ne!(gids(&lay("3 ٣ ۳", Digits::Default)), gids(&lay("3 ٣ ۳", Digits::Hindi)));
 }

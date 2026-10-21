@@ -17,10 +17,19 @@ fn safe_path() -> String {
     vectorcraft_testkit::temp_dir("sweep").join("out.bin").to_string_lossy().to_string()
 }
 
+/// `r`, after failing the case if the command panicked. The engine's guard reports a panic as
+/// `EngineError::Internal`.
+fn no_panic(r: Result<Value, vectorcraft_engine::EngineError>) -> Result<Value, vectorcraft_engine::EngineError> {
+    if let Err(vectorcraft_engine::EngineError::Internal { cmd, msg }) = &r {
+        panic!("{cmd} panicked: {msg}");
+    }
+    r
+}
+
 /// Run one call; returns a failure description or None.
 fn probe(fx: Fixture, id: &str, params: &Value) -> Option<String> {
     let mut s = fx.session();
-    let r = catch_quiet(|| s.execute(id, params));
+    let r = catch_quiet(|| no_panic(s.execute(id, params)));
     match r {
         Err(msg) => Some(format!("PANIC {id} {params} [{fx:?}]: {msg}")),
         Ok(_) => {
@@ -68,7 +77,7 @@ fn every_command_without_a_document() {
     let mut failures = vec![];
     for c in command_specs() {
         let mut s = Session::new();
-        match catch_quiet(|| s.execute(c.id, &json!({}))) {
+        match catch_quiet(|| no_panic(s.execute(c.id, &json!({})))) {
             Err(p) => failures.push(format!("PANIC {} with no document: {p}", c.id)),
             // Anything that needs a document must say so via enablement, not fail later.
             Ok(Err(vectorcraft_engine::EngineError::NoDocument)) => failures.push(format!("{}: enabled without a document but needs one", c.id)),
@@ -106,8 +115,60 @@ fn bug_huge_transform_makes_document_unloadable() {
         ("object.distributeSpacing", json!({"spacing": 1e308})),
     ] {
         let mut s = Fixture::Multi.session();
-        if s.execute(id, &p).is_ok() {
+        if no_panic(s.execute(id, &p)).is_ok() {
             vectorcraft_testkit::invariants::check_native_roundtrip(&s.doc().unwrap().doc).unwrap_or_else(|e| panic!("{id} {p}: {e}"));
+        }
+    }
+}
+
+/// Distribute with a huge spacing from each of the three selected objects as the key object leaves
+/// a document that saves and opens again.
+#[test]
+fn distribute_with_a_huge_spacing_from_the_key_object() {
+    for key in 0..3 {
+        for p in [json!({"horizontal": "left", "spacing": 1e308}), json!({"vertical": "bottom", "spacing": -1e308})] {
+            let mut s = Fixture::Multi.session();
+            let id = s.doc().unwrap().selection.objects[key];
+            s.execute("select.key", &json!({"id": id.0})).unwrap();
+            if no_panic(s.execute("object.distribute", &p)).is_ok() {
+                check_session(&s).unwrap_or_else(|e| panic!("key {key}, {p}: {e}"));
+                vectorcraft_testkit::invariants::check_native_roundtrip(&s.doc().unwrap().doc).unwrap_or_else(|e| panic!("key {key}, {p}: {e}"));
+            }
+        }
+    }
+}
+
+#[test]
+fn distribute_with_a_huge_spacing_from_a_key_guide() {
+    for (vertical, pos) in [(true, 50.0), (true, 10000.0), (false, -10000.0)] {
+        for p in [json!({"horizontal": "left", "spacing": 1e308}), json!({"vertical": "bottom", "spacing": -1e308})] {
+            let mut s = Fixture::Multi.session();
+            s.execute("guide.add", &json!({"vertical": vertical, "pos": pos})).unwrap();
+            s.execute("guide.select", &json!({"indexes": [0], "toggle": true})).unwrap();
+            s.execute("select.key", &json!({"guide": 0})).unwrap();
+            if no_panic(s.execute("object.distribute", &p)).is_ok() {
+                check_session(&s).unwrap_or_else(|e| panic!("guide at {pos}, {p}: {e}"));
+                vectorcraft_testkit::invariants::check_native_roundtrip(&s.doc().unwrap().doc).unwrap_or_else(|e| panic!("guide at {pos}, {p}: {e}"));
+            }
+        }
+    }
+}
+
+#[test]
+fn distribute_guides_selected_alone_with_a_huge_spacing() {
+    for (cmd, p) in [
+        ("object.distributeSpacing", json!({"axis": "horizontal", "spacing": 1e308})),
+        ("object.distributeSpacing", json!({"axis": "vertical", "spacing": -1e308})),
+        ("object.distribute", json!({"horizontal": "center", "to": "artboard", "artboard": 99})),
+    ] {
+        let mut s = Fixture::Empty.session();
+        for (v, pos) in [(true, 10.0), (true, 20.0), (true, 9000.0), (false, -9000.0), (false, 0.0)] {
+            s.execute("guide.add", &json!({"vertical": v, "pos": pos})).unwrap();
+        }
+        s.execute("guide.select", &json!({"indexes": [0, 1, 2, 3, 4]})).unwrap();
+        if no_panic(s.execute(cmd, &p)).is_ok() {
+            check_session(&s).unwrap_or_else(|e| panic!("{cmd} {p}: {e}"));
+            vectorcraft_testkit::invariants::check_native_roundtrip(&s.doc().unwrap().doc).unwrap_or_else(|e| panic!("{cmd} {p}: {e}"));
         }
     }
 }
@@ -117,7 +178,7 @@ fn bug_artboard_huge_props_break_svg() {
     for key in ["x", "y", "width", "height"] {
         let mut s = Fixture::Single.session();
         let p = json!({"index": 0, key: 1e308});
-        if s.execute("artboard.setProps", &p).is_ok() {
+        if no_panic(s.execute("artboard.setProps", &p)).is_ok() {
             vectorcraft_testkit::invariants::check_svg_roundtrip(&s.doc().unwrap().doc).unwrap_or_else(|e| panic!("{p}: {}", &e[..e.len().min(200)]));
         }
     }
@@ -163,6 +224,11 @@ fn every_command_with_junk_params() {
 fn structured_junk() {
     let cases: Vec<(&str, Value)> = vec![
         ("select.set", json!({"ids": [0, u64::MAX, -1, "x", null, 1.5]})),
+        ("document.export", json!({"format": "png", "rect": [1e308, -1e308, 1e308, 1e308]})),
+        ("document.export", json!({"format": "png", "rect": [0, 0, 1e300, 1e300], "scale": 64})),
+        ("document.export", json!({"format": "tiff", "rect": [null, "x", -1, 0.0000001], "useArtboards": true})),
+        ("document.export", json!({"format": "bmp", "rect": {"x": 1}, "artboard": 3})),
+        ("document.export", json!({"format": "svg", "rect": [0, 0, 10, 10]})),
         ("select.add", json!({"ids": [[1], {"a": 1}]})),
         ("select.anchors", json!({"id": 2, "anchors": [[99, 99], [-1, 0], ["a", "b"]], "mode": "set"})),
         ("select.anchorsMany", json!({"items": [{"id": 2, "anchors": [[0, 1000]]}, null, 5]})),
@@ -188,6 +254,8 @@ fn structured_junk() {
         ("path.insertAnchor", json!({"id": 2, "subpath": 0, "segment": 99, "t": 5})),
         ("path.insertAnchor", json!({"id": 2, "subpath": 7, "segment": 0, "t": -1})),
         ("path.setHandle", json!({"id": 2, "subpath": 0, "anchor": 100, "which": "in", "x": 0, "y": 0})),
+        ("path.moveAnchor", json!({"id": 2, "subpath": 0, "anchor": 100, "x": 0, "y": 0})),
+        ("path.moveAnchor", json!({"id": 2, "subpath": 0, "anchor": 0, "x": 1e308, "y": -1e308})),
         ("path.removeAnchor", json!({"id": 2, "subpath": 0, "anchor": 0})),
         ("path.split", json!({"id": 2, "subpath": 0, "segment": 1000, "t": 0.5})),
         ("path.reshapeSegment", json!({"id": 2, "subpath": 0, "segment": 0, "t": 2.0, "dx": 1e308, "dy": 0})),
@@ -244,6 +312,8 @@ fn structured_junk() {
         ("stroke.set", json!({"weight": -5, "dash": [0, 0, 0], "miterLimit": -1})),
         ("stroke.set", json!({"weight": 1e308, "dash": [-1, -2], "dashOffset": 1e308})),
         ("stroke.set", json!({"dash": [1e-12]})),
+        ("document.inspect", json!({"ids": [u64::MAX, 0, 1e308], "kind": "", "limit": u64::MAX, "offset": u64::MAX})),
+        ("document.inspect", json!({"ids": null, "kind": {"a": 1}, "limit": -1, "offset": "x", "depth": u64::MAX})),
         ("transparency.set", json!({"opacity": -50})),
         ("transparency.set", json!({"opacity": 1e308, "blend": "NoSuchBlend"})),
         ("perspective.move", json!({"from": [0, 0], "to": [1e308, -1e308], "perpendicular": true, "copy": true, "plane": "ground"})),
@@ -296,6 +366,20 @@ fn structured_junk() {
         ("effect.apply", json!({"effect": "pixelate.crystallize", "params": {"cellSize": -1e308}})),
         ("effect.apply", json!({"effect": "pixelate.mezzotint", "params": {"type": 5}})),
         ("effect.apply", json!({"effect": "pixelate.pointillize", "params": {"cellSize": "NaN"}})),
+        ("effect.apply", json!({"effect": "artistic.smudgeStick", "params": {"strokeLength": 1e308, "highlightArea": "NaN", "intensity": [1]}})),
+        ("effect.apply", json!({"effect": "artistic.sponge", "params": {"brushSize": -1e308, "definition": 1e308, "smoothness": null}})),
+        ("effect.apply", json!({"effect": "artistic.watercolor", "params": {"brushDetail": "1e999", "shadowIntensity": -1, "texture": 1e308}})),
+        ("effect.apply", json!({"effect": "artistic.cutout", "params": {"levels": 1e308, "edgeSimplicity": "NaN", "edgeFidelity": -1e308}})),
+        ("effect.apply", json!({"effect": "artistic.neonGlow", "params": {"glowSize": -1e308, "glowBrightness": "1e999", "color": [1]}})),
+        ("effect.apply", json!({"effect": "artistic.posterEdges", "params": {"edgeThickness": 1e308, "edgeIntensity": [], "posterization": -7}})),
+        ("effect.apply", json!({"effect": "sketch.chrome", "params": {"detail": -1e308, "smoothness": "NaN"}})),
+        ("effect.apply", json!({"effect": "sketch.graphicPen", "params": {"strokeLength": -1e308, "lightDarkBalance": "NaN", "strokeDirection": 3}})),
+        ("effect.apply", json!({"effect": "sketch.halftonePattern", "params": {"size": -1e308, "contrast": "NaN", "patternType": 3}})),
+        ("effect.apply", json!({"effect": "sketch.basRelief", "params": {"detail": "NaN", "smoothness": 1e308, "lightDirection": 3}})),
+        ("effect.apply", json!({"effect": "sketch.charcoal", "params": {"thickness": 1e308, "detail": -1e308, "lightDarkBalance": [1]}})),
+        ("effect.apply", json!({"effect": "sketch.photocopy", "params": {"detail": "1e999", "darkness": null}})),
+        ("effect.apply", json!({"effect": "sketch.stamp", "params": {"lightDarkBalance": -1e308, "smoothness": "NaN"}})),
+        ("effect.apply", json!({"effect": "sketch.reticulation", "params": {"density": "NaN", "foregroundLevel": -1e308, "backgroundLevel": 1e308}})),
         ("effect.apply", json!({"effect": "texture.craquelure", "params": {"crackSpacing": -1e308, "crackDepth": "NaN", "crackBrightness": 1e308}})),
         ("effect.apply", json!({"effect": "texture.grain", "params": {"intensity": 1e308, "contrast": [1], "grainType": 7}})),
         ("effect.apply", json!({"effect": "texture.mosaicTiles", "params": {"tileSize": "1e999", "groutWidth": -1, "lightenGrout": null}})),
@@ -316,11 +400,32 @@ fn structured_junk() {
         ("object.path.offsetPath", json!({"offset": 1e308})),
         ("object.path.offsetPath", json!({"offset": -1e308})),
         ("object.path.simplify", json!({"tolerance": -1, "cornerAngle": 1e308})),
+        ("object.path.simplify", json!({"level": 1e308, "tolerance": "x"})),
+        ("object.path.simplify", json!({"level": -1e308, "auto": "yes"})),
+        ("object.path.simplify", json!({"auto": true, "level": [1]})),
+        (
+            "shape.rectangularGrid",
+            json!({"x": 0, "y": 0, "width": 1e308, "height": -1e308, "rows": 999, "columns": u64::MAX, "rowSkew": 1e308, "columnSkew": -1e308, "frame": false, "fill": true}),
+        ),
+        ("shape.rectangularGrid", json!({"x": 0, "y": 0, "width": 0, "height": 0, "rowSkew": "x", "frame": 3})),
+        (
+            "shape.polarGrid",
+            json!({"x": 0, "y": 0, "width": 1e308, "height": 1e-308, "concentric": 999, "radial": 999, "concentricSkew": -1e308, "radialSkew": 1e308, "compound": true, "fill": true}),
+        ),
+        (
+            "shape.polarGrid",
+            json!({"x": 0, "y": 0, "width": 10, "height": 10, "concentric": -1, "radial": 0.5, "radialSkew": null, "compound": "yes"}),
+        ),
         ("object.path.splitIntoGrid", json!({"rows": 500, "columns": 1, "gutter": 1e308})),
         ("object.path.splitIntoGrid", json!({"rows": 0.4})),
         ("object.setBounds", json!({"width": 0, "height": 0})),
         ("object.setBounds", json!({"width": -10, "height": 1e308, "reference": 99})),
         ("object.distributeSpacing", json!({"axis": "horizontal", "spacing": -1e308})),
+        ("object.distributeSpacing", json!({"axis": "vertical", "spacing": 0})),
+        ("object.align", json!({"horizontal": "center", "vertical": "center", "to": "artboard", "bounds": "preview"})),
+        ("object.distribute", json!({"vertical": "center", "bounds": "geometric"})),
+        ("object.distribute", json!({"horizontal": "right", "to": "artboard", "artboard": u64::MAX, "bounds": "preview"})),
+        ("object.distributeSpacing", json!({"axis": "vertical", "to": "artboard", "artboard": -1, "spacing": null})),
         ("artboard.setProps", json!({"index": 0, "width": -1, "height": 0})),
         ("artboard.setProps", json!({"index": 0, "width": 1e300, "height": 1e-300, "scaleArt": true, "strokes": true, "corners": true})),
         ("artboard.setProps", json!({"index": 0, "x": -1e308, "width": 0, "height": 1, "scaleArt": true, "patterns": true})),
@@ -364,11 +469,21 @@ fn structured_junk() {
         ("object.blend.options", json!({"spacing": "distance", "value": -1e308, "orientation": 5})),
         ("object.blend.spine.moveAnchor", json!({"id": 2, "anchor": u64::MAX, "x": 1e308, "y": -1e308, "handle": "sideways"})),
         ("object.blend.spine.addAnchor", json!({"id": u64::MAX, "x": 0, "y": 0})),
+        ("object.blend.spine.reshapeSegment", json!({"id": 2, "segment": u64::MAX, "t": f64::NAN, "dx": 1e308, "dy": -1e308})),
         ("object.blend.spine.removeAnchor", json!({"anchor": -1})),
         ("object.puppetWarp", json!({"rest": true, "pins": [], "moved": []})),
         ("object.puppetWarp", json!({"rest": true, "pins": [[1e308, 0]], "moved": [[0, 0]], "expand": -5})),
         ("object.puppetWarp", json!({"rest": true, "ids": [u64::MAX], "pins": [[0, 0]], "moved": [[0, 0]]})),
         ("object.puppetWarp.pins", json!({"ids": [0, 1, 2], "expand": 1e308})),
+        ("symbol.new", json!({"name": "J", "nineSlice": true, "nineSliceGuides": [1e308, -1e308, f64::NAN, 0]})),
+        ("symbol.new", json!({"name": "J", "nineSlice": "yes", "nineSliceGuides": [0.6, 0.1, 0.6, 0.1]})),
+        ("symbol.new", json!({"name": "J", "nineSliceGuides": [0.1, 0.2]})),
+        ("symbol.new", json!({"name": "J", "nineSliceGuides": {"left": 0.1}})),
+        ("symbol.new", json!({"name": "J", "nineSlice": true, "nineSliceGuides": ["a", null, [1], {}]})),
+        ("symbol.options", json!({"nineSlice": true, "nineSliceGuides": [0.5, 0.5, 0.5, 0.5]})),
+        ("symbol.options", json!({"name": "Dot", "nineSlice": true, "nineSliceGuides": [1e308, -1e308, 0, 0]})),
+        ("symbol.options", json!({"nineSlice": 7, "nineSliceGuides": []})),
+        ("symbol.options", json!({"nineSlice": false, "nineSliceGuides": null})),
     ];
     let mut failures = vec![];
     for fx in Fixture::ALL {
@@ -408,14 +523,14 @@ fn area_options_fit_junk() {
     for (size, (w, h)) in [(12.0, (120.0, 40.0)), (0.1, (1.0, 1.0)), (1296.0, (100_000.0, 1.0))] {
         for p in &cases {
             let mut s = Fixture::Multi.session();
-            let made = s.execute("text.create", &json!({"x": 10, "y": 10, "size": size, "text": story, "area": {"width": w, "height": h}}));
+            let made = no_panic(s.execute("text.create", &json!({"x": 10, "y": 10, "size": size, "text": story, "area": {"width": w, "height": h}})));
             let Ok(made) = made else { continue };
             let id = made["id"].as_u64().unwrap_or(0);
-            let r = catch_quiet(|| s.execute("text.areaOptions", p));
+            let r = catch_quiet(|| no_panic(s.execute("text.areaOptions", p)));
             match r {
                 Err(m) => failures.push(format!("PANIC text.areaOptions {p} [{size} pt, {w}×{h}]: {m}")),
                 Ok(_) => {
-                    let typed = catch_quiet(|| s.execute("text.editRange", &json!({"id": id, "start": 0, "insert": "More words. "})));
+                    let typed = catch_quiet(|| no_panic(s.execute("text.editRange", &json!({"id": id, "start": 0, "insert": "More words. "}))));
                     if typed.is_err() {
                         failures.push(format!("PANIC typing after text.areaOptions {p}"));
                     }
@@ -443,11 +558,13 @@ fn polygon_properties_junk() {
     for scale in [None, Some((300.0, 20.0)), Some((1e-300, 100.0))] {
         for p in &cases {
             let mut s = Fixture::Multi.session();
-            let Ok(_) = s.execute("shape.polygon", &json!({"cx": 100, "cy": 100, "radius": 40, "sides": 7, "rotation": 10})) else { continue };
+            let Ok(_) = no_panic(s.execute("shape.polygon", &json!({"cx": 100, "cy": 100, "radius": 40, "sides": 7, "rotation": 10}))) else {
+                continue;
+            };
             if let Some((sx, sy)) = scale {
-                let _ = s.execute("object.scale", &json!({"sx": sx, "sy": sy}));
+                let _ = no_panic(s.execute("object.scale", &json!({"sx": sx, "sy": sy})));
             }
-            match catch_quiet(|| s.execute("object.setLiveShape", p)) {
+            match catch_quiet(|| no_panic(s.execute("object.setLiveShape", p))) {
                 Err(m) => failures.push(format!("PANIC object.setLiveShape {p} [{scale:?}]: {m}")),
                 Ok(_) => {
                     if let Err(e) = catch_quiet(|| check_all(&mut s)).unwrap_or_else(|m| Err(format!("panic in checks: {m}"))) {
@@ -500,7 +617,7 @@ fn every_command_undoes_exactly() {
         let depth = s.doc().unwrap().history.undo.len();
         let Ok(Ok(_)) = catch_quiet(|| s.execute(c.id, &json!({}))) else { continue };
         if s.doc().unwrap().history.undo.len() > depth {
-            let _ = s.execute("edit.undo", &json!({}));
+            let _ = no_panic(s.execute("edit.undo", &json!({})));
             let after = doc_json(&s.doc().unwrap().doc);
             if after != before {
                 failures.push(format!("{}: {}", c.id, vectorcraft_testkit::invariants::first_diff(&before, &after, "$")));
@@ -539,7 +656,7 @@ fn recovery_commands_with_a_damaged_store_and_junk_params() {
             for p in std::iter::once(json!({})).chain(junk_params(spec.params, &path)) {
                 let mut s = fx.session();
                 s.recovery.set_store(store.clone());
-                let r = catch_quiet(|| s.execute(id, &p));
+                let r = catch_quiet(|| no_panic(s.execute(id, &p)));
                 assert!(r.is_ok(), "PANIC {id} {p} [{fx:?}]");
                 check_session(&s).unwrap_or_else(|e| panic!("{id} {p} [{fx:?}]: {e}"));
             }
@@ -572,9 +689,9 @@ fn envelope_commands_with_junk_params_on_envelopes() {
                         continue;
                     }
                     if editing {
-                        let _ = s.execute("object.envelope.editContents", &json!({"editing": true}));
+                        let _ = no_panic(s.execute("object.envelope.editContents", &json!({"editing": true})));
                     }
-                    let r = catch_quiet(|| s.execute(id, &p));
+                    let r = catch_quiet(|| no_panic(s.execute(id, &p)));
                     if r.is_err() {
                         failures.push(format!("PANIC {id} {p} [{make}, editing {editing}]"));
                     } else if s.in_interaction() {
@@ -642,7 +759,7 @@ fn text_commands_with_junk_params_on_inline_graphics() {
     let mut failures = vec![];
     let mut run = |id: &str, p: &Value| {
         let (mut s, _) = setup();
-        match catch_quiet(|| s.execute(id, p)) {
+        match catch_quiet(|| no_panic(s.execute(id, p))) {
             Err(msg) => failures.push(format!("PANIC {id} {p}: {msg}")),
             Ok(r) => {
                 if s.in_interaction() {
@@ -664,6 +781,66 @@ fn text_commands_with_junk_params_on_inline_graphics() {
         let spec = command_specs().iter().find(|c| c.id == id).unwrap();
         for p in std::iter::once(json!({})).chain(junk_params(spec.params, &path)) {
             run(id, &p);
+        }
+    }
+    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// Create Gradient Mesh on embedded, linked and broken images (bad pixels, zero size, a NaN
+/// transform) with junk rows and columns: never a panic or a broken tree.
+#[test]
+fn gradient_mesh_from_images_with_junk_params() {
+    use vectorcraft_doc::{ImageBlob, ImageObject, LinkInfo, Node, NodeKind};
+    use vectorcraft_geom::Affine;
+    let img = image::RgbaImage::from_fn(5, 3, |x, y| image::Rgba([x as u8 * 50, y as u8 * 90, 7, if x == 2 { 0 } else { 255 }]));
+    let mut png = vec![];
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    let params = [
+        json!({}),
+        json!({"rows": 1, "cols": 1}),
+        json!({"rows": 50, "cols": 50}),
+        json!({"rows": 0, "cols": 3}),
+        json!({"rows": 51, "cols": 3}),
+        json!({"rows": -1, "cols": 1e308}),
+        json!({"rows": "x", "columns": null, "appearance": 5}),
+        json!({"rows": 7, "cols": 9, "appearance": "edge", "highlight": f64::MAX}),
+        json!({"at": [2.5, 1.0]}),
+        json!({"at": [1e308, -1e308]}),
+        json!({"ids": [u64::MAX]}),
+    ];
+    // (stored bytes, width, height, transform, linked)
+    let variants: [(Vec<u8>, u32, u32, Affine, bool); 6] = [
+        (png.clone(), 5, 3, Affine::scale(4.0), false),
+        (png.clone(), 5, 3, Affine::scale(4.0), true),
+        (png.clone(), 0, 0, Affine::scale(4.0), false),
+        (png.clone(), 5, 3, Affine::new([f64::NAN, 0.0, 0.0, 1.0, 0.0, 0.0]), false),
+        (png[..png.len() / 2].to_vec(), 5, 3, Affine::IDENTITY, false),
+        (png.clone(), u32::MAX, u32::MAX, Affine::scale(1e300), false),
+    ];
+    let mut failures = vec![];
+    for (i, (bytes, w, h, xf, linked)) in variants.iter().enumerate() {
+        for p in &params {
+            let mut s = Fixture::Empty.session();
+            let placed = s.edit("Place", |d, sel| {
+                d.images.insert("pic".into(), ImageBlob::png(bytes.clone()));
+                let id = d.alloc_id();
+                let link = linked.then(|| LinkInfo { path: "/nonexistent/pic.png".into(), ..Default::default() });
+                let im = ImageObject { key: "pic".into(), width: *w, height: *h, xf: *xf, link, placement: Default::default() };
+                d.insert(d.default_layer(), 0, Node::new(id, NodeKind::Image(Box::new(im))))?;
+                sel.set([id]);
+                Ok(())
+            });
+            if placed.is_err() {
+                // Insert already refuses a NaN or out-of-range transform.
+                assert!(i >= 3, "variant {i}: {placed:?}");
+                continue;
+            }
+            let r = catch_quiet(|| no_panic(s.execute("object.mesh.create", p)));
+            if r.is_err() {
+                failures.push(format!("PANIC variant {i} {p}"));
+            } else if let Err(e) = check_session(&s) {
+                failures.push(format!("variant {i} {p}: {e}"));
+            }
         }
     }
     assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));

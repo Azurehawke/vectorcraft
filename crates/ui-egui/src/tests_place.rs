@@ -108,8 +108,8 @@ fn laid_out(app: &mut VectorcraftApp, ctx: &egui::Context) -> egui::Rect {
     app.canvas_rect.expect("the canvas is laid out")
 }
 
-/// Where the platform tells where files were dropped (the web), they go as in Illustrator: placed
-/// at the pointer on the canvas whatever they are, opened off it (the tab bar).
+/// Where the platform tells where files were dropped (the web), documents, pictures and text go
+/// as in Illustrator: placed at the pointer on the canvas, opened off it (the tab bar).
 #[test]
 fn a_drop_with_a_position_places_on_the_canvas_and_opens_off_it() {
     let mut app = app();
@@ -139,6 +139,96 @@ fn a_drop_without_a_position_opens_documents_and_places_pictures() {
     for name in ["a.png", "a.jpg", "a.tiff", "a.webp", "a.txt"] {
         assert_eq!(app.drop_target(name, None, false), DropTarget::Place(DropAt { doc: uid, at: center, embed: false }), "{name}");
     }
+}
+
+/// Swatch libraries and color books, graphic style libraries, Libraries panel files, presets,
+/// plug-ins and scripts open as File → Open opens them, dropped with or without a position, on the
+/// canvas too.
+#[test]
+fn libraries_presets_and_plugins_open_wherever_they_are_dropped() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    let rect = laid_out(&mut app, &ctx);
+    let on_canvas = rect.center() + vec2(60.0, -40.0);
+    let libraries = ["a.vcswatches", "a.gpl", "a.ase", "a.acb", "a.vcstyles", "a.vclibrary"];
+    let presets_and_plugins = ["a.vcflattener", "a.vcpdfpresets", "a.vcprintpresets", "a.vcperspective", "a.wasm", "a.jsx", "a.jsxinc", "a.jsxbin"];
+    for name in libraries.into_iter().chain(presets_and_plugins) {
+        assert_eq!(app.drop_target(name, None, false), DropTarget::Open, "{name}");
+        assert_eq!(app.drop_target(name, Some(on_canvas), true), DropTarget::Open, "{name} on the canvas");
+    }
+}
+
+/// A swatch library dropped on the window while a document is open loads in the library panel,
+/// as File → Open loads it.
+#[test]
+fn a_dropped_swatch_library_opens_in_the_library_panel() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut app, &ctx);
+    let gpl = temp_file("dropped.gpl", b"GIMP Palette\nName: Dropped\n#\n255   0   0\tRed\n  0 128 255\tSky\n");
+    frame(&mut app, &ctx, vec![], &[&gpl], false);
+    let id = format!("loaded/{gpl}");
+    assert_eq!(crate::panels::library_panel::last_open(&app.ui).map(|o| o.id.as_str()), Some(id.as_str()), "{}", app.ui.status);
+    let lib = app.session.execute("swatch.library.get", &json!({"library": id})).unwrap();
+    let names: Vec<&str> = lib["swatches"].as_array().unwrap().iter().filter_map(|w| w["name"].as_str()).collect();
+    assert_eq!((lib["name"].as_str(), names), (Some("Dropped"), vec!["Red", "Sky"]));
+    assert_eq!((app.session.documents().len(), images(&app, 0)), (1, 0), "neither opened as a document nor placed");
+    assert_eq!(app.ui.recent_files.first(), Some(&gpl), "added to Open Recent Files as File → Open adds it");
+}
+
+/// A script dropped on the window while a document is open shows its check, as File → Open shows
+/// it, and the document is left as it was.
+#[test]
+fn a_dropped_script_shows_its_check() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut app, &ctx);
+    let path = temp_file("dropped.jsx", b"#target acme\napp.executeMenuCommand('acmecopyall');\n");
+    frame(&mut app, &ctx, vec![], &[&path], false);
+    let d = app.ui.dialog.as_ref().expect("the check is shown");
+    assert_eq!(d.kind, crate::dialogs::script_check::KIND, "{}", app.ui.status);
+    assert_eq!(
+        (d.fields["report"]["name"].as_str(), d.fields["report"]["needs"].clone()),
+        (Some("dropped.jsx"), json!(["language", "menuCommands"]))
+    );
+    assert_eq!((app.session.documents().len(), images(&app, 0)), (1, 0), "neither opened as a document nor placed");
+}
+
+/// A Libraries panel file dropped on the window while a document is open is added to the
+/// Libraries panel as a new library, as File → Open adds it.
+#[test]
+fn a_dropped_libraries_panel_file_is_added_as_a_new_library() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut app, &ctx);
+    let file = json!({"name": "Dropped", "colors": [{"name": "Red", "color": {"model": "rgb", "r": 1, "g": 0, "b": 0}}]});
+    let path = temp_file("dropped.vclibrary", file.to_string().as_bytes());
+    frame(&mut app, &ctx, vec![], &[&path], false);
+    assert_eq!(app.ui.status, "Imported library Dropped");
+    let lib = app.session.execute("library.get", &json!({})).unwrap();
+    let colors: Vec<&str> = lib["colors"].as_array().unwrap().iter().filter_map(|c| c["name"].as_str()).collect();
+    assert_eq!((lib["name"].as_str(), colors), (Some("Dropped"), vec!["Red"]));
+    assert_eq!((app.session.documents().len(), images(&app, 0)), (1, 0), "neither opened as a document nor placed");
+}
+
+/// A shortcut set dropped on the window while a document is open opens Import Shortcut Set, as
+/// File → Open opens it: from its path (desktop) and from its bytes dropped on the canvas (web).
+#[test]
+fn a_dropped_shortcut_set_opens_import_shortcut_set() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    let rect = laid_out(&mut app, &ctx);
+    let set = "/Menus {\n /Acme\\ Undo { /Modifiers 11 /Key 902 }\n}\n";
+    let path = temp_file("dropped.kys", set.as_bytes());
+    frame(&mut app, &ctx, vec![], &[&path], false);
+    let kind = |app: &VectorcraftApp| app.ui.dialog.as_ref().map(|d| d.kind.clone());
+    assert_eq!(kind(&app).as_deref(), Some(crate::dialogs::shortcut_import::KIND), "{}", app.ui.status);
+    app.ui.dialog = None;
+    let target = app.drop_target("sent.kys", Some(rect.center()), false);
+    assert_eq!(target, DropTarget::Open);
+    crate::place::drop_files(&mut app, vec![(target, ("sent.kys".into(), None, set.as_bytes().to_vec()))]);
+    assert_eq!(kind(&app).as_deref(), Some(crate::dialogs::shortcut_import::KIND), "{}", app.ui.status);
+    assert_eq!((app.session.documents().len(), images(&app, 0)), (1, 0), "neither opened as a document nor placed");
 }
 
 #[test]
@@ -404,6 +494,44 @@ fn click_label(app: &mut VectorcraftApp, ctx: &egui::Context, label: &str) {
     click_control(app, ctx, p);
 }
 
+/// The Control bar's file name opens the link menu: Replace… puts the picked file in the image's
+/// place (an embedded image becomes linked) with the new file's own aspect ratio, fitted inside the
+/// old bounds; Placement Options… opens its dialog.
+#[test]
+fn the_control_bars_file_name_relinks_the_image() {
+    use crate::tests_removeanchors::{click_control, control_frame};
+    // Menu items are drawn after the space a check mark takes.
+    let item = |app: &mut VectorcraftApp, ctx: &egui::Context, label: &str| {
+        let texts = control_frame(app, ctx, vec![]);
+        texts.iter().find(|(t, _)| t.trim() == label).map(|(_, r)| r.center()).unwrap_or_else(|| panic!("no `{label}` in {texts:?}"))
+    };
+    let mut app = app();
+    let data = vectorcraft_format::base64_encode(&png(30, 30, 72.0));
+    app.run("file.place", json!({"name": "red.png", "dataBase64": data, "link": false})).unwrap();
+    let before = selected_image(&app).geometric_bounds().unwrap();
+    let ctx = egui::Context::default();
+    crate::theme::install_fonts(&ctx);
+    click_label(&mut app, &ctx, "red.png");
+    for s in ["Replace…", "Go To Link", "Edit Original", "Update Link", "Placement Options…"] {
+        item(&mut app, &ctx, s);
+    }
+    let other = temp_file("blue.png", &png(60, 30, 72.0));
+    let picked = other.clone();
+    app.services.pick_open = Some(Box::new(move |_: &crate::FilePick| Some(picked.clone())));
+    let p = item(&mut app, &ctx, "Replace…");
+    click_control(&mut app, &ctx, p);
+    let image = selected_image(&app);
+    let NodeKind::Image(im) = &image.kind else { panic!("an image") };
+    assert!(im.link.as_ref().is_some_and(|l| l.name() == "blue.png"), "relinked to the picked file");
+    let after = image.geometric_bounds().unwrap();
+    assert!((after.width() - before.width()).abs() < 1e-6 && (after.height() - before.height() / 2.0).abs() < 1e-6, "2:1, fitted: {after:?}");
+    assert!((after.center() - before.center()).hypot() < 1e-6, "centred where the old image was");
+    click_label(&mut app, &ctx, "blue.png");
+    let p = item(&mut app, &ctx, "Placement Options…");
+    click_control(&mut app, &ctx, p);
+    assert!(app.ui.dialog.is_some(), "Placement Options opens");
+}
+
 #[test]
 fn the_control_bar_and_properties_trace_a_selected_image() {
     use crate::panels::image_trace::{TRACE_BUTTON_W, selected_trace};
@@ -547,6 +675,30 @@ fn crop_image_shows_a_box_that_apply_crops_to() {
     assert!(!crate::menus::enabled(&app, "ui.cropImage") && app.run("ui.cropImage", json!({})).is_err());
 }
 
+/// Crop Image's Apply and Object › Rasterize say in the status bar when the image couldn't be
+/// decoded, as raster exports do.
+#[test]
+fn crop_and_rasterize_say_in_the_status_bar_when_an_image_could_not_be_decoded() {
+    const WARNING: &str = "an image couldn't be decoded and is missing from the picture";
+    // A PNG whose header reads (so it places at its size) but whose pixel data is cut short.
+    let mut cut = png(100, 50, 72.0);
+    let idat = cut.windows(4).position(|w| w == b"IDAT").unwrap();
+    cut.truncate(idat + 8);
+    let mut app = app();
+    app.run("file.place", json!({"name": "cut.png", "dataBase64": vectorcraft_format::base64_encode(&cut)})).unwrap();
+    let whole = selected_image(&app).geometric_bounds().unwrap();
+    app.run("ui.cropImage", json!({})).unwrap();
+    app.run("tool.setOption", json!({"key": "rect", "value": [whole.x0, whole.y0, whole.width() / 2.0, whole.height()]})).unwrap();
+    app.status("");
+    tool_key(&mut app, vectorcraft_tools::ToolKey::Enter);
+    assert_eq!(app.ui.status, WARNING, "Crop Image's Apply");
+    // Undo puts the image back as placed; then Rasterize runs on it.
+    app.run("edit.undo", json!({})).unwrap();
+    app.status("");
+    app.run("object.rasterize", json!({"ppi": 72})).unwrap();
+    assert_eq!(app.ui.status, WARNING, "Rasterize");
+}
+
 /// One headless frame of the whole window at `time` → how long the app asked to wait before the
 /// next one.
 fn frame_at(app: &mut VectorcraftApp, ctx: &egui::Context, time: f64) -> std::time::Duration {
@@ -563,6 +715,7 @@ fn frame_at(app: &mut VectorcraftApp, ctx: &egui::Context, time: f64) -> std::ti
 /// for) or until `done` → whether it was.
 fn idle(app: &mut VectorcraftApp, ctx: &egui::Context, time: &mut f64, secs: f64, done: &dyn Fn(&VectorcraftApp) -> bool) -> bool {
     let end = *time + secs;
+    let real_end = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let wait = frame_at(app, ctx, *time);
         if done(app) {
@@ -573,9 +726,11 @@ fn idle(app: &mut VectorcraftApp, ctx: &egui::Context, time: &mut f64, secs: f64
             *time = end;
             return false;
         }
-        if app.session.link_scan.is_some() {
-            // The look runs on a worker thread, in real time.
+        // The look runs on a worker thread, in real time: the clock waits for it, else a busy
+        // machine's slow look outlasts the simulated seconds and the test fails at random.
+        if app.session.link_scan.is_some() && std::time::Instant::now() < real_end {
             std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
         }
         *time = next;
     }

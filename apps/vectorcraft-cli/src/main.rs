@@ -4,10 +4,10 @@
 //! vectorcraft-cli mcp [--connect 127.0.0.1:7979 | --headless] [--automation-read-root DIR] [--automation-write-root DIR]
 //! vectorcraft-cli run [--in FILE] [--cmd id [--params '{json}']]... [--export out.svg]... [--scale 2]
 //! vectorcraft-cli commands
-//! vectorcraft-cli convert IN OUT [--scale 2] [--artboard 0 | --range 1-3,5] [--outline-text] [--replace-lossy]
+//! vectorcraft-cli convert IN OUT [--scale 2] [--artboard 0 | --range 1-3,5] [--outline-text] [--decimals N] [--replace-lossy] [--editing-data] [--ai-version 7|pdf] [--hidden-objects layer|omit|visible] [--transparent-images flatten|omit]
 //! vectorcraft-cli info FILE
 //! vectorcraft-cli bench FILE [--size 2880x1800] [--iters 5]
-//! vectorcraft-cli perf [--paths 50000]
+//! vectorcraft-cli perf [--paths 50000] [--deep]
 //! ```
 // Denied, not forbidden: the font listers shared with the desktop app allow it for their
 // DirectWrite (Windows) and CoreText (macOS) calls, and nothing else may.
@@ -78,20 +78,32 @@ USAGE:
 
   vectorcraft-cli run [--in FILE] [--cmd ID [--params JSON]]... [--export FILE]... [--scale N]
       Headless batch: open FILE (any readable format) or start a new document, run commands in
-      order, export each FILE in the format its extension picks (see Writable formats). Prints one
-      JSON result per step.
+      order, export each FILE in the format its extension picks (see Writable formats; a .ait FILE
+      is a template, written as file.saveAsTemplate writes it). --scale sizes raster exports
+      (pixels per point, default 1); other formats leave it out. Prints one JSON result per step.
 
   vectorcraft-cli commands
       Print the command catalogue as JSON.
 
-  vectorcraft-cli convert IN OUT [--scale N] [--artboard I | --range R] [--outline-text] [--replace-lossy]
+  vectorcraft-cli convert IN OUT [--scale N] [--artboard I | --range R] [--outline-text] [--decimals N] [--replace-lossy] [--editing-data] [--ai-version 7|pdf] [--hidden-objects layer|omit|visible] [--transparent-images flatten|omit]
       Open IN (any readable format) and export OUT in the format its extension picks (see Writable
-      formats). --artboard is 0-based, --range 1-based (\"1-3,5\"); a PDF gets every artboard
+      formats). --scale sizes a raster OUT (pixels per point, default 1); other formats leave it
+      out. --artboard is 0-based, --range 1-based (\"1-3,5\"); a PDF gets every artboard
       unless one of them is given, EPS the bounds of the art, the other formats the first artboard.
+      A .ait OUT is a template of every artboard, written as file.saveAsTemplate writes it (not with
+      --artboard or --range).
       Live effects are kept, and hidden layers and objects (written hidden in SVG and PSD), with
-      SVG's data-* attributes; --outline-text writes SVG text as paths. OUT may not be IN when reading
+      SVG's data-* attributes; --outline-text writes SVG text as paths, --decimals sets SVG's coordinate
+      precision (1–7, default 3). OUT may not be IN when reading
       IN left things out (hidden text, art or layers it could not read; the notes say which) unless
-      --replace-lossy is given.
+      --replace-lossy is given. --editing-data opens a .ai from its editing copy even where that
+      draws differently from its PDF part (which can be older), as long as it can be read. The
+      result has the export's warnings, and importWarnings for what reading IN left out.
+      --ai-version 7 writes a .ai as the legacy version 7 (layers, groups and type kept; one file
+      per artboard, OUT-<artboard>.ai when there are several; default pdf, PDF-compatible), with
+      --hidden-objects (default layer: a hidden layer above each layer's hidden objects; omit;
+      visible), --transparent-images (default flatten, with the art under them; omit) and
+      --outline-text (type as outlines instead of text).
 
   vectorcraft-cli info FILE
       Print a JSON summary: the import warnings (what didn't come in as it was, such as an EPS
@@ -102,9 +114,12 @@ USAGE:
       Render FILE (any readable format) fitted to WxH (default 2880x1800) and print ms per frame
       (warm), multithreaded and single-threaded.
 
-  vectorcraft-cli perf [--paths N]
-      Check the performance budgets (render, pan, hit test, save/load, SVG, Pathfinder) on a
-      synthetic N-path document (default 50000). Exits non-zero if a budget is exceeded.
+  vectorcraft-cli perf [--paths N] [--deep]
+      Check the performance budgets (render, pan, hit test, save/load, SVG, Pathfinder, handle
+      and segment drags) on a synthetic N-path document (default 50000). Exits non-zero if a
+      budget is exceeded, unless the report says the machine is busy. --deep also times work with
+      no budget yet and prints memory use (the working set on Windows), with the peak so far on
+      Windows and Linux.
 ";
 
 /// The usage text plus the formats `document.open` reads and `document.export` writes.
@@ -148,6 +163,16 @@ fn main() -> ExitCode {
     }
 }
 
+/// A headless session that remembers what the user keeps between runs: the PDF presets saved, the
+/// ICC profiles loaded and the plug-ins installed (#2168, #2174, #2541), in the folders next to the preferences that the desktop
+/// app uses too. `VECTORCRAFT_NO_PREFS` and `VECTORCRAFT_CONFIG_DIR` apply as they do there.
+fn with_stores(mut h: Headless) -> Headless {
+    prefs_dir::attach_profile_store(&mut h.session);
+    prefs_dir::attach_plugin_store(&mut h.session);
+    prefs_dir::attach_pdf_preset_store(&mut h.session);
+    h
+}
+
 fn mcp(args: &[String]) -> Result<(), String> {
     let mut connect: Option<String> = None;
     let mut headless = false;
@@ -187,14 +212,14 @@ fn mcp(args: &[String]) -> Result<(), String> {
         eprintln!("vectorcraft-cli: files confined: read root {}, write root {}", show(roots.read_root()), show(roots.write_root()));
         Box::new(Headless::with_document().with_automation_roots(Some(roots)))
     } else if headless {
-        Box::new(Headless::with_document())
+        Box::new(with_stores(Headless::with_document()))
     } else if let Some(addr) = connect {
         // Explicit address: fail loudly if the app isn't there.
         Box::new(Remote::connect(&addr).map_err(|e| format!("cannot connect to {addr}: {e}"))?)
     } else {
         match Remote::connect(DEFAULT_ADDR) {
             Ok(r) => Box::new(r),
-            Err(_) => Box::new(Headless::with_document()),
+            Err(_) => Box::new(with_stores(Headless::with_document())),
         }
     };
     eprintln!("vectorcraft-cli: MCP server on stdio ({})", backend.describe());
@@ -202,8 +227,8 @@ fn mcp(args: &[String]) -> Result<(), String> {
     // uses `vectorcraft_mcp` free to bring its own. Silent until a client sends logging/setLevel.
     vectorcraft_mcp::logging::install();
     let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    Server::new(backend).serve(stdin.lock(), stdout.lock()).map_err(|e| e.to_string())
+    // The server reads and writes from threads of its own, so it takes the handles, not locks held here.
+    Server::new(backend).serve(std::io::BufReader::new(stdin), std::io::stdout()).map_err(|e| e.to_string())
 }
 
 fn commands() -> Result<(), String> {
@@ -215,7 +240,12 @@ fn commands() -> Result<(), String> {
 
 fn convert(args: &[String]) -> Result<(), String> {
     let mut files = vec![];
-    let (mut scale, mut artboard, mut range, mut outline_text, mut replace_lossy) = (1.0f64, None::<u64>, None::<String>, false, false);
+    let (mut scale, mut artboard, mut range, mut outline_text, mut replace_lossy, mut editing_data) =
+        (1.0f64, None::<u64>, None::<String>, false, false, false);
+    let mut decimals = None::<u64>;
+    // Legacy `.ai` options, passed on as the export's own (`aiVersion`, `hiddenObjects`,
+    // `transparentImages`); the engine checks their values.
+    let mut legacy: Vec<(&str, String)> = vec![];
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -223,19 +253,66 @@ fn convert(args: &[String]) -> Result<(), String> {
             "--artboard" | "-a" => artboard = Some(it.next().and_then(|v| v.parse().ok()).ok_or("--artboard needs an index")?),
             "--range" | "-r" => range = Some(it.next().cloned().ok_or("--range needs artboards such as 1-3,5")?),
             "--outline-text" => outline_text = true,
+            "--decimals" => decimals = Some(it.next().and_then(|v| v.parse::<u64>().ok()).ok_or("--decimals needs a number")?),
             "--replace-lossy" => replace_lossy = true,
+            "--editing-data" => editing_data = true,
+            "--ai-version" => legacy.push(("aiVersion", it.next().cloned().ok_or("--ai-version needs 7 or pdf")?)),
+            "--hidden-objects" => legacy.push(("hiddenObjects", it.next().cloned().ok_or("--hidden-objects needs layer, omit or visible")?)),
+            "--transparent-images" => legacy.push(("transparentImages", it.next().cloned().ok_or("--transparent-images needs flatten or omit")?)),
             f => files.push(f.to_string()),
         }
     }
     let [input, output] = <[String; 2]>::try_from(files).map_err(|_| "convert needs IN and OUT")?;
+    let template = is_template(&output);
+    if template && (artboard.is_some() || range.is_some()) {
+        return Err("a .ait template holds every artboard: --artboard and --range don't apply".into());
+    }
     let mut h = Headless::new();
-    h.call("app.open", json!({"path": input})).map_err(|e| format!("open {input}: {e}"))?;
-    // A conversion keeps hidden layers and objects, written hidden, where the format can (SVG,
-    // PSD).
-    let params = json!({"path": output, "scale": scale, "artboard": artboard, "range": range, "outlineText": outline_text, "hiddenLayers": true, "acknowledgeLoss": replace_lossy});
-    let r = h.call("engine.execute", json!({"command": "document.export", "params": params})).map_err(|e| format!("export {output}: {e}"))?;
+    let opened = if editing_data {
+        let params = json!({"path": input, "editingData": "always"});
+        h.call("engine.execute", json!({"command": "document.open", "params": params})).map_err(|e| format!("open {input}: {e}"))?
+    } else {
+        h.call("app.open", json!({"path": input})).map_err(|e| format!("open {input}: {e}"))?
+    };
+    let (command, mut params) = if template {
+        // Save as Template writes every artboard, with the .ai options.
+        ("file.saveAsTemplate", json!({"path": output, "format": "ait", "outlineText": outline_text, "acknowledgeLoss": replace_lossy}))
+    } else {
+        // A conversion keeps hidden layers and objects, written hidden, where the format can (SVG,
+        // PSD).
+        let params = json!({"path": output, "artboard": artboard, "range": range, "outlineText": outline_text, "hiddenLayers": true, "acknowledgeLoss": replace_lossy});
+        let mut params = with_pixel_scale(params, &output, scale);
+        if let Some(decimals) = decimals {
+            params["decimals"] = json!(decimals);
+        }
+        ("document.export", params)
+    };
+    for (key, value) in legacy {
+        params[key] = json!(value);
+    }
+    let mut r = h.call("engine.execute", json!({"command": command, "params": params})).map_err(|e| format!("export {output}: {e}"))?;
+    // What reading the input left out (a missing linked file, an unsupported filter…) matters as
+    // much as what writing the output did.
+    if let (Some(w), Some(out)) = (opened.get("warnings").filter(|w| w.as_array().is_some_and(|a| !a.is_empty())), r.as_object_mut()) {
+        out.insert("importWarnings".into(), w.clone());
+    }
     outln!("{r}");
     Ok(())
+}
+
+/// Is `path` a `.ait` template? `file.saveAsTemplate` writes it; exports don't.
+fn is_template(path: &str) -> bool {
+    vectorcraft_engine::cmd::fileio::format_for_name(path).is_some_and(|f| f.id == "ait")
+}
+
+/// The export `params` for `path`, with `--scale` (pixels per point) when its format is raster.
+/// DXF has a `scale` of its own (drawing units per unit), which would resize the drawing and leave
+/// its units unset.
+fn with_pixel_scale(mut params: Value, path: &str, scale: f64) -> Value {
+    if vectorcraft_engine::cmd::fileio::writable_format(None, Some(path)).is_ok_and(|f| f.raster) {
+        params["scale"] = json!(scale);
+    }
+    params
 }
 
 fn info(args: &[String]) -> Result<(), String> {
@@ -290,7 +367,7 @@ fn run(args: &[String]) -> Result<(), String> {
         }
     }
 
-    let mut h = Headless::new();
+    let mut h = with_stores(Headless::new());
     let mut out = std::io::stdout().lock();
     // A reader that stopped early (a closed pipe) isn't an error, and the batch goes on: its later
     // steps (an export…) still run, unprinted.
@@ -324,7 +401,12 @@ fn run(args: &[String]) -> Result<(), String> {
                 r
             }
             Step::Export(path) => {
-                let r = h.call("app.export", json!({"path": path, "scale": scale})).map_err(|e| format!("export {path}: {e}"))?;
+                let r = if is_template(&path) {
+                    h.call("engine.execute", json!({"command": "file.saveAsTemplate", "params": {"path": path, "format": "ait"}}))
+                } else {
+                    h.call("app.export", with_pixel_scale(json!({"path": path}), &path, scale))
+                };
+                let r = r.map_err(|e| format!("export {path}: {e}"))?;
                 emit(json!({"step": "export", "result": r}))?;
                 r
             }

@@ -97,6 +97,21 @@ notarize() {
   fi
 }
 
+# `stapler validate` looks the ticket up in Apple's CloudKit, and a dropped connection there
+# (NSURLErrorDomain -1005, "Error 68") fails it although the staple worked. Retry with a pause; a
+# missing or bad ticket still fails every try.
+validate_stapled() {
+  local try
+  for try in 1 2 3 4; do
+    xcrun stapler validate "$1" && return 0
+    [ "$try" = 4 ] && break
+    echo "stapler validate failed (try $try of 4); retrying in $((try * 20)) s" >&2
+    sleep $((try * 20))
+  done
+  echo "error: stapler validate $(basename "$1") failed 4 times" >&2
+  exit 1
+}
+
 # ---- VectorCraft.app ----------------------------------------------------------------------------
 echo "==> assembling $APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -109,7 +124,7 @@ sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHORT_VERSION@/$SHORT_VERSION/g" \
 plutil -lint "$APP/Contents/Info.plist"
 printf 'APPL????' >"$APP/Contents/PkgInfo"
 # The licences of the craft-fonts fonts embedded in the binary (release builds).
-copy_font_licences "$APP/Contents/Resources"
+copy_docs "$APP/Contents/Resources"
 
 # Sign inside-out: nested code first, then the bundle itself (no --deep on the final signature).
 # Today the only nested code is the main executable; frameworks/helpers would be signed here too.
@@ -121,7 +136,7 @@ if [ "$NOTARIZE" = 1 ]; then
   ditto -c -k --keepParent "$APP" "$WORK/VectorCraft-notarize.zip"
   notarize "$WORK/VectorCraft-notarize.zip"
   xcrun stapler staple "$APP"
-  xcrun stapler validate "$APP"
+  validate_stapled "$APP"
   spctl --assess --type execute -vvv "$APP"
 fi
 
@@ -135,19 +150,43 @@ ln -s /Applications "$STAGE/Applications"
 mkdir -p "$STAGE/.background"
 cp "$HERE/dmg/background.tiff" "$STAGE/.background/background.tiff"
 cp "$HERE/dmg/DS_Store" "$STAGE/.DS_Store"
-rm -f "$DMG" "$WORK/raw.dmg"
-# makehybrid + convert builds the image without attaching a device, unlike `create -srcfolder`,
-# which is flaky on CI runners ("Resource busy") and hangs in sandboxed sessions.
-# The volume name has no version: .DS_Store finds the background through an alias that includes it.
-hdiutil makehybrid -hfs -hfs-volume-name "VectorCraft" -hfs-openfolder "$STAGE" -o "$WORK/raw.dmg" "$STAGE"
-hdiutil convert "$WORK/raw.dmg" -format UDZO -imagekey zlib-level=9 -o "$DMG"
-rm -f "$WORK/raw.dmg"
+rm -f "$DMG"
+# `hdiutil create -srcfolder` writes the files as they are. `makehybrid -hfs` gave every file a
+# com.apple.FinderInfo, which `codesign --verify --strict` rejects as "Finder information, or
+# similar detritus" on the app in the image and on a copy installed from it (#1085, as PdfCraft's
+# storytold/pdfcraft#823). `create` attaches a device while it copies, which fails now and then on
+# CI runners ("Resource busy"), so it gets a few tries. The volume name has no version: .DS_Store
+# finds the background through an alias that includes it.
+# Usage: hdiutil_retry <what> <hdiutil args…>; tries five times with growing pauses.
+hdiutil_retry() {
+  local what="$1" attempt
+  shift
+  for attempt in 1 2 3 4 5; do
+    if hdiutil "$@"; then
+      return 0
+    fi
+    [ "$attempt" = 5 ] && { echo "hdiutil $what failed 5 times" >&2; return 1; }
+    echo "hdiutil $what failed (attempt $attempt of 5); retrying in $((attempt * 10))s" >&2
+    sleep $((attempt * 10))
+  done
+}
+hdiutil_retry create create -srcfolder "$STAGE" -volname "VectorCraft" -fs HFS+ -format UDZO -imagekey zlib-level=9 -ov "$DMG"
 sign "$DMG"
 codesign --verify --strict --verbose=2 "$DMG"
+# The app inside the image must still pass --strict, so a makehybrid-style regression can't ship.
+MOUNT="$WORK/dmg-check"
+rm -rf "$MOUNT"
+mkdir -p "$MOUNT"
+hdiutil_retry attach attach -nobrowse -readonly -mountpoint "$MOUNT" "$DMG" >/dev/null
+if ! codesign --verify --strict --deep --verbose=2 "$MOUNT/VectorCraft.app"; then
+  hdiutil_retry detach detach "$MOUNT" >/dev/null || true
+  exit 1
+fi
+hdiutil_retry detach detach "$MOUNT" >/dev/null
 if [ "$NOTARIZE" = 1 ]; then
   notarize "$DMG"
   xcrun stapler staple "$DMG"
-  xcrun stapler validate "$DMG"
+  validate_stapled "$DMG"
   spctl --assess --type open --context context:primary-signature -vvv "$DMG"
 fi
 

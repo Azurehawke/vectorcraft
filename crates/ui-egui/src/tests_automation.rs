@@ -77,6 +77,34 @@ fn control_requests_stay_inside_the_roots() {
     let _ = std::fs::remove_dir_all(base);
 }
 
+/// A shortcut set another app saved (`.kys`) is read only from inside the read root, whichever way a
+/// control request names it: `shortcutSet.read`, Import Shortcut Set, Keyboard Shortcuts' Import…
+/// and File › Open.
+#[test]
+fn shortcut_sets_are_read_only_inside_the_read_root() {
+    let (mut app, tx, base) = confined("kys");
+    let set = "/Menus {\n /Acme\\ Undo { /Modifiers 0 /Key 48 }\n}\n";
+    std::fs::write(base.join("in/a.kys"), set).unwrap();
+    std::fs::write(base.join("outside/b.kys"), set).unwrap();
+    let execute = |command: &str, path: PathBuf| json!({"command": command, "params": {"path": s(path)}});
+    let r = request(&mut app, &tx, "engine.execute", execute("shortcutSet.read", base.join("in/a.kys")));
+    assert_eq!(r["result"]["entries"][0]["name"], "Acme Undo", "{r}");
+    for (method, params) in [
+        ("engine.execute", execute("shortcutSet.read", base.join("outside/b.kys"))),
+        ("engine.execute", execute("ui.shortcutImportDialog", base.join("outside/b.kys"))),
+        ("engine.execute", execute("shortcuts.import", base.join("outside/b.kys"))),
+        ("app.open", json!({"path": s(base.join("outside/b.kys"))})),
+    ] {
+        let r = request(&mut app, &tx, method, params.clone());
+        assert!(r["error"].as_str().is_some_and(|e| e.contains("outside the read root")), "{method} {params}: {r}");
+        assert!(app.ui.dialog.is_none(), "{method} {params}: no dialog opens");
+    }
+    let r = request(&mut app, &tx, "engine.execute", execute("ui.shortcutImportDialog", base.join("in/a.kys")));
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(app.ui.dialog.as_ref().map(|d| d.kind.as_str()), Some(crate::dialogs::shortcut_import::KIND));
+    let _ = std::fs::remove_dir_all(base);
+}
+
 #[test]
 fn frames_with_injected_input_are_confined() {
     let (mut app, tx, base) = confined("synthetic");
@@ -88,5 +116,41 @@ fn frames_with_injected_input_are_confined() {
     let mut raw = egui::RawInput::default();
     app.raw_input_hook(&mut raw);
     assert!(!app.synthetic_frame, "the frames after it are the person's");
+    let _ = std::fs::remove_dir_all(base);
+}
+
+/// Edit Original and the Attributes panel's Browser button hand a file or URL to another app: a
+/// control request (or MCP, which comes through it) can't run them, roots or not.
+#[test]
+fn automation_cannot_hand_files_or_urls_to_other_apps() {
+    let base = std::env::temp_dir().join(format!("vc-ui-handoff-{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let png = base.join("linked.png");
+    image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 0, 255])).save(&png).unwrap();
+    let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let (u, f) = (opened.clone(), opened.clone());
+    let services = Services {
+        open_url: Some(Box::new(move |p: &str| u.borrow_mut().push(p.to_string()))),
+        open_file: Some(Box::new(move |p: &str| {
+            f.borrow_mut().push(p.to_string());
+            Ok(())
+        })),
+        ..Default::default()
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut app = VectorcraftApp::new(Session::new(), services).with_control(rx);
+    app.run("file.new", json!({"width": 100, "height": 100})).unwrap();
+    let image = app.run("file.place", json!({"path": s(png.clone())})).unwrap()["ids"][0].as_u64().unwrap();
+    app.run("shape.rectangle", json!({"x": 0, "y": 0, "width": 50, "height": 50})).unwrap();
+    app.run("attributes.set", json!({"url": "https://example.com/a"})).unwrap();
+    for (command, params) in [("attributes.openUrl", json!({})), ("links.editOriginal", json!({"id": image}))] {
+        let r = request(&mut app, &tx, "engine.execute", json!({"command": command, "params": params}));
+        assert!(r["error"].as_str().is_some_and(|e| e.contains("only the person at the keyboard")), "{command}: {r}");
+    }
+    assert!(opened.borrow().is_empty());
+    // The person at the keyboard can.
+    app.run("attributes.openUrl", json!({})).unwrap();
+    app.run("links.editOriginal", json!({"id": image})).unwrap();
+    assert_eq!(opened.borrow().len(), 2);
     let _ = std::fs::remove_dir_all(base);
 }

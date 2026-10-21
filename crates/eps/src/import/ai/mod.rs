@@ -17,17 +17,21 @@
 //! objects and points. Anything it doesn't read is an error: the caller opens the file the way it
 //! did before (the printed page, or the PDF), with a warning saying why.
 
+mod frames;
 mod lex;
+mod mesh;
 mod obj;
 mod paint;
 mod read;
+mod style;
 
 use std::io::Read as _;
 
 use super::lex::find;
 use crate::ps;
 
-pub use read::{Structure, artboards, read};
+pub(crate) use frames::text_frames;
+pub use read::{Structure, artboards, read, variables};
 pub(crate) use read::{slot_frame, slot_of};
 
 #[cfg(test)]

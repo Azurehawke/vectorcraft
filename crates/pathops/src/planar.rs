@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use kurbo::{Affine, BezPath, CubicBez, ParamCurve, PathSeg, Point, Shape as _};
+use kurbo::{Affine, BezPath, CubicBez, ParamCurve, ParamCurveArclen, PathSeg, Point, Shape as _};
 use linesweeper::topology::{Topology, WindingNumber};
 use vectorcraft_geom::{FillRule, PathData, SubPath};
 
@@ -147,6 +147,20 @@ struct Edge {
     ends: [usize; 2],
     /// The input it came from (the front-most, where inputs share it).
     source: usize,
+}
+
+/// `segs` (a chain) moved to start at `a` and end at `b`, the handles next to each moving with it.
+pub(crate) fn pin_ends(segs: &mut [Seg], a: Point, b: Point) {
+    if let Some(s) = segs.first_mut() {
+        let d = a - s.c.p0;
+        s.c.p0 = a;
+        s.c.p1 += d;
+    }
+    if let Some(s) = segs.last_mut() {
+        let d = b - s.c.p3;
+        s.c.p3 = b;
+        s.c.p2 += d;
+    }
 }
 
 /// Half-edge `2e` runs along edge `e`, `2e + 1` back along it.
@@ -293,8 +307,282 @@ pub fn live_paint(shapes: &[Shape]) -> (Vec<Region>, Vec<Shape>) {
     build(shapes).unwrap_or_default()
 }
 
-/// Most segments the Shape Builder sweeps with open paths as edges: the planar map costs far more
-/// than the filled areas' arrangement, so past this only the filled areas count.
+/// [`live_paint`] with Gap Detection: the faces are those of `shapes` with a line across each gap
+/// [`find_gaps`] finds up to `max_gap`, so paint stops at the gaps, and the edges are those of
+/// `shapes` alone (the lines add none). Also returns the gaps.
+pub fn live_paint_with_gaps(shapes: &[Shape], max_gap: f64) -> (Vec<Region>, Vec<Shape>, Vec<[Point; 2]>) {
+    let gaps = find_gaps(shapes, max_gap);
+    if gaps.is_empty() {
+        let (faces, edges) = live_paint(shapes);
+        return (faces, edges, gaps);
+    }
+    let mut closed = shapes.to_vec();
+    let lines = PathData::new(gaps.iter().map(|g| SubPath::polyline(g, false)).collect());
+    closed.push(Shape::new(lines, FillRule::NonZero, u64::MAX));
+    let (faces, _) = live_paint(&closed);
+    let (_, edges) = live_paint(shapes);
+    (faces, edges, gaps)
+}
+
+/// How many times longer than a gap the way between its two ends along the paths must be for it to
+/// count: a loose end that crosses a path just before it (an overshoot), or a path that curls back
+/// close to its own end (a hook), leaves no gap there.
+const GAP_DETOUR: f64 = 8.0;
+
+/// How exactly [`find_gaps`] measures lengths along the paths.
+const GAP_ARC_ACCURACY: f64 = 1e-4;
+
+/// How many points along a loose end's own segment [`find_gaps`] tries.
+const GAP_SAMPLES: u32 = 64;
+
+/// One subpath's segments for [`find_gaps`], with the length along it where each starts.
+struct Track {
+    segs: Vec<PathSeg>,
+    /// The length at the start of each segment, then the whole length.
+    at: Vec<f64>,
+    closed: bool,
+    bounds: kurbo::Rect,
+}
+
+impl Track {
+    fn new(sp: &SubPath) -> Option<Self> {
+        if sp.anchors.len() < 2 || !sp.anchors.iter().all(|a| a.p.is_finite() && a.h_in.is_finite() && a.h_out.is_finite()) {
+            return None;
+        }
+        let mut bp = BezPath::new();
+        sp.to_bezpath_into(&mut bp);
+        let segs: Vec<PathSeg> = bp.segments().collect();
+        let mut at = Vec::with_capacity(segs.len() + 1);
+        let mut len = 0.0;
+        for s in &segs {
+            at.push(len);
+            len += s.arclen(GAP_ARC_ACCURACY);
+        }
+        at.push(len);
+        (!segs.is_empty()).then(|| Self { bounds: bp.bounding_box(), segs, at, closed: sp.closed })
+    }
+
+    fn len(&self) -> f64 {
+        self.at.last().copied().unwrap_or(0.0)
+    }
+
+    /// The length along the subpath to parameter `t` of segment `k`.
+    fn pos(&self, k: usize, t: f64) -> f64 {
+        let Some(s) = self.segs.get(k) else { return self.len() };
+        self.at.get(k).copied().unwrap_or(0.0) + s.subsegment(0.0..t).arclen(GAP_ARC_ACCURACY)
+    }
+
+    /// The length along the subpath between two places on it (the shorter way round a closed one).
+    fn along(&self, a: f64, b: f64) -> f64 {
+        let d = (a - b).abs();
+        if self.closed { d.min(self.len() - d) } else { d }
+    }
+}
+
+/// Do two boxes (lines' boxes included, which have no area) touch or overlap?
+fn boxes_meet(a: kurbo::Rect, b: kurbo::Rect) -> bool {
+    a.x0 <= b.x1 && b.x0 <= a.x1 && a.y0 <= b.y1 && b.y0 <= a.y1
+}
+
+/// Where track `o`, within `reach` along it of `from`, crosses the segments `near` of track `q`:
+/// (length along `o`, length along `q`) of each crossing.
+fn crossings(o: &Track, from: f64, reach: f64, q: &Track, near: impl Iterator<Item = usize>) -> Vec<(f64, f64)> {
+    let near: Vec<(usize, &PathSeg)> = near.filter_map(|j| Some((j, q.segs.get(j)?))).collect();
+    let mut out = vec![];
+    // `first` is the first segment that ends within reach.
+    let first = o.at.partition_point(|&a| a < from - reach).saturating_sub(1);
+    for (k, s) in o.segs.iter().enumerate().skip(first) {
+        let (Some(&a0), Some(&a1)) = (o.at.get(k), o.at.get(k + 1)) else { continue };
+        if a0 > from + reach {
+            break;
+        }
+        if a1 < from - reach || !boxes_meet(s.bounding_box(), q.bounds) {
+            continue;
+        }
+        // A curve is tried as 16 chords.
+        let n = if matches!(s, PathSeg::Line(_)) { 1 } else { 16 };
+        let mut prev = s.start();
+        for i in 1..=n {
+            let (t0, t1) = (f64::from(i - 1) / f64::from(n), f64::from(i) / f64::from(n));
+            let p = s.eval(t1);
+            let chord = kurbo::Line::new(prev, p);
+            let cb = chord.bounding_box();
+            for &(j, qs) in &near {
+                if !boxes_meet(qs.bounding_box(), cb) {
+                    continue;
+                }
+                for x in qs.intersect_line(chord) {
+                    out.push((o.pos(k, t0 + x.line_t * (t1 - t0)), q.pos(j, x.segment_t)));
+                }
+            }
+            prev = p;
+        }
+    }
+    out
+}
+
+/// Most grid cells one segment is listed in by [`SegGrid`]; a longer one is tried for every point.
+const GAP_GRID_SPAN: i64 = 1024;
+
+/// The farthest cell from the grid's origin, on each axis, that [`SegGrid`] numbers a point in.
+const GAP_GRID_LIMIT: f64 = 1_048_576.0;
+
+/// The segments of [`find_gaps`]' tracks by the cells of a square grid that their bounds cover.
+struct SegGrid {
+    origin: Point,
+    cell: f64,
+    /// (track, segment) by cell.
+    cells: HashMap<(i64, i64), Vec<(usize, usize)>>,
+    /// Segments whose bounds cover more than [`GAP_GRID_SPAN`] cells, near every point.
+    wide: Vec<(usize, usize)>,
+}
+
+impl SegGrid {
+    fn new(tracks: &[Track], origin: Point, cell: f64) -> Self {
+        let mut grid = Self { origin, cell, cells: HashMap::new(), wide: vec![] };
+        for (j, t) in tracks.iter().enumerate() {
+            for (k, s) in t.segs.iter().enumerate() {
+                let b = s.bounding_box();
+                let ((x0, y0), (x1, y1)) = (grid.cell_of(Point::new(b.x0, b.y0)), grid.cell_of(Point::new(b.x1, b.y1)));
+                if (x1 - x0 + 1).saturating_mul(y1 - y0 + 1) > GAP_GRID_SPAN {
+                    grid.wide.push((j, k));
+                    continue;
+                }
+                for x in x0..=x1 {
+                    for y in y0..=y1 {
+                        grid.cells.entry((x, y)).or_default().push((j, k));
+                    }
+                }
+            }
+        }
+        grid
+    }
+
+    /// The cell `p` is in, counted from the origin (at most [`GAP_GRID_LIMIT`] cells away on each
+    /// axis).
+    fn cell_of(&self, p: Point) -> (i64, i64) {
+        let at = |v: f64, o: f64| ((v - o) / self.cell).floor().clamp(-GAP_GRID_LIMIT, GAP_GRID_LIMIT) as i64;
+        (at(p.x, self.origin.x), at(p.y, self.origin.y))
+    }
+
+    /// The segments whose bounds come within `r` of `p` (and some farther ones), each once, in
+    /// track order.
+    fn near(&self, p: Point, r: f64) -> Vec<(usize, usize)> {
+        let mut out = self.wide.clone();
+        let ((x0, y0), (x1, y1)) = (self.cell_of(Point::new(p.x - r, p.y - r)), self.cell_of(Point::new(p.x + r, p.y + r)));
+        for x in x0..=x1 {
+            for y in y0..=y1 {
+                out.extend(self.cells.get(&(x, y)).into_iter().flatten());
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
+/// The point a gap from the loose end `e` of track `own` (at `from` along it) closes to: the
+/// nearest point of any path within `max_gap` of it, leaving out points the paths already join to
+/// `e` along a way less than [`GAP_DETOUR`] times as long as the gap. None when there is no such
+/// point, or when `e` lies on a path (it is no loose end).
+fn gap_from(tracks: &[Track], grid: &SegGrid, own: usize, e: Point, from: f64, max_gap: f64, eps: f64) -> Option<Point> {
+    use kurbo::ParamCurveNearest;
+    let o = tracks.get(own)?;
+    let reach = GAP_DETOUR * max_gap;
+    let mut best: Option<(f64, Point)> = None;
+    // `around` holds the segments a way of up to `reach` from `e` can cross, and `crossed` the
+    // crossings with each track.
+    let mut around: Option<Vec<(usize, usize)>> = None;
+    let mut crossed: HashMap<usize, Vec<(f64, f64)>> = HashMap::new();
+    for (j, k) in grid.near(e, max_gap) {
+        let Some(q) = tracks.get(j) else { continue };
+        let Some(s) = q.segs.get(k) else { continue };
+        let b = s.bounding_box();
+        if e.x < b.x0 - max_gap || e.x > b.x1 + max_gap || e.y < b.y0 - max_gap || e.y > b.y1 + max_gap {
+            continue;
+        }
+        let near = s.nearest(e, 1e-9);
+        let d = near.distance_sq.sqrt();
+        if d > max_gap {
+            continue;
+        }
+        let at = q.pos(k, near.t);
+        let way = if j == own {
+            o.along(from, at)
+        } else {
+            let xs = crossed.entry(j).or_insert_with(|| {
+                let segs = around.get_or_insert_with(|| grid.near(e, reach + max_gap));
+                crossings(o, from, reach, q, segs.iter().filter(|c| c.0 == j).map(|c| c.1))
+            });
+            xs.iter().map(|&(a, b)| o.along(from, a) + q.along(b, at)).fold(f64::INFINITY, f64::min)
+        };
+        if d <= eps {
+            // On another path, or on its own away from the end: the end is joined there.
+            if j != own || way > 4.0 * eps.max(GAP_ARC_ACCURACY) {
+                return None;
+            }
+            // The end's own segment: a curve that comes back round can still pass near it.
+            for i in 0..=GAP_SAMPLES {
+                let t = f64::from(i) / f64::from(GAP_SAMPLES);
+                let p = s.eval(t);
+                let d = p.distance(e);
+                if d > eps && d <= max_gap && o.along(from, q.pos(k, t)) > GAP_DETOUR * d && best.is_none_or(|b| d < b.0) {
+                    best = Some((d, p));
+                }
+            }
+            continue;
+        }
+        if way > GAP_DETOUR * d && best.is_none_or(|b| d < b.0) {
+            best = Some((d, s.eval(near.t)));
+        }
+    }
+    best.map(|b| b.1)
+}
+
+/// The gaps Live Paint's Gap Detection closes in `shapes`: from each loose end of an open subpath
+/// (an end that lies on no path) to the nearest point of any path, its own included, at most
+/// `max_gap` away, unless the paths already join the two along a way less than [`GAP_DETOUR`] times
+/// the gap's length. Each gap is a pair of points: the loose end, then where it closes to. A gap
+/// between two loose ends that close to each other is listed once.
+pub fn find_gaps(shapes: &[Shape], max_gap: f64) -> Vec<[Point; 2]> {
+    if !(max_gap.is_finite() && max_gap > 0.0) {
+        return vec![];
+    }
+    let tracks: Vec<Track> = shapes.iter().flat_map(|s| &s.path.subpaths).filter_map(Track::new).collect();
+    let eps = (max_gap * 1e-4).max(1e-6);
+    // The grid cells are as wide as the gap, or 1/4096 of the art where that is wider.
+    let bounds = tracks.iter().map(|t| t.bounds).reduce(|a, b| a.union(b)).unwrap_or_default();
+    let grid = SegGrid::new(&tracks, bounds.origin(), max_gap.max(bounds.width().max(bounds.height()) / 4096.0));
+    let mut gaps: Vec<[Point; 2]> = vec![];
+    // `by_end` lists the gaps by the cell of their loose end.
+    let mut by_end: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    for (i, o) in tracks.iter().enumerate() {
+        let (Some(first), Some(last)) = (o.segs.first(), o.segs.last()) else { continue };
+        // An open subpath that ends where it starts encloses its area already.
+        if o.closed || first.start().distance(last.end()) <= eps {
+            continue;
+        }
+        for (e, from) in [(first.start(), 0.0), (last.end(), o.len())] {
+            let Some(to) = gap_from(&tracks, &grid, i, e, from, max_gap, eps) else { continue };
+            let (cx, cy) = grid.cell_of(to);
+            let listed = (cx - 1..=cx + 1)
+                .flat_map(|x| (cy - 1..=cy + 1).map(move |y| (x, y)))
+                .filter_map(|c| by_end.get(&c))
+                .flatten()
+                .filter_map(|&g| gaps.get(g))
+                .any(|g| g[0].distance(to) <= eps && g[1].distance(e) <= eps);
+            if !listed {
+                by_end.entry(grid.cell_of(e)).or_default().push(gaps.len());
+                gaps.push([e, to]);
+            }
+        }
+    }
+    gaps
+}
+
+/// Most segments the Shape Builder sweeps into its planar map (open paths as edges, the gaps closed
+/// paths enclose, outline edges): the map costs far more than the filled areas' arrangement, so past
+/// this only the filled areas count.
 pub const SHAPE_BUILDER_MAX_SEGMENTS: usize = 4096;
 
 /// The Shape Builder's arrangement: see [`shape_builder`].
@@ -308,20 +596,26 @@ pub struct BuilderArrangement {
     pub edges: Vec<Shape>,
 }
 
+/// Does any of `shapes` have an open subpath (a cutting edge for the Shape Builder)?
+pub fn has_open_path(shapes: &[Shape]) -> bool {
+    shapes.iter().flat_map(|s| &s.path.subpaths).any(|sp| !sp.closed && sp.anchors.len() >= 2)
+}
+
 /// Shape Builder regions of `shapes` (back → front), the pieces of their open paths and, with
 /// `edges`, the pieces of their outlines (what erasing an edge deletes).
 ///
-/// Closed paths bound regions with their filled areas, as in [`regions`](crate::regions). Open
-/// paths (the caller closes the ones whose fill should count) are cutting edges: a line across a
-/// shape splits it, lines around an area enclose a region nothing fills (empty `sources`), and each
-/// path with no closed subpath comes back cut wherever another path meets it, as pieces keyed by
-/// its index in `shapes`. Outlines are cut the same way. With no open path, more than
+/// Closed paths bound regions with their filled areas, as in [`regions`](crate::regions), and the
+/// gaps they enclose that nothing fills are regions too (empty `sources`), such as the middle of
+/// four circles that touch (#1691). Open paths (the caller closes the ones whose fill should count)
+/// are cutting edges: a line across a shape splits it, lines around an area enclose a region
+/// nothing fills, and each path with no closed subpath comes back cut wherever another path meets
+/// it, as pieces keyed by its index in `shapes`. Outlines are cut the same way. With more than
 /// [`SHAPE_BUILDER_MAX_SEGMENTS`] segments or a map that can't be built, only the filled areas
 /// count and there are no pieces.
 pub fn shape_builder(shapes: &[Shape], edges: bool) -> BuilderArrangement {
-    let has_open = shapes.iter().flat_map(|s| &s.path.subpaths).any(|sp| !sp.closed && sp.anchors.len() >= 2);
+    let has_open = has_open_path(shapes);
     let segments: usize = shapes.iter().flat_map(|s| &s.path.subpaths).map(|sp| sp.segment_count()).sum();
-    let planar = ((has_open || edges) && segments <= SHAPE_BUILDER_MAX_SEGMENTS)
+    let planar = (segments <= SHAPE_BUILDER_MAX_SEGMENTS)
         .then(|| {
             let keyed: Vec<Shape> = shapes.iter().enumerate().map(|(i, s)| Shape::new(s.path.clone(), s.rule, i as u64)).collect();
             live_paint(&keyed)
@@ -332,11 +626,15 @@ pub fn shape_builder(shapes: &[Shape], edges: bool) -> BuilderArrangement {
     };
     let is_line = |i: u64| shapes.get(i as usize).is_some_and(|s| !s.path.subpaths.iter().any(|sp| sp.closed));
     let (lines, outline): (Vec<Shape>, Vec<Shape>) = pieces.into_iter().partition(|e| is_line(e.key));
-    BuilderArrangement {
-        regions: if has_open { faces } else { crate::regions(shapes) },
-        lines: if has_open { lines } else { Vec::new() },
-        edges: if edges { outline } else { Vec::new() },
-    }
+    let regions = if has_open {
+        faces
+    } else {
+        // The filled areas from their arrangement, whose faces merge exactly, then the gaps.
+        let mut regions = crate::regions(shapes);
+        regions.extend(faces.into_iter().filter(|f| f.sources.is_empty()));
+        regions
+    };
+    BuilderArrangement { regions, lines: if has_open { lines } else { Vec::new() }, edges: if edges { outline } else { Vec::new() } }
 }
 
 /// Does `sp`, closed, enclose an area (rather than retrace itself)? The Shape Builder closes the
@@ -465,7 +763,24 @@ fn span(sp: &SubPath, u0: f64, u1: f64) -> Option<SubPath> {
     segs_to_subpath(&segs, false)
 }
 
-fn build(shapes: &[Shape]) -> Option<(Vec<Region>, Vec<Shape>)> {
+/// The planar graph of `shapes` (in the sweep's frame) with its faces walked: what [`build`] makes
+/// Live Paint faces and edges from, and what [`Map::merge`] merges faces in.
+pub(crate) struct Map {
+    edges: Vec<Edge>,
+    around: Vec<Vec<usize>>,
+    slot_of: Vec<usize>,
+    /// Bounded faces: their cycle of half-edges, path and area.
+    faces: Vec<(Vec<usize>, BezPath, f64)>,
+    /// Outer boundaries of connected pieces, and the face each one is a hole in.
+    holes: Vec<(Vec<usize>, BezPath)>,
+    face_holes: Vec<Vec<usize>>,
+    tidy: Tidy,
+    /// The inputs' anchors (sorted by x) and how close results snap back onto them.
+    anchors: Vec<Point>,
+    snap: f64,
+}
+
+pub(crate) fn map(shapes: &[Shape]) -> Option<Map> {
     let mut inputs: Vec<(BezPath, usize)> = Vec::new();
     for (i, s) in shapes.iter().enumerate() {
         let mut bp = BezPath::new();
@@ -515,16 +830,65 @@ fn build(shapes: &[Shape]) -> Option<(Vec<Region>, Vec<Shape>)> {
             points.len() - 1
         })
     };
+    let mut pieces: Vec<(Vec<Seg>, [usize; 2])> = Vec::new();
+    for idx in top.segment_indices() {
+        let segs: Vec<Seg> = positions[idx].path.segments().map(to_seg).collect();
+        let ends = [vertex_id(top.point(idx.first_half()).to_kurbo()), vertex_id(top.point(idx.second_half()).to_kurbo())];
+        if !segs.is_empty() && ends[0] != ends[1] {
+            pieces.push((segs, ends));
+        }
+    }
+    // The sweep can cut the paths through one crossing at points more than `eps` apart, so copies of
+    // one edge (such as an open path's two passes) can end on different vertices. Pieces whose
+    // middles and ends lie within `tol` of each other are such copies, and their ends are one vertex.
+    let tol = 16.0 * eps;
+    let cell_of = |p: Point| ((p.x / tol).floor() as i64, (p.y / tol).floor() as i64);
+    let mids: Vec<Option<Point>> = pieces.iter().map(|(segs, _)| mid(segs)).collect();
+    let mut by_mid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    for (k, m) in mids.iter().enumerate() {
+        if let Some(m) = m {
+            by_mid.entry(cell_of(*m)).or_default().push(k);
+        }
+    }
+    let close = |a: usize, b: usize| matches!((points.get(a), points.get(b)), (Some(p), Some(q)) if p.distance(*q) <= tol);
+    let mut joined: Vec<usize> = (0..points.len()).collect();
+    for (k, (_, [a, b])) in pieces.iter().enumerate() {
+        let Some(&Some(m)) = mids.get(k) else { continue };
+        let (cx, cy) = cell_of(m);
+        let others = (cx - 1..=cx + 1).flat_map(|x| (cy - 1..=cy + 1).map(move |y| (x, y))).filter_map(|c| by_mid.get(&c)).flatten();
+        for &j in others.filter(|&&j| j > k) {
+            let (Some((_, [c, d])), Some(&Some(n))) = (pieces.get(j), mids.get(j)) else { continue };
+            if m.distance(n) > tol {
+                continue;
+            }
+            let pairs = if close(*a, *c) && close(*b, *d) {
+                [(*a, *c), (*b, *d)]
+            } else if close(*a, *d) && close(*b, *c) {
+                [(*a, *d), (*b, *c)]
+            } else {
+                continue;
+            };
+            for (x, y) in pairs {
+                let (x, y) = (find(&mut joined, x), find(&mut joined, y));
+                if let Some(r) = joined.get_mut(x.max(y)) {
+                    *r = x.min(y);
+                }
+            }
+        }
+    }
     let mut edges: Vec<Edge> = Vec::new();
     let mut between: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
     let outlines = Outlines::new(&inputs, eps);
-    for idx in top.segment_indices() {
-        let half = idx.first_half();
-        let segs: Vec<Seg> = positions[idx].path.segments().map(to_seg).collect();
-        let ends = [vertex_id(top.point(half).to_kurbo()), vertex_id(top.point(idx.second_half()).to_kurbo())];
-        if segs.is_empty() || ends[0] == ends[1] {
+    for (mut segs, ends) in pieces {
+        let ends = ends.map(|v| find(&mut joined, v));
+        let (Some(&p0), Some(&p1)) = (points.get(ends[0]), points.get(ends[1])) else { continue };
+        if ends[0] == ends[1] {
             continue;
         }
+        // Every edge at a vertex starts or ends exactly on it, so faces meeting there share its
+        // coordinates: merging them (a union) then cancels their common edge, which it can't when
+        // each face carries its own rounding of the corner (#893).
+        pin_ends(&mut segs, p0, p1);
         let Some(source) = mid(&segs).and_then(|m| outlines.source_at(m)) else { continue };
         // Coincident pieces the sweep left apart are one edge (the front-most input's).
         let key = (ends[0].min(ends[1]), ends[0].max(ends[1]));
@@ -637,22 +1001,89 @@ fn build(shapes: &[Shape]) -> Option<(Vec<Region>, Vec<Shape>)> {
         }
     }
 
-    let fills: Vec<Fill> = shapes.iter().map(Fill::new).collect();
     // The inputs' anchors, which results land on again up to the sweep's tolerance.
     let snap = 2.0 * eps;
     let mut anchors: Vec<Point> = shapes.iter().flat_map(|s| s.path.subpaths.iter().flat_map(|sp| sp.anchors.iter().map(|a| a.p))).collect();
     anchors.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+    Some(Map { edges, around, slot_of, faces, holes, face_holes, tidy, anchors, snap })
+}
+
+impl Map {
+    /// The union of the faces that hold `inside` (document points, one per face), traced along the
+    /// map's own edges: those between two merged faces drop out exactly, where a boolean union of
+    /// the faces' outlines can leave them in when its sweep rounds their shared corners apart
+    /// (#893). Outer outlines come out positive, holes negative. None when a point is in no face.
+    pub(crate) fn merge(&self, inside: &[Point]) -> Option<PathData> {
+        let halves = 2 * self.edges.len();
+        // The face on each half-edge's side; holes bound the face around them.
+        let mut face_of: Vec<Option<usize>> = vec![None; halves];
+        for (i, (cycle, ..)) in self.faces.iter().enumerate() {
+            let hole_cycles = self.face_holes.get(i)?.iter().filter_map(|&k| self.holes.get(k)).map(|(c, _)| c);
+            for &h in std::iter::once(cycle).chain(hole_cycles).flatten() {
+                *face_of.get_mut(h)? = Some(i);
+            }
+        }
+        let mut picked = vec![false; self.faces.len()];
+        for &p in inside {
+            let q = SHEAR * p;
+            // The smallest face around it: faces of a piece inside a hole lie within the face around.
+            let (i, _) = self
+                .faces
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, bp, _))| bp.bounding_box().contains(q) && bp.winding(q) != 0)
+                .min_by(|a, b| a.1.2.total_cmp(&b.1.2))?;
+            *picked.get_mut(i)? = true;
+        }
+        let merged = |h: usize| face_of.get(h).copied().flatten().is_some_and(|f| picked.get(f) == Some(&true));
+        let boundary = |h: usize| merged(h) && !merged(twin(h));
+        let mut used = vec![false; halves];
+        let mut subpaths = Vec::new();
+        for start in 0..halves {
+            if !boundary(start) || used.get(start).copied().unwrap_or(true) {
+                continue;
+            }
+            let mut cycle = vec![];
+            let mut h = start;
+            while !used.get(h).copied().unwrap_or(true) {
+                if let Some(u) = used.get_mut(h) {
+                    *u = true;
+                }
+                cycle.push(h);
+                // Turn from the way back as a face walk does, past the edges inside the merged
+                // faces (between two of them, or a line's loose end), to the next boundary edge.
+                let back = twin(h);
+                let list = self.around.get(origin(&self.edges, back)?)?;
+                let k = *self.slot_of.get(back)?;
+                let n = list.len();
+                h = (1..=n).filter_map(|j| list.get((k + n * 2 - j) % n).copied()).find(|&g| boundary(g))?;
+            }
+            if h != start {
+                return None;
+            }
+            let segs: Vec<Seg> = cycle.iter().flat_map(|&h| half_segs(&self.edges, h)).collect();
+            subpaths.push(segs_to_subpath(&tidy_segments(segs, true, &self.tidy), true)?);
+        }
+        (!subpaths.is_empty()).then(|| unshear(PathData::new(subpaths), &self.anchors, self.snap))
+    }
+}
+
+fn build(shapes: &[Shape]) -> Option<(Vec<Region>, Vec<Shape>)> {
+    let m = map(shapes)?;
+    let Map { edges, around, faces, holes, face_holes, tidy, anchors, snap, .. } = &m;
+    let snap = *snap;
+    let fills: Vec<Fill> = shapes.iter().map(Fill::new).collect();
     let subpath = |cycle: &[usize]| {
-        let segs: Vec<Seg> = cycle.iter().flat_map(|&h| half_segs(&edges, h)).collect();
-        segs_to_subpath(&tidy_segments(segs, true, &tidy), true)
+        let segs: Vec<Seg> = cycle.iter().flat_map(|&h| half_segs(edges, h)).collect();
+        segs_to_subpath(&tidy_segments(segs, true, tidy), true)
     };
     let regions = faces
         .iter()
-        .zip(&face_holes)
+        .zip(face_holes)
         .filter_map(|((cycle, _, _), hs)| {
             let mut subpaths = vec![subpath(cycle)?];
             subpaths.extend(hs.iter().filter_map(|&k| holes.get(k)).filter_map(|(c, _)| subpath(c)));
-            let path = unshear(PathData::new(subpaths), &anchors, snap);
+            let path = unshear(PathData::new(subpaths), anchors, snap);
             let sources =
                 interior_point(&path).map(|p| fills.iter().enumerate().filter(|(_, f)| f.contains(p)).map(|(i, _)| i).collect()).unwrap_or_default();
             Some(Region { path, sources })
@@ -680,13 +1111,13 @@ fn build(shapes: &[Shape]) -> Option<(Vec<Region>, Vec<Shape>)> {
                 return Some((segs, true, source));
             }
             *u = true;
-            segs.extend(half_segs(&edges, h));
-            let v = origin(&edges, twin(h))?;
-            let Some((a, b)) = passes(v) else { return Some((segs, origin(&edges, h0) == Some(v), source)) };
+            segs.extend(half_segs(edges, h));
+            let v = origin(edges, twin(h))?;
+            let Some((a, b)) = passes(v) else { return Some((segs, origin(edges, h0) == Some(v), source)) };
             h = if a == twin(h) { b } else { a };
         }
     };
-    for v in 0..nv {
+    for v in 0..around.len() {
         if passes(v).is_some() {
             continue;
         }
@@ -709,8 +1140,8 @@ fn build(shapes: &[Shape]) -> Option<(Vec<Region>, Vec<Shape>)> {
     let edge_shapes = chains
         .into_iter()
         .filter_map(|(segs, closed, source)| {
-            let sp = segs_to_subpath(&tidy_segments(segs, closed, &tidy), closed)?;
-            Some(Shape::new(unshear(PathData::new(vec![sp]), &anchors, snap), FillRule::NonZero, shapes.get(source)?.key))
+            let sp = segs_to_subpath(&tidy_segments(segs, closed, tidy), closed)?;
+            Some(Shape::new(unshear(PathData::new(vec![sp]), anchors, snap), FillRule::NonZero, shapes.get(source)?.key))
         })
         .collect();
     Some((regions, edge_shapes))
@@ -801,6 +1232,101 @@ mod tests {
         // Each line is cut where the others cross it: 3 + 3 + 3 pieces.
         assert_eq!(edges.len(), 9);
         assert_eq!(edges.iter().filter(|e| e.key == 2).count(), 3);
+    }
+
+    fn open(points: &[(f64, f64)], key: u64) -> Shape {
+        let pts: Vec<Point> = points.iter().map(|&(x, y)| Point::new(x, y)).collect();
+        Shape::new(PathData::single(SubPath::polyline(&pts, false)), FillRule::NonZero, key)
+    }
+
+    #[test]
+    fn gap_detection_closes_a_square_drawn_with_a_gap() {
+        // One open path round a square, its end 2 pt short of its start.
+        let s = [open(&[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0), (0.0, 2.0)], 0)];
+        assert!(live_paint(&s).0.is_empty(), "paint leaks through the gap");
+        let (faces, edges, gaps) = live_paint_with_gaps(&s, 3.0);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        let g = gaps[0];
+        assert!(g[0].distance(Point::new(0.0, 0.0)) < 1e-9 && g[1].distance(Point::new(0.0, 2.0)) < 1e-6, "{g:?}");
+        assert_eq!(faces.len(), 1, "{faces:?}");
+        assert!((area(&faces[0]) - 10000.0).abs() < 1e-6, "{}", area(&faces[0]));
+        assert_eq!(edges, live_paint(&s).1, "the gap adds no edge");
+        // A gap wider than the size stays open.
+        let (faces, _, gaps) = live_paint_with_gaps(&s, 1.5);
+        assert!(faces.is_empty() && gaps.is_empty());
+    }
+
+    #[test]
+    fn gaps_close_to_curves_and_between_paths() {
+        // A line across a circle, each end 2 pt short of it: the circle splits in two.
+        let circle = Shape::new(shapes::ellipse(Rect::new(50.0, 0.0, 150.0, 100.0)), FillRule::NonZero, 0);
+        let s = [circle, line((52.0, 50.0), (148.0, 50.0), 1)];
+        assert_eq!(live_paint(&s).0.len(), 1);
+        let (faces, _, gaps) = live_paint_with_gaps(&s, 3.0);
+        assert_eq!(gaps.len(), 2, "{gaps:?}");
+        for g in &gaps {
+            assert!((g[0].distance(g[1]) - 2.0).abs() < 1e-6, "{g:?}");
+        }
+        assert_eq!(faces.len(), 2, "{faces:?}");
+        assert_eq!(at(&faces, 100.0, 25.0).len(), 1);
+        assert_eq!(at(&faces, 100.0, 75.0).len(), 1);
+        // Four lines round a square whose corners miss by 1 pt: the gaps are listed once each.
+        let s = [
+            line((0.0, 0.0), (99.0, 0.0), 0),
+            line((100.0, 1.0), (100.0, 99.0), 1),
+            line((99.0, 100.0), (1.0, 100.0), 2),
+            line((0.0, 99.0), (0.0, 1.0), 3),
+        ];
+        let (faces, _, gaps) = live_paint_with_gaps(&s, 3.0);
+        assert_eq!(gaps.len(), 4, "{gaps:?}");
+        assert_eq!(faces.len(), 1, "{faces:?}");
+        // One curve that comes back round to 2 pt from its start.
+        let mut bp = BezPath::new();
+        bp.move_to((0.0, 0.0));
+        bp.curve_to((100.0, 0.0), (100.0, 100.0), (0.0, 2.0));
+        let s = [Shape::new(PathData::from_bezpath(&bp), FillRule::NonZero, 0)];
+        let (faces, _, gaps) = live_paint_with_gaps(&s, 3.0);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!((gaps[0][0].distance(gaps[0][1]) - 2.0).abs() < 1e-9, "{gaps:?}");
+        assert_eq!(faces.len(), 1, "{faces:?}");
+        // A line far longer than the gap, and many lines far from each other.
+        let mut s = vec![line((0.0, 0.0), (100000.0, 0.0), 0), line((50000.0, 2.0), (50000.0, 100.0), 1)];
+        s.extend((0..2000).map(|k| {
+            let (x, y) = (f64::from(k % 50) * 40.0, 1000.0 + f64::from(k / 50) * 40.0);
+            line((x, y), (x + 10.0, y), 2)
+        }));
+        let gaps = find_gaps(&s, 3.0);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0][0].distance(Point::new(50000.0, 2.0)) < 1e-9 && gaps[0][1].distance(Point::new(50000.0, 0.0)) < 1e-9, "{gaps:?}");
+        // Paths far from the origin: one gap between two loose ends, listed once.
+        let s = [line((1e20, 0.0), (1e20, 100.0), 0), line((1e20, 102.0), (1e20, 200.0), 1)];
+        assert_eq!(find_gaps(&s, 3.0).len(), 1, "{:?}", find_gaps(&s, 3.0));
+    }
+
+    #[test]
+    fn overshoots_and_joined_ends_are_no_gaps() {
+        // Ends that cross a line just before they stop, square to it and at 30 degrees.
+        let t = 30f64.to_radians();
+        let s = [
+            line((-10.0, 0.0), (110.0, 0.0), 0),
+            line((20.0, 100.0), (20.0, -1.0), 1),
+            line((80.0 + 100.0 * t.cos(), 100.0 * t.sin()), (80.0 - t.cos(), -t.sin()), 2),
+        ];
+        assert!(find_gaps(&s, 3.0).is_empty(), "{:?}", find_gaps(&s, 3.0));
+        // An end on another path, or on its own, is joined there.
+        let s = [line((0.0, 0.0), (100.0, 0.0), 0), line((50.0, 0.0), (50.0, 100.0), 1)];
+        assert!(find_gaps(&s, 3.0).is_empty(), "{:?}", find_gaps(&s, 3.0));
+        // Another path 2 pt away does not make a gap from the joined end.
+        let s = [line((0.0, 0.0), (100.0, 0.0), 0), line((50.0, 0.0), (50.0, 100.0), 1), line((40.0, -2.0), (60.0, -2.0), 2)];
+        let gaps = find_gaps(&s, 3.0);
+        assert!(!gaps.is_empty() && gaps.iter().all(|g| g[0].distance(Point::new(50.0, 0.0)) > 1e-9), "{gaps:?}");
+        let six = [open(&[(0.0, 0.0), (0.0, 100.0), (50.0, 100.0), (50.0, 50.0), (0.0, 50.0)], 0)];
+        assert!(find_gaps(&six, 3.0).is_empty(), "{:?}", find_gaps(&six, 3.0));
+        // Sizes that are not a length find nothing.
+        let square = [open(&[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0), (0.0, 2.0)], 0)];
+        for size in [0.0, -3.0, f64::NAN, f64::INFINITY] {
+            assert!(find_gaps(&square, size).is_empty(), "{size}");
+        }
     }
 
     #[test]
@@ -913,6 +1439,92 @@ mod tests {
         assert_eq!(edges.len(), 1);
     }
 
+    /// A strip merged across an axonometric grid of lines (#893, the reporter's file): faces meeting
+    /// at a vertex share its exact coordinates, so the merge is one outline with no edge left inside.
+    #[test]
+    fn faces_share_their_corners_exactly_so_merging_them_leaves_no_seam() {
+        const LINES: &[[f64; 4]] = &[
+            [416.57797027866155, 268.45362144397683, 416.5779702786616, 811.5463785560231],
+            [243.12292300414873, 511.1134238473054, 713.4550472745127, 782.6598024033286],
+            [836.8770769958512, 511.1134238473054, 366.5449527254871, 782.6598024033286],
+            [457.718646852441, 268.45362144397683, 457.718646852441, 811.5463785560231],
+            [263.6932612910385, 475.4845528055331, 734.0253855614023, 747.0309313615563],
+            [816.3067387089613, 475.4845528055331, 345.9746144385975, 747.0309313615563],
+            [498.85932342622044, 268.45362144397683, 498.85932342622044, 811.5463785560231],
+            [284.26359957792823, 439.8556817637607, 754.5957238482922, 711.4020603197839],
+            [795.7364004220717, 439.8556817637607, 325.40427615170773, 711.4020603197839],
+            [539.9999999999998, 268.45362144397683, 539.9999999999998, 811.5463785560231],
+            [304.83393786481787, 404.22681072198844, 775.1660621351818, 675.7731892780117],
+            [775.1660621351821, 404.22681072198844, 304.833937864818, 675.7731892780117],
+            [581.1406765737793, 268.45362144397683, 581.1406765737793, 811.5463785560231],
+            [325.4042761517076, 368.59793968021614, 795.7364004220715, 640.1443182362394],
+            [754.5957238482922, 368.59793968021614, 284.26359957792835, 640.1443182362394],
+            [622.2813531475588, 268.45362144397683, 622.2813531475588, 811.5463785560231],
+            [345.97461443859737, 332.9690686384438, 816.3067387089613, 604.515447194467],
+            [734.0253855614026, 332.9690686384438, 263.6932612910385, 604.515447194467],
+            [663.422029721338, 268.45362144397683, 663.422029721338, 811.5463785560231],
+            [366.54495272548706, 297.3401975966715, 836.877076995851, 568.8865761526947],
+            [713.4550472745128, 297.3401975966715, 243.12292300414884, 568.8865761526947],
+        ];
+        let s: Vec<Shape> = LINES.iter().enumerate().map(|(i, &[x0, y0, x1, y1])| line((x0, y0), (x1, y1), i as u64)).collect();
+        let (faces, _) = live_paint(&s);
+        let corners: Vec<Point> = faces.iter().flat_map(|f| f.path.subpaths.iter().flat_map(|sp| sp.anchors.iter().map(|a| a.p))).collect();
+        for p in &corners {
+            for q in &corners {
+                assert!(p == q || p.distance(*q) > 1e-6, "one corner, two positions: {p:?} {q:?}");
+            }
+        }
+        // Down the strip between the lines x ≈ 498.9 and x = 540: 11 triangles, one outline.
+        let mut strip: Vec<&Region> = vec![];
+        for k in 0..=240 {
+            if let Some(f) = faces.iter().find(|f| f.contains(Point::new(519.43, 420.0 + f64::from(k))))
+                && !strip.iter().any(|g| std::ptr::eq(*g, f))
+            {
+                strip.push(f);
+            }
+        }
+        assert_eq!(strip.len(), 11);
+        // As the Shape Builder merges them: in the map, so no sweep can round the corners apart.
+        let merged = crate::FaceMerger::new(&s).merge(&strip);
+        assert_eq!(merged.subpaths.len(), 1, "{merged:?}");
+        let want: f64 = strip.iter().map(|f| area(f)).sum();
+        assert!((crate::area(&merged, FillRule::NonZero) - want).abs() < 1e-6 * want);
+    }
+
+    /// Merging faces of a grid of lines in the map: a ring keeps its hole, cells that only touch at
+    /// a corner stay two outlines, a line's loose end inside the merge leaves no spur.
+    #[test]
+    fn faces_merge_in_the_map_with_holes_corners_and_loose_ends() {
+        let mut s = vec![];
+        for k in 0..4 {
+            let v = f64::from(k) * 10.0;
+            s.push(line((v, -5.0), (v, 35.0), 0));
+            s.push(line((-5.0, v), (35.0, v), 1));
+        }
+        // A loose end poking into the middle cell.
+        s.push(line((15.0, 10.0), (15.0, 15.0), 2));
+        let (faces, _) = live_paint(&s);
+        let cell = |x: f64, y: f64| at(&faces, x, y)[0];
+        let merger = crate::FaceMerger::new(&s);
+        let m = map(&s).unwrap();
+        let check = |picked: &[&Region], subpaths: usize, area_want: f64| {
+            // Merged in the map itself, not by the fallback union.
+            let inside: Vec<Point> = picked.iter().map(|f| interior_point(&f.path).unwrap()).collect();
+            assert_eq!(m.merge(&inside).as_ref(), Some(&merger.merge(picked)));
+            let m = merger.merge(picked);
+            assert_eq!(m.subpaths.len(), subpaths, "{m:?}");
+            assert!((crate::area(&m, FillRule::NonZero) - area_want).abs() < 1e-6, "{}", crate::area(&m, FillRule::NonZero));
+            m
+        };
+        let all: Vec<&Region> = faces.iter().collect();
+        let whole = check(&all, 1, 900.0);
+        assert_eq!(whole.subpaths[0].anchors.len(), 4, "one square, no anchors left from the inner lines or the loose end");
+        let ring: Vec<&Region> =
+            [(5., 5.), (15., 5.), (25., 5.), (5., 15.), (25., 15.), (5., 25.), (15., 25.), (25., 25.)].iter().map(|&(x, y)| cell(x, y)).collect();
+        check(&ring, 2, 800.0);
+        check(&[cell(5.0, 5.0), cell(15.0, 15.0)], 2, 200.0);
+    }
+
     #[test]
     fn shape_builder_lines_cut_regions() {
         // A line across a rectangle: two regions, the line in three pieces keyed by its index.
@@ -949,6 +1561,43 @@ mod tests {
         assert!((regions.iter().map(area).sum::<f64>() - 10000.0).abs() < 1e-6);
     }
 
+    fn circle(cx: f64, cy: f64, r: f64, key: u64) -> Shape {
+        Shape::new(shapes::ellipse(Rect::new(cx - r, cy - r, cx + r, cy + r)), FillRule::NonZero, key)
+    }
+
+    #[test]
+    fn shape_builder_offers_the_gaps_closed_shapes_enclose() {
+        // Four circles in a 2×2 grid, each touching its neighbours (#1691): the four circles and
+        // the diamond between them, which nothing fills.
+        let s = [circle(50.0, 50.0, 50.0, 0), circle(150.0, 50.0, 50.0, 1), circle(50.0, 150.0, 50.0, 2), circle(150.0, 150.0, 50.0, 3)];
+        let regions = shape_builder(&s, false).regions;
+        assert_eq!(regions.len(), 5, "{regions:?}");
+        let gaps: Vec<&Region> = regions.iter().filter(|r| r.sources.is_empty()).collect();
+        assert_eq!(gaps.len(), 1);
+        assert!(gaps[0].contains(Point::new(100.0, 100.0)) && !gaps[0].contains(Point::new(50.0, 50.0)));
+        let diamond = 10000.0 - std::f64::consts::PI * 2500.0;
+        assert!((area(gaps[0]).abs() - diamond).abs() < 0.01 * diamond, "{}", area(gaps[0]));
+        assert_eq!(shape_builder(&s, true).regions, regions, "the outline edges don't change them");
+        // A ring of four bars that overlap at the corners: the eight pieces of the bars and the
+        // square they enclose.
+        let s =
+            [rect(0.0, 0.0, 300.0, 100.0, 0), rect(200.0, 0.0, 300.0, 300.0, 1), rect(0.0, 200.0, 300.0, 300.0, 2), rect(0.0, 0.0, 100.0, 300.0, 3)];
+        let regions = shape_builder(&s, false).regions;
+        assert_eq!(regions.len(), 9, "{regions:?}");
+        let gaps: Vec<&Region> = regions.iter().filter(|r| r.sources.is_empty()).collect();
+        assert_eq!(gaps.len(), 1);
+        assert!((area(gaps[0]).abs() - 10000.0).abs() < 1e-6 && gaps[0].contains(Point::new(150.0, 150.0)));
+        // The gap merges with a bar in the planar map: the bar's piece and the square, no seam.
+        let merger = crate::FaceMerger::new(&s);
+        let bar = regions.iter().find(|r| r.sources == [0] && r.contains(Point::new(150.0, 50.0))).unwrap();
+        let merged = merger.merge(&[bar, gaps[0]]);
+        assert_eq!(merged.subpaths.len(), 1, "{merged:?}");
+        assert!((crate::area(&merged, FillRule::NonZero) - 20000.0).abs() < 1e-6);
+        // Shapes apart or overlapping without a hole enclose no gap.
+        let s = [circle(50.0, 50.0, 50.0, 0), circle(250.0, 50.0, 50.0, 1), rect(80.0, 0.0, 220.0, 60.0, 2)];
+        assert!(shape_builder(&s, false).regions.iter().all(|r| !r.sources.is_empty()));
+    }
+
     #[test]
     fn shape_builder_stays_quick_up_to_its_cap() {
         // A wavy ring of nearly the most segments the map takes, crossed by a few lines.
@@ -961,6 +1610,10 @@ mod tests {
             })
             .collect();
         let mut s = vec![Shape::new(PathData::single(SubPath::polyline(&ring, true)), FillRule::NonZero, 0)];
+        // Closed paths alone are swept for the gaps they enclose.
+        let started = std::time::Instant::now();
+        assert_eq!(shape_builder(&s, false).regions.len(), 1, "the ring encloses no gap");
+        assert!(started.elapsed().as_secs_f64() < 5.0, "{:?}", started.elapsed());
         for k in 0..4 {
             let y = -60.0 + 40.0 * f64::from(k);
             s.push(line((-150.0, y), (150.0, y + 7.0), 1));
@@ -1035,6 +1688,36 @@ mod tests {
         assert_eq!(cut.subpaths.len(), 2);
         assert!(cut.subpaths.iter().all(|sp| !sp.closed));
         assert!((cut.length() - 160.0).abs() < 1e-6, "{}", cut.length());
+    }
+
+    /// Proptest shrank a failure of `pieces_cut_out_of_their_inputs` to this input with linesweeper
+    /// 0.5. The sweep cuts lines 0 and 1 at points of their crossing up to 1.4 `eps` apart, and
+    /// `vertex_id` merges a point only into a vertex within `eps` of it. Line 0's loose end in the
+    /// square is still one piece, and erasing it shortens line 0 by its length only. No face or
+    /// merged outline runs out along it and back.
+    #[test]
+    fn a_loose_end_is_one_piece_when_the_sweep_cuts_its_passes_apart() {
+        let s = [line((30.0, 20.0), (70.0, 0.0), 0), line((40.0, 0.0), (0.0, 90.0), 1), rect(10.0, 0.0, 40.0, 30.0, 2)];
+        let arr = shape_builder(&s, true);
+        for key in 0..3 {
+            assert_eq!(arr.edges.iter().chain(&arr.lines).filter(|e| e.key == key).count(), 3, "pieces of {key}");
+        }
+        for e in arr.edges.iter().chain(&arr.lines) {
+            let input = &s[e.key as usize].path;
+            let cut = cut_out(input, &e.path.subpaths[0], false, 0.05).expect("on its input");
+            assert!((input.length() - cut.length() - e.path.length()).abs() < 1e-6, "{:?}", e.path);
+        }
+        // From (30,20) to the crossing at (220/7, 135/7).
+        let loose = arr.lines.iter().find(|l| l.path.subpaths[0].anchors.iter().any(|a| a.p == Point::new(30.0, 20.0))).expect("the loose end");
+        assert_eq!(loose.path.subpaths[0].anchors.len(), 2, "{:?}", loose.path);
+        assert!((loose.path.length() - 2000f64.sqrt() / 28.0).abs() < 1e-6, "{}", loose.path.length());
+        let (faces, _) = live_paint(&s);
+        let left = at(&faces, 15.0, 15.0);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].path.subpaths[0].anchors.len(), 4, "(10,0) (40,0) (26.67,30) (10,30): {:?}", left[0].path);
+        let merged = crate::FaceMerger::new(&s).merge(&faces.iter().collect::<Vec<_>>());
+        assert_eq!(merged.subpaths.len(), 1, "the square: {merged:?}");
+        assert_eq!(merged.subpaths[0].anchors.len(), 4, "{merged:?}");
     }
 
     fn arb_segment() -> impl Strategy<Value = Shape> {

@@ -739,9 +739,10 @@ pub struct Appearance {
     pub items: Vec<AppearanceItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<Effect>,
-    /// Groups, layers and type: how many items paint below the object's contents (its members, or
-    /// type's characters), the slot of the Appearance panel's Contents (Characters) row. `None`:
-    /// every item paints above the contents (see [`Self::contents_at`]).
+    /// Groups, layers, type and images: how many items paint below the object's contents (its
+    /// members, type's characters, or an image's pixels), the slot of the Appearance panel's
+    /// Contents (Characters) row. `None`: every item paints above the contents (see
+    /// [`Self::contents_at`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contents_index: Option<usize>,
 }
@@ -942,7 +943,7 @@ impl Appearance {
         })
     }
     /// Gradient paints of the fills and strokes.
-    fn gradients(&self) -> impl Iterator<Item = &vectorcraft_color::GradientPaint> {
+    pub(crate) fn gradients(&self) -> impl Iterator<Item = &vectorcraft_color::GradientPaint> {
         self.items.iter().filter_map(|i| match i {
             AppearanceItem::Fill(FillLayer { paint: Paint::Gradient(g), .. })
             | AppearanceItem::Stroke(StrokeLayer { paint: Paint::Gradient(g), .. }) => Some(&**g),

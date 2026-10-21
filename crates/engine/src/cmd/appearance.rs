@@ -15,14 +15,16 @@
 //! layer's own fills and strokes paint its members' geometry and its effects apply to them as one
 //! piece; the Contents row (type: Characters) is the slot that says which of its fills and strokes
 //! paint below the members and which above ([`Appearance::contents_at`], moved by
-//! `appearance.moveItem {from: "contents"}`).
+//! `appearance.moveItem {from: "contents"}`). An image's own fills and strokes paint only the
+//! shape that a Convert to Shape or Outline Object effect on them gives them, below or above the
+//! image as its Contents row says; new ones go right below that row.
 
 use serde_json::{Value, json};
 use vectorcraft_color::{BlendMode, Paint};
 use vectorcraft_doc::{Appearance, AppearanceItem, CharStyle, FillLayer, Node, NodeKind, ParaStyle, StrokeLayer};
 use vectorcraft_geom::Rect;
 
-use super::edit::selected_roots;
+use super::edit::{outermost, selected_roots};
 use super::opacitymask::percent;
 use super::paint::paint_from;
 use super::*;
@@ -35,8 +37,8 @@ pub fn specs() -> Vec<CommandSpec> {
             "appearance.addFill",
             "Add New Fill",
             ["Window", "Appearance"],
-            None,
-            "{ids?, target?: \"object\"|\"contents\"} add a fill on top of each selected object's own stack (a copy of its top fill; type without one: its characters' fill; else the default fill)",
+            Some("Cmd+/"),
+            "{ids?|id?, target?: \"object\"|\"contents\"} add a fill on top of each selected object's own stack, on an image right below its Contents row (a copy of its top fill; type without one: its characters' fill; else the default fill)",
             has_doc,
             |s, p| add_item(s, p, true)
         ),
@@ -44,8 +46,8 @@ pub fn specs() -> Vec<CommandSpec> {
             "appearance.addStroke",
             "Add New Stroke",
             ["Window", "Appearance"],
-            None,
-            "{ids?, target?} add a stroke on top of each selected object's own stack (a copy of its top stroke, else the default stroke)",
+            Some("Cmd+Alt+/"),
+            "{ids?|id?, target?} add a stroke on top of each selected object's own stack, on an image right below its Contents row (a copy of its top stroke, else the default stroke)",
             has_doc,
             |s, p| add_item(s, p, false)
         ),
@@ -54,7 +56,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Clear Appearance",
             ["Window", "Appearance"],
             None,
-            "{ids?, target?} leave each object one empty fill and stroke (None; a group none of its own) and reset its opacity and blend mode",
+            "{ids?|id?, target?} leave each object one empty fill and stroke (None; a group none of its own) and reset its opacity and blend mode",
             has_doc,
             clear_appearance
         ),
@@ -63,7 +65,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Reduce to Basic Appearance",
             ["Window", "Appearance"],
             None,
-            "{ids?, target?} keep only the topmost visible fill and stroke, without their own opacity, blend mode or effects (a group keeps no rows it lacked), and drop the object's effects",
+            "{ids?|id?, target?} keep only the topmost visible fill and stroke, without their own opacity, blend mode or effects (a group keeps no rows it lacked), and drop the object's effects",
             has_doc,
             reduce_basic
         ),
@@ -72,7 +74,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Appearance Item",
             [],
             None,
-            "{index: paint-order item index, ids? (default: the selection), target?: \"object\"|\"contents\", opacity?: 0..100, blend?: name, visible?: bool, weight?: pt (strokes), color?|none?|swatch?|gradient? (as paint.setFill)} edit one fill/stroke of each target object's own appearance stack",
+            "{index: paint-order item index, ids?|id? (default: the selection), target?: \"object\"|\"contents\", opacity?: 0..100, blend?: name, visible?: bool, weight?: pt (strokes), color?|none?|swatch?|gradient? (as paint.setFill), tint?: 0..100, keepModel?: bool (both as paint.setFill)} edit one fill/stroke of each target object's own appearance stack",
             has_doc,
             set_item
         ),
@@ -81,7 +83,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Remove Item",
             [],
             None,
-            "{index | indices: [..] (paint-order item indices), ids?, target?} remove those fills/strokes from each target object's own stack",
+            "{index | indices: [..] (paint-order item indices), ids?|id?, target?} remove those fills/strokes from each target object's own stack",
             has_doc,
             remove_item
         ),
@@ -90,7 +92,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add Effect",
             [],
             None,
-            "same as effect.apply (an alias): {effect: id, params?: {…}, item?: appearance item index|null, ids?, target?} → {ids, index, item}",
+            "{…as effect.apply} same as effect.apply (an alias): {effect: id, params?: {…}, item?: appearance item index|null, ids?, target?} → {ids, index, item}",
             has_doc,
             super::effectcmd::apply
         ),
@@ -99,7 +101,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Duplicate Item",
             ["Window", "Appearance"],
             None,
-            "{index | indices: [..] (paint-order item indices), to?: paint-order index of the copy (one `index` only; default: right above it, as Alt-dragging a row places it), ids?, target?} copy fills/strokes with their effects",
+            "{index | indices: [..] (paint-order item indices), to?: paint-order index of the copy (one `index` only; default: right above it, as Alt-dragging a row places it), ids?|id?, target?} copy fills/strokes with their effects",
             has_doc,
             duplicate_item
         ),
@@ -108,7 +110,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Reorder Appearance Item",
             [],
             None,
-            "{from: paint-order item index | \"contents\", to, contents?: count, ids?, target?} move fill/stroke `from` to paint-order index `to`; on a group, layer or type the Contents (Characters) row stays between the same items (a moved item landing next to it keeps its side) unless `contents` says how many items paint below it afterwards. from \"contents\": move that row so `to` items paint below the members (characters) and the rest above → {index: where the item landed | contents: the row's slot}",
+            "{from: paint-order item index | \"contents\", to, contents?: count, ids?|id?, target?} move fill/stroke `from` to paint-order index `to`; on a group, layer or type the Contents (Characters) row stays between the same items (a moved item landing next to it keeps its side) unless `contents` says how many items paint below it afterwards. from \"contents\": move that row so `to` items paint below the members (characters) and the rest above → {index: where the item landed | contents: the row's slot}",
             has_doc,
             move_item
         ),
@@ -135,7 +137,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Show All Hidden Attributes",
             ["Window", "Appearance"],
             None,
-            "{ids?, target?} make every hidden fill, stroke and effect (the object's and each item's) of each selected object visible again; errors when nothing is hidden → {ids}",
+            "{ids?|id?, target?} make every hidden fill, stroke and effect (the object's and each item's) of each selected object visible again; errors when nothing is hidden → {ids}",
             has_doc,
             show_all_hidden
         ),
@@ -144,7 +146,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Target Contents",
             [],
             None,
-            "{ids?} select the members of the selected groups and layers (or `ids`), as double-clicking the Appearance panel's Contents row does: the panel then lists, and appearance edits change, their own appearance; errors when none has members → {ids}",
+            "{ids?|id?, target?: \"object\"|\"contents\"} select the members of the selected groups and layers (or `ids`), as double-clicking the Appearance panel's Contents row does: the panel then lists, and appearance edits change, their own appearance; errors when none has members → {ids}",
             has_doc,
             target_contents
         ),
@@ -294,15 +296,15 @@ pub(crate) fn subject_roots(s: &Session) -> Result<Vec<NodeId>> {
     }
 }
 
-/// Objects whose own appearance stack a command edits: `ids`/`id` (layers too), else the
-/// [`subject_roots`]; with `target: "contents"` the painted objects inside the groups and layers
-/// among them ([`leaf_targets`]).
+/// Objects whose own appearance stack a command edits: `ids`/`id` (layers too; an id inside
+/// another given one is dropped), else the [`subject_roots`]; with `target: "contents"` the painted
+/// objects inside the groups and layers among them ([`leaf_targets`]).
 pub(crate) fn appearance_targets(s: &Session, p: &Value) -> Result<Vec<NodeId>> {
     let roots = if p.get("ids").is_none() && p.get("id").is_none() {
         subject_roots(s)?
     } else {
         let d = &s.doc()?.doc;
-        targets(s, p)?.into_iter().filter(|id| d.node(*id).is_some()).collect()
+        outermost(d, targets(s, p)?.into_iter().filter(|id| d.node(*id).is_some()).collect())
     };
     if targets_contents(p)? { leaf_targets(s, &roots) } else { Ok(roots) }
 }
@@ -318,7 +320,8 @@ fn require_targets(s: &Session, p: &Value, cmd: &str) -> Result<Vec<NodeId>> {
 
 /// One undo step (`label`) running `f` on each of `ids` with the item a fill (`fill`) or stroke
 /// edit aimed at `item` changes there (`None`: the topmost one; text then edits its characters).
-/// Nothing targeted is not an edit.
+/// Nothing targeted is not an edit, and when `f` leaves every target as it was, the document and
+/// its undo history stay as they are.
 pub(crate) fn edit_items(
     s: &mut Session,
     ids: &[NodeId],
@@ -328,10 +331,12 @@ pub(crate) fn edit_items(
     fill: bool,
     f: impl FnMut(&mut Node, Option<usize>) -> Result<()>,
 ) -> Result<()> {
-    edit_items_then(s, ids, item, cmd, label, fill, f, |_, _| Ok(()))
+    edit_items_then(s, ids, item, cmd, label, fill, f, |_, _| Ok(false))
 }
 
-/// [`edit_items`], then `after` on the ids `f` changed, inside the same undo step.
+/// [`edit_items`], then `after` on the ids `f` ran on, inside the same undo step. `after` returns
+/// whether it changed the document; when it did not and `f` left every target as it was, the
+/// document and its undo history stay as they are.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn edit_items_then(
     s: &mut Session,
@@ -341,21 +346,29 @@ pub(crate) fn edit_items_then(
     label: &str,
     fill: bool,
     mut f: impl FnMut(&mut Node, Option<usize>) -> Result<()>,
-    mut after: impl FnMut(&mut vectorcraft_doc::Document, &[NodeId]) -> Result<()>,
+    mut after: impl FnMut(&mut vectorcraft_doc::Document, &[NodeId]) -> Result<bool>,
 ) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
-    s.edit(label, |d, _| {
-        let mut changed = Vec::new();
+    let before = s.doc()?.doc.clone();
+    super::overprint::edit_counted(s, label, |d| {
+        let mut edited = Vec::new();
         for id in ids {
             let Some(n) = d.node_mut(*id) else { continue };
             let index = item.resolve(&n.appearance, fill, cmd)?;
             f(n, index)?;
-            changed.push(*id);
+            edited.push(*id);
         }
-        after(d, &changed)
-    })
+        let more = after(d, &edited)?;
+        Ok(count_changed(d, &before, &edited) + usize::from(more))
+    })?;
+    Ok(())
+}
+
+/// How many of `ids` differ in `d` from `before`.
+pub(crate) fn count_changed(d: &vectorcraft_doc::Document, before: &vectorcraft_doc::Document, ids: &[NodeId]) -> usize {
+    ids.iter().filter(|id| d.node(**id) != before.node(**id)).count()
 }
 
 /// Whether an edit aimed at `item` changes a stroke: the `stroke` param, else the kind of the
@@ -397,6 +410,9 @@ fn set_active_item(s: &mut Session, p: &Value) -> Result<Value> {
 fn add_item(s: &mut Session, p: &Value, fill: bool) -> Result<Value> {
     let ids = require_targets(s, p, if fill { "appearance.addFill" } else { "appearance.addStroke" })?;
     let defaults = s.paint.clone();
+    // Where the new item went in on the active item's object, when it is an image.
+    let active = s.active_appearance_item.as_ref().and_then(|a| a.objects.first().copied());
+    let mut inserted = None;
     s.edit(if fill { "Add New Fill" } else { "Add New Stroke" }, |d, _| {
         for id in &ids {
             if let Some(n) = d.node_mut(*id) {
@@ -418,23 +434,37 @@ fn add_item(s: &mut Session, p: &Value, fill: bool) -> Result<Value> {
                 } else {
                     AppearanceItem::Stroke(StrokeLayer::new(paint, n.appearance.stroke_width().max(1.0)))
                 };
-                n.appearance.items.push(item);
+                if matches!(n.kind, NodeKind::Image(_)) {
+                    // On an image it goes right below the Contents row (the image).
+                    let k = n.appearance.contents_at();
+                    n.appearance.items.insert(k, item);
+                    n.appearance.set_contents_at(k + 1);
+                    if active == Some(*id) {
+                        inserted = Some(k);
+                    }
+                } else {
+                    n.appearance.items.push(item);
+                }
             }
         }
         Ok(())
     })?;
+    // The rows above the new item move up by one.
+    s.remap_appearance_item(&ids, |a| Some(a + usize::from(inserted.is_some_and(|k| k <= a))));
     ok()
 }
 
 fn clear_appearance(s: &mut Session, p: &Value) -> Result<Value> {
     let ids = require_targets(s, p, "appearance.clear")?;
-    s.edit("Clear Appearance", |d, _| {
+    // When every object is cleared already, the document and its undo history stay as they are.
+    let before = s.doc()?.doc.clone();
+    super::overprint::edit_counted(s, "Clear Appearance", |d| {
         for id in &ids {
             if let Some(n) = d.node_mut(*id) {
                 clear(n);
             }
         }
-        Ok(())
+        Ok(count_changed(d, &before, &ids))
     })?;
     s.active_appearance_item = None;
     ok()
@@ -443,7 +473,7 @@ fn clear_appearance(s: &mut Session, p: &Value) -> Result<Value> {
 /// Clear Appearance on `n`: no fill, no stroke, and the object's Opacity row back to Default. A
 /// group keeps no fill or stroke rows of its own.
 fn clear(n: &mut Node) {
-    n.appearance = if is_group(n) { Appearance::default() } else { Appearance::basic(Paint::None, Paint::None, 1.0) };
+    n.appearance = if is_group(n) { Appearance::default().into() } else { Appearance::basic(Paint::None, Paint::None, 1.0).into() };
     n.opacity = 1.0;
     n.blend = BlendMode::Normal;
 }
@@ -456,14 +486,16 @@ fn transfer(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(C, "`source` and `target` are the same object"));
     }
     let copy = bool_or(p, "copy", false);
-    s.edit(if copy { "Copy Appearance" } else { "Move Appearance" }, |d, _| {
+    // When both objects come out as they were, the document and its undo history stay as they are.
+    let before = s.doc()?.doc.clone();
+    super::overprint::edit_counted(s, if copy { "Copy Appearance" } else { "Move Appearance" }, |d| {
         let src = d.node(source).cloned().ok_or(EngineError::NoNode(source))?;
         let to = d.node_mut(target).ok_or(EngineError::NoNode(target))?;
         let mut ap = src.appearance.clone();
         if let (Some(f), Some(t)) = (src.geometric_bounds(), to.geometric_bounds()) {
             ap.rebase_gradients(f, t);
         }
-        // Only groups, layers and type have a Contents (Characters) row to keep a slot for.
+        // Only groups, layers, type and images have a Contents (Characters) row to keep a slot for.
         if to.contents_label().is_none() {
             ap.contents_index = None;
         }
@@ -473,7 +505,7 @@ fn transfer(s: &mut Session, p: &Value) -> Result<Value> {
             clear(n);
             (n.isolate, n.knockout, n.knockout_shape) = (false, Default::default(), false);
         }
-        Ok(())
+        Ok(count_changed(d, &before, &[source, target]))
     })?;
     s.active_appearance_item = None;
     Ok(json!({ "source": source.0, "target": target.0 }))
@@ -486,7 +518,9 @@ fn is_group(n: &Node) -> bool {
 
 fn reduce_basic(s: &mut Session, p: &Value) -> Result<Value> {
     let ids = require_targets(s, p, "appearance.reduceToBasic")?;
-    s.edit("Reduce to Basic Appearance", |d, _| {
+    // When every object comes out as it was, the document and its undo history stay as they are.
+    let before = s.doc()?.doc.clone();
+    super::overprint::edit_counted(s, "Reduce to Basic Appearance", |d| {
         for id in &ids {
             if let Some(n) = d.node_mut(*id) {
                 // The topmost visible fill and stroke stay, without their own transparency or effects.
@@ -496,7 +530,7 @@ fn reduce_basic(s: &mut Session, p: &Value) -> Result<Value> {
                 // keeps the rows it had.
                 let fill =
                     (fill.is_some() || !is_group(n)).then(|| AppearanceItem::Fill(FillLayer::new(fill.map_or(Paint::None, |f| f.paint().clone()))));
-                n.appearance = Appearance { items: fill.into_iter().collect(), ..Default::default() };
+                n.appearance = Appearance { items: fill.into_iter().collect(), ..Default::default() }.into();
                 if let Some(AppearanceItem::Stroke(mut st)) = stroke {
                     st.effects.clear();
                     st.opacity = 1.0;
@@ -505,7 +539,7 @@ fn reduce_basic(s: &mut Session, p: &Value) -> Result<Value> {
                 }
             }
         }
-        Ok(())
+        Ok(count_changed(d, &before, &ids))
     })?;
     s.active_appearance_item = None;
     ok()
@@ -519,9 +553,17 @@ fn set_item(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad("appearance.setItem", "select objects or give ids"));
     }
     let blend = str_param(p, "blend").and_then(BlendMode::parse);
-    s.edit("Appearance", |d, _| {
+    // When every object comes out as it was (for example, when none has item `index`), the document
+    // and its undo history stay as they are.
+    let before = s.doc()?.doc.clone();
+    super::overprint::edit_counted(s, "Appearance", |d| {
         for id in &ids {
             let Some(n) = d.node_mut(*id) else { continue };
+            if p.get("weight").is_none()
+                && let Some(pa) = &paint
+            {
+                super::paint::restore_unpainted_stroke(&mut n.appearance, Some(idx), pa);
+            }
             let bounds = n.geometric_bounds();
             let Some(item) = n.appearance.items.get_mut(idx) else { continue };
             let (pp, op, bl, vis, bounds) = match item {
@@ -535,7 +577,7 @@ fn set_item(s: &mut Session, p: &Value) -> Result<Value> {
                 }
             };
             if let Some(pa) = &paint {
-                *pp = super::gradient::place_paint(pa, p, bounds);
+                *pp = super::gradient::place_paint(&super::paint::keep_pattern_xf(pa, p, Some(&*pp)), p, bounds);
             }
             if let Some(o) = p.get("opacity").and_then(Value::as_f64) {
                 *op = percent(o);
@@ -547,7 +589,7 @@ fn set_item(s: &mut Session, p: &Value) -> Result<Value> {
                 *vis = v;
             }
         }
-        Ok(())
+        Ok(count_changed(d, &before, &ids))
     })?;
     if let Some(pa) = &paint {
         s.remember_paint(pa);
@@ -574,7 +616,10 @@ fn item_indices(p: &Value, cmd: &str) -> Result<Vec<usize>> {
 fn remove_item(s: &mut Session, p: &Value) -> Result<Value> {
     let idx = item_indices(p, "appearance.removeItem")?;
     let ids = require_targets(s, p, "appearance.removeItem")?;
-    s.edit("Remove Item", |d, _| {
+    // When no object has an item at any of the indices, the document and its undo history stay as
+    // they are.
+    let before = s.doc()?.doc.clone();
+    super::overprint::edit_counted(s, "Remove Item", |d| {
         for id in &ids {
             if let Some(n) = d.node_mut(*id) {
                 // From the top down, so the lower indices stay valid.
@@ -583,7 +628,7 @@ fn remove_item(s: &mut Session, p: &Value) -> Result<Value> {
                 }
             }
         }
-        Ok(())
+        Ok(count_changed(d, &before, &ids))
     })?;
     s.remap_appearance_item(&ids, |a| (!idx.contains(&a)).then(|| a - idx.iter().filter(|i| **i < a).count()));
     ok()
@@ -648,7 +693,10 @@ fn move_item(s: &mut Session, p: &Value) -> Result<Value> {
     let from = index_param(p, "from", C)?;
     let contents = p.get("contents").map(|_| index_param(p, "contents", C)).transpose()?;
     let mut landed = to;
-    s.edit("Reorder Appearance", |d, _| {
+    // When every object's stack comes out as it was, the document and its undo history stay as they
+    // are.
+    let before = s.doc()?.doc.clone();
+    super::overprint::edit_counted(s, "Reorder Appearance", |d| {
         for id in &ids {
             let Some(n) = d.node_mut(*id) else { continue };
             landed = n.appearance.move_item(from, to).ok_or_else(|| bad(C, format!("no item at index {from}")))?;
@@ -656,7 +704,7 @@ fn move_item(s: &mut Session, p: &Value) -> Result<Value> {
                 n.appearance.set_contents_at(k);
             }
         }
-        Ok(())
+        Ok(count_changed(d, &before, &ids))
     })?;
     // The moved row stays the active one; the rows it passed shift by one.
     s.remap_appearance_item(&ids, |a| {
@@ -676,14 +724,18 @@ fn move_item(s: &mut Session, p: &Value) -> Result<Value> {
 /// `appearance.moveItem {from: "contents"}`: put the Contents (Characters) row of each target that
 /// has one above its bottom `to` items.
 fn move_contents(s: &mut Session, ids: &[NodeId], to: usize) -> Result<Value> {
-    let slot = s.edit("Reorder Appearance", |d, _| {
-        let mut slot = None;
+    // When every Contents row is above the bottom `to` items already, the document and its undo
+    // history stay as they are.
+    let before = s.doc()?.doc.clone();
+    let mut slot = None;
+    super::overprint::edit_counted(s, "Reorder Appearance", |d| {
         for id in ids {
             let Some(n) = d.node_mut(*id).filter(|n| n.contents_label().is_some()) else { continue };
             n.appearance.set_contents_at(to);
             slot.get_or_insert(n.appearance.contents_at());
         }
-        slot.ok_or_else(|| bad("appearance.moveItem", "only groups, layers and type have a Contents (Characters) row"))
+        slot.ok_or_else(|| bad("appearance.moveItem", "only groups, layers, type and images have a Contents (Characters) row"))?;
+        Ok(count_changed(d, &before, ids))
     })?;
     Ok(json!({ "contents": slot }))
 }
@@ -710,7 +762,7 @@ fn copy_from(s: &mut Session, p: &Value) -> Result<Value> {
     let (reverse, append) = (bool_or(p, "reverse", false), bool_or(p, "append", false));
     let attrs = s.prefs.eyedropper.attrs(p).map_err(|e| bad(C, e))?;
     let selected = match ids_param(p, "ids") {
-        Some(v) => v,
+        Some(v) => outermost(&s.doc()?.doc, v),
         None => selected_roots(s)?,
     };
     // Reversed, the first selected object's attributes go onto the clicked object.
@@ -728,13 +780,15 @@ fn copy_from(s: &mut Session, p: &Value) -> Result<Value> {
     if targets.is_empty() || attrs.is_empty() {
         return Ok(json!({ "ids": [] }));
     }
-    s.edit("Eyedropper", |d, _| {
+    // When every target comes out as it was, the document and its undo history stay as they are.
+    let before = s.doc()?.doc.clone();
+    super::overprint::edit_counted(s, "Eyedropper", |d| {
         for id in &targets {
             if let Some(n) = d.node_mut(*id) {
                 picked.apply(n, &attrs, append);
             }
         }
-        Ok(())
+        Ok(count_changed(d, &before, &targets))
     })?;
     Ok(json!({ "ids": targets.iter().map(|i| i.0).collect::<Vec<_>>() }))
 }
@@ -758,7 +812,7 @@ impl Picked {
                 let st = &t.runs[0].style;
                 (st.basic_appearance(), Some(t.local_bounds()), Some((st.clone(), t.para.clone())))
             }
-            _ => (n.appearance.clone(), n.geometric_bounds(), None),
+            _ => ((*n.appearance).clone(), n.geometric_bounds(), None),
         };
         Self { appearance, bounds, opacity: n.opacity, blend: n.blend, text }
     }
@@ -831,7 +885,7 @@ impl Picked {
         }
         let placed = self.placed(n.geometric_bounds());
         if ap.fill == FillAttrs::ALL && ap.stroke == StrokeAttrs::ALL {
-            n.appearance = placed;
+            n.appearance = placed.into();
         } else {
             focal_attrs(&mut n.appearance, &placed, ap);
         }
