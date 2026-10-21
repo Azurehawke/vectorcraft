@@ -95,16 +95,27 @@ struct Browser {
     answer: Sender<Vec<String>>,
 }
 
-fn filters_of(list: impl Iterator<Item = (&'static str, &'static [&'static str])>) -> Vec<(String, Vec<String>)> {
-    list.map(|(name, exts)| (name.to_string(), exts.iter().map(|e| e.trim_start_matches('.').to_ascii_lowercase()).collect())).collect()
+fn filters_of<N, X, E>(list: impl IntoIterator<Item = (N, X)>) -> Vec<(String, Vec<String>)>
+where
+    N: AsRef<str>,
+    X: IntoIterator<Item = E>,
+    E: AsRef<str>,
+{
+    list.into_iter()
+        .map(|(name, exts)| (name.as_ref().to_string(), exts.into_iter().map(|e| e.as_ref().trim_start_matches('.').to_ascii_lowercase()).collect()))
+        .collect()
 }
 
 impl Browser {
     fn new(request: PickRequest, last: Option<PathBuf>, answer: Sender<Vec<String>>) -> Self {
         let (mode, title, filters, folder, name) = match &request {
-            PickRequest::Open(p) => (Mode::File, "Open", filters_of(p.filters.iter().copied()), p.folder.clone(), String::new()),
+            PickRequest::Open(p) => {
+                (Mode::File, "Open", filters_of(p.filters.iter().map(|(n, e)| (n.as_str(), e.iter()))), p.folder.clone(), String::new())
+            }
             PickRequest::OpenMany => (Mode::Files, "Place", filters_of(fileio::place_filters()), None, String::new()),
-            PickRequest::Save(p) => (Mode::Save, "Save As", filters_of(p.filters.iter().copied()), p.folder.clone(), p.name.clone()),
+            PickRequest::Save(p) => {
+                (Mode::Save, "Save As", filters_of(p.filters.iter().map(|(n, e)| (n.as_str(), e.iter()))), p.folder.clone(), p.name.clone())
+            }
             PickRequest::Folder => (Mode::Folder, "Choose a Folder", Vec::new(), None, String::new()),
         };
         // A save dialog's folder (Templates, presets) may not exist yet.
