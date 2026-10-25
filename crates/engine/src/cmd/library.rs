@@ -1088,7 +1088,7 @@ fn move_group(s: &mut Session, p: &Value) -> Result<Value> {
     let (name, at) = s.libraries.change(&id, |lib| {
         let i = group_at(lib, group, C)?;
         let g = lib.groups.remove(i);
-        let at = usize::try_from(to).unwrap_or(usize::MAX).min(lib.groups.len());
+        let at = index(to).min(lib.groups.len());
         let name = g.name.clone();
         lib.groups.insert(at, g);
         Ok((name, at))

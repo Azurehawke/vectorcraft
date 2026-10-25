@@ -155,7 +155,10 @@ pub fn char_attrs(v: &CharStyle) -> Map<String, Value> {
         ("position", json!(v.position)),
         ("small_caps", json!(v.small_caps)),
         ("charAlign", json!(v.char_align)),
+        ("charDirection", json!(v.char_direction)),
         ("proportionalMetrics", json!(v.proportional_metrics)),
+        ("tateChuYoko", json!(v.tate_chu_yoko)),
+        ("noBreak", json!(v.no_break)),
         ("digits", json!(v.digits)),
     ] {
         m.insert(k.into(), x);
@@ -165,7 +168,7 @@ pub fn char_attrs(v: &CharStyle) -> Map<String, Value> {
 
 /// Every paragraph attribute of `v` as a JSON map, without the style name: those the paragraph's
 /// JSON leaves out at their defaults (the Hyphenation and Justification options, the Every-line Composer, no tab
-/// stops, Auto direction…) are written out, as [`char_attrs`] does for characters.
+/// stops, no list, Auto direction…) are written out, as [`char_attrs`] does for characters.
 pub fn para_attrs(v: &ParaStyle) -> Map<String, Value> {
     let mut m = to_attrs(v);
     for (k, x) in [
@@ -173,6 +176,7 @@ pub fn para_attrs(v: &ParaStyle) -> Map<String, Value> {
         ("justification", json!(v.justification)),
         ("composer", json!(v.composer)),
         ("tabs", json!(v.tabs)),
+        ("list", json!(v.list)),
         ("mojikumi", json!(v.mojikumi)),
         ("direction", json!(v.direction)),
         ("leading_model", json!(v.leading_model)),
@@ -342,10 +346,10 @@ fn selection_attrs(s: &Session, p: &Value, kind: Kind) -> Result<Option<Map<Stri
         None => text_targets(s, &json!({}), "").ok().and_then(|v| v.first().copied()),
     };
     let Some(NodeKind::Text(t)) = id.and_then(|i| d.node(i)).map(|n| &n.kind) else { return Ok(None) };
-    let at = p.get("start").and_then(Value::as_u64).map_or(0, |v| usize::try_from(v).unwrap_or(usize::MAX));
+    let at = p.get("start").and_then(Value::as_u64).map_or(0, index);
     Ok(Some(match kind {
         Kind::Char => {
-            let style = match p.get("end").and_then(Value::as_u64).map(|v| usize::try_from(v).unwrap_or(usize::MAX)) {
+            let style = match p.get("end").and_then(Value::as_u64).map(index) {
                 Some(end) => vectorcraft_text::edit::insertion_style(&t.runs, at.min(end), at.max(end)),
                 None => vectorcraft_text::edit::style_at(&t.runs, at),
             };
@@ -486,12 +490,9 @@ fn apply(s: &mut Session, p: &Value, kind: Kind) -> Result<Value> {
             match kind {
                 Kind::Char => {
                     let len = vectorcraft_text::edit::runs_len(&t.runs);
-                    let (a, b) = match range {
-                        Some(_) => {
-                            let g = |k: &str, def: usize| p.get(k).and_then(Value::as_u64).map_or(def, |v| (v as usize).min(len));
-                            (g("start", 0), g("end", len))
-                        }
-                        None => (0, len),
+                    let (a, b) = match (range, text_range) {
+                        (Some(_), Some(r)) => r.bytes(t),
+                        _ => (0, len),
                     };
                     let mut err = None;
                     vectorcraft_text::edit::style_range(&mut t.runs, a.min(b), a.max(b), |st| match char_fn(st) {
@@ -910,6 +911,7 @@ mod tests {
     /// resets the type that uses it.
     #[test]
     fn variable_font_settings_are_captured_explicitly() {
+        let _fonts = crate::adding_fonts();
         use vectorcraft_text::test_fonts::{TWO_AXIS_FAMILY, two_axis_font};
         vectorcraft_text::FontDb::global().add_font(two_axis_font().unwrap());
         let (mut s, source) = session_with_text("Source");
@@ -933,6 +935,7 @@ mod tests {
     /// version and Variable Font settings, unless the style sets them.
     #[test]
     fn another_font_from_a_style_clears_the_old_fonts_version_and_settings() {
+        let _fonts = crate::adding_fonts();
         use vectorcraft_text::test_fonts::{TWO_AXIS_FAMILY, two_axis_font};
         vectorcraft_text::FontDb::global().add_font(two_axis_font().unwrap());
         let (mut s, id) = session_with_text("Source");

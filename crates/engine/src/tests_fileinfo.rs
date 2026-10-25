@@ -113,6 +113,29 @@ fn saving_to_a_file_stamps_the_modified_date() {
 }
 
 #[test]
+fn inspect_and_open_report_the_file_info_title_beside_the_file_name() {
+    let dir = std::env::temp_dir().join(format!("vc-fileinfotitle-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("poster.vectorcraft");
+    let mut s = session();
+    // Untitled, the two are the same.
+    let r = s.execute("document.inspect", &json!({"depth": 0})).unwrap();
+    assert_eq!((r["title"].as_str(), r["fileInfoTitle"].as_str()), (Some("Poster"), Some("Poster")));
+    s.execute("file.info", &json!({"title": "Poster: final"})).unwrap();
+    s.execute("document.save", &json!({"path": path.to_str().unwrap()})).unwrap();
+    let r = s.execute("document.inspect", &json!({"depth": 0})).unwrap();
+    assert_eq!((r["title"].as_str(), r["fileInfoTitle"].as_str()), (Some("poster.vectorcraft"), Some("Poster: final")));
+    // Opened from the file, in another session.
+    let mut s = Session::new();
+    let opened = s.execute("document.open", &json!({"path": path.to_str().unwrap()})).unwrap();
+    assert_eq!((opened["title"].as_str(), opened["fileInfoTitle"].as_str()), (Some("poster.vectorcraft"), Some("Poster: final")));
+    let r = s.execute("document.inspect", &json!({"depth": 0})).unwrap();
+    assert_eq!((r["title"].as_str(), r["fileInfoTitle"].as_str()), (Some("poster.vectorcraft"), Some("Poster: final")));
+    assert_eq!(r["fileInfoTitle"], s.execute("file.info", &json!({})).unwrap()["title"]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn pdf_info_carries_author_subject_and_keywords() {
     let mut s = session();
     s.execute("file.info", &info()).unwrap();
@@ -139,6 +162,25 @@ fn an_exported_pdf_opens_with_its_file_info() {
     assert_eq!(back["keywords"], json!(["fair", "Poster", "print"]));
     assert!(back["created"].as_str().is_some_and(|c| c.ends_with('Z')), "the file's creation date: {}", back["created"]);
     assert_eq!(back["title"], "poster.pdf", "the title stays the file name");
+    assert_eq!(back["copyrightStatus"], "copyrighted");
+    assert_eq!(back["copyrightNotice"], "(c) 2026 Ada");
+    assert_eq!(back["copyrightUrl"], "https://example.com/rights");
+}
+
+#[test]
+fn a_pdf_compatible_ai_carries_the_copyright() {
+    let mut s = session();
+    let rights = json!({"copyrightStatus": "publicDomain", "copyrightNotice": "No rights reserved", "copyrightUrl": "https://example.com/cc0"});
+    s.execute("file.info", &rights).unwrap();
+    let path = std::env::temp_dir().join(format!("vc-fileinfo-rights-{}.ai", std::process::id()));
+    let saved = s.execute("document.save", &json!({"path": path.to_string_lossy()}));
+    let ai = std::fs::read(&path);
+    let _ = std::fs::remove_file(&path);
+    saved.unwrap();
+    let f = vectorcraft_pdf::file_info(&ai.unwrap(), None).expect("a PDF-compatible .ai");
+    assert_eq!(f.copyrighted, Some(false));
+    assert_eq!(f.copyright_notice.as_deref(), Some("No rights reserved"));
+    assert_eq!(f.copyright_url.as_deref(), Some("https://example.com/cc0"));
 }
 
 /// Unix seconds of 2020-01-01 00:00:00 UTC.
@@ -291,6 +333,18 @@ fn an_untitled_document_saved_to_a_file_exports_titled_after_it() {
     let dir = std::env::temp_dir().join(format!("vc-pdftitle-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("Document C.vectorcraft");
+    // Unsaved and untitled: viewers keep showing the file name, not "Untitled-1".
+    let mut untitled = Session::new();
+    untitled.execute("file.new", &json!({"width": 100, "height": 80})).unwrap();
+    for pdf in pdf_texts(&mut untitled) {
+        assert!(!pdf.contains("/DisplayDocTitle true"), "{pdf}");
+    }
+    // An explicitly empty document title is also not a title to display.
+    std::sync::Arc::make_mut(&mut untitled.doc_mut().unwrap().doc).title.clear();
+    for pdf in pdf_texts(&mut untitled) {
+        assert!(!pdf.contains("/DisplayDocTitle true"), "{pdf}");
+    }
+
     // Saved as a file, then exported: Untitled-1 was only the name New gave it.
     let mut s = Session::new();
     s.execute("file.new", &json!({"width": 100, "height": 80})).unwrap();
@@ -298,6 +352,9 @@ fn an_untitled_document_saved_to_a_file_exports_titled_after_it() {
     for pdf in pdf_texts(&mut s) {
         assert!(pdf.contains("/Title(Document C)") && xmp_title(&pdf).contains("Document C"), "{}", xmp_title(&pdf));
     }
+    // Non-object parameters still preserve that the file-stem title was not user supplied.
+    let pdf = String::from_utf8_lossy(&b64(&s.execute("document.exportPdf", &Value::Null).unwrap())).into_owned();
+    assert!(!pdf.contains("/DisplayDocTitle true"), "{pdf}");
     // Opened from that file, in another session.
     let mut s = Session::new();
     s.execute("document.open", &json!({"path": path.to_str().unwrap()})).unwrap();
@@ -311,6 +368,7 @@ fn an_untitled_document_saved_to_a_file_exports_titled_after_it() {
     s.execute("document.save", &json!({"path": dir.join("Document D.vectorcraft").to_str().unwrap()})).unwrap();
     for pdf in pdf_texts(&mut s) {
         assert!(pdf.contains("/Title(Poster)") && xmp_title(&pdf).contains("Poster"));
+        assert!(pdf.contains("/ViewerPreferences<</DisplayDocTitle true>>"), "{pdf}");
     }
     let _ = std::fs::remove_dir_all(dir);
 }

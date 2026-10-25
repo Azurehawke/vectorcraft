@@ -238,6 +238,27 @@ fn lines_join_split_and_follow_the_selection() {
     assert_eq!(g["points"][i]["at"], json!([190.0, 190.0]));
 }
 
+/// Split Line refuses a `t` that is not a number, and the point commands and the query a `stroke`
+/// that is not true or false, given as text or as another value of the wrong kind; the gradient and
+/// the undo history stay as they were. Numbers, false and null still work.
+#[test]
+fn freeform_commands_refuse_a_number_or_boolean_given_as_text() {
+    use super::tests::{not_a_number, not_a_switch, not_refused};
+    let (mut s, id) = freeform_rect();
+    run(&mut s, "paint.freeform.addLine", json!({"points": [0, 1]}));
+    let calls = [
+        not_a_number("paint.freeform.splitLine", json!({"line": 0, "segment": 0, "t": "0.25"}), "t"),
+        not_a_switch("paint.freeform.addPoint", json!({"at": [150, 150], "stroke": "false"}), "stroke"),
+        not_a_switch("paint.freeform.get", json!({"stroke": [false]}), "stroke"),
+    ];
+    let wrong = not_refused(&mut s, &calls);
+    assert!(wrong.is_empty(), "not refused: {wrong:#?}");
+    run(&mut s, "paint.freeform.splitLine", json!({"line": 0, "segment": 0, "t": null}));
+    let g = run(&mut s, "paint.freeform.get", json!({"stroke": false}));
+    assert_eq!(g["lines"][0].as_array().map(Vec::len), Some(3));
+    assert_eq!(points(&s, id).lines[0].len(), 3);
+}
+
 #[test]
 fn point_commands_need_a_freeform_gradient() {
     let mut s = session();
@@ -260,6 +281,27 @@ fn point_commands_need_a_freeform_gradient() {
     // Nothing selected: nothing to edit.
     run(&mut s, "select.none", json!({}));
     assert!(s.execute("paint.freeform.addPoint", &json!({"at": [1, 1]})).is_err());
+}
+
+/// The point and line commands refuse a point, line or segment of 2^32 + k, where k names one that
+/// exists, and the points and the selected point stay as they were. A 32-bit build read the number
+/// as k.
+#[test]
+fn point_commands_refuse_an_index_past_u32() {
+    let (mut s, id) = freeform_rect();
+    run(&mut s, "paint.freeform.addLine", json!({"points": [0, 1]}));
+    let (before, selected) = (points(&s, id), s.selected_freeform_point());
+    let past = |k: u64| (1u64 << 32) + k;
+    for (cmd, p) in [
+        ("paint.freeform.setPoint", json!({"index": past(1), "color": "#000000"})),
+        ("paint.freeform.deletePoint", json!({"index": past(1)})),
+        ("paint.freeform.selectPoint", json!({"index": past(1)})),
+        ("paint.freeform.splitLine", json!({"line": past(0), "segment": 0})),
+        ("paint.freeform.splitLine", json!({"line": 0, "segment": past(0)})),
+    ] {
+        assert!(s.execute(cmd, &p).is_err(), "{cmd} {p}");
+        assert_eq!((points(&s, id), s.selected_freeform_point()), (before.clone(), selected), "{cmd} {p}");
+    }
 }
 
 #[test]

@@ -702,7 +702,7 @@ mod tests {
             pick.filters,
             crate::FilePick::filters([("VectorCraft Template", &["vctemplate"][..]), ("PDF-compatible .ait template", &["ait"][..])])
         );
-        assert_eq!(written.borrow()[1].0, "copy.vectorcraft.vctemplate", "the picked name, with the template's extension");
+        assert_eq!(written.borrow()[1].0, "copy.vctemplate", "the picked name, its extension replaced with the template's");
     }
 
     #[test]
@@ -740,13 +740,11 @@ mod tests {
         assert!(!names("ait").contains(&"aiVersion"), "{:?}", names("ait"));
     }
 
-    /// A name typed in the Save as Template panel with a Save As format's extension gets the
-    /// template's extension added, as Save As adds its own to a name it doesn't write.
+    /// A name typed in the Save as Template panel with a Save As format's extension has it
+    /// replaced with the template's, as Save As replaces the extension of a format it doesn't write.
     #[test]
-    fn save_as_template_adds_its_extension_to_a_save_formats_name() {
-        for (picked, saved) in
-            [("card.pdf", "card.pdf.vctemplate"), ("card.vectorcraft", "card.vectorcraft.vctemplate"), ("card.svg", "card.svg.vctemplate")]
-        {
+    fn save_as_template_replaces_a_save_formats_extension() {
+        for (picked, saved) in [("card.pdf", "card.vctemplate"), ("card.vectorcraft", "card.vctemplate"), ("card.svg", "card.vctemplate")] {
             let (mut app, written, _) = desktop(picked);
             app.session.prefs.templates_folder = vectorcraft_testkit::temp_dir("save-template-ext").to_string_lossy().into_owned();
             app.run("file.saveAsTemplate", json!({})).unwrap();

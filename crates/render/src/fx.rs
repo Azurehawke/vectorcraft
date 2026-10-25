@@ -81,12 +81,12 @@ pub(crate) fn has_fx(n: &Node) -> bool {
 /// symbol instances, live objects; Crop Marks and colour adjustments on anything), is it type with
 /// a geometry effect on a fill or stroke of its own or an image with a fill or stroke of its own
 /// that paints a shape ([`effects::has_item_geometry`]), is it a path whose Transform effect copies
-/// it with a gradient ([`effects::has_gradient_copies`]), or is it a group or layer with an
-/// appearance of its own (see [`Renderer::draw_object_fx`])?
+/// it with a gradient or changes its fills and strokes ([`effects::has_transform_art`]), or is it a
+/// group or layer with an appearance of its own (see [`Renderer::draw_object_fx`])?
 pub(crate) fn has_object_fx(n: &Node) -> bool {
     (effects::needs_outline(n) && (visible(&n.appearance.effects) || n.projection().is_some()))
         || effects::has_item_geometry(n)
-        || effects::has_gradient_copies(n)
+        || effects::has_transform_art(n)
         || effects::has_container_appearance(n)
         || effects::has_crop_marks(n)
         || effects::has_adjustment(n)
@@ -316,7 +316,7 @@ fn shape_bounds(symbols: &SymbolBoxes, n: &Node) -> Option<Rect> {
     };
     match &n.kind {
         _ if effects::has_container_appearance(n) => {
-            let art = effects::evaluate_container(n);
+            let art = effects::evaluate_container(Some(symbols.document()), n);
             let art = art.as_ref().unwrap_or(n);
             if art.clips() { art.visual_bounds_with(symbols) } else { union(art) }
         }
@@ -350,7 +350,7 @@ fn shape_bounds(symbols: &SymbolBoxes, n: &Node) -> Option<Rect> {
                 NodeKind::SymbolInstance { symbol, .. } => symbols.document().symbols.iter().find(|s| s.name == *symbol).map(|s| s.art.clone()),
                 _ => None,
             };
-            let reshaped = effects::reshape(n, symbol.as_deref());
+            let reshaped = effects::reshape(Some(symbols.document()), n, symbol.as_deref());
             let b = match &reshaped {
                 Some(r) if matches!(n.kind, NodeKind::Text(_)) || (matches!(n.kind, NodeKind::Image(_)) && !r.clips()) => {
                     r.children().into_iter().flatten().fold(None, |acc, c| vectorcraft_geom::union_opt(acc, painted_reach(symbols, c)))
@@ -430,7 +430,7 @@ fn cull_bounds_in(symbols: &SymbolBoxes, n: &Node, after_reshape: bool) -> Optio
         _ if effects::has_crop_marks(n) => effects::crop_marks_art(n).and_then(|art| inner(&art)),
         // The evaluated art (its fills, strokes and geometry effects) and the raster effects' reach.
         _ if effects::has_container_appearance(n) => {
-            let art = effects::evaluate_container(n);
+            let art = effects::evaluate_container(Some(symbols.document()), n);
             let art = art.as_ref().unwrap_or(n);
             let b = if art.clips() {
                 art.visual_bounds_with(symbols)
@@ -453,7 +453,7 @@ fn cull_bounds_in(symbols: &SymbolBoxes, n: &Node, after_reshape: bool) -> Optio
                 NodeKind::SymbolInstance { symbol, .. } => symbols.document().symbols.iter().find(|s| s.name == *symbol).map(|s| s.art.clone()),
                 _ => None,
             };
-            let reshaped = effects::reshape(n, symbol.as_deref());
+            let reshaped = effects::reshape(Some(symbols.document()), n, symbol.as_deref());
             let b = match &reshaped {
                 Some(r) if matches!(n.kind, NodeKind::Text(_)) || (matches!(n.kind, NodeKind::Image(_)) && !r.clips()) => {
                     r.children().into_iter().flatten().fold(None, |acc, c| vectorcraft_geom::union_opt(acc, inner(c)))
@@ -478,10 +478,24 @@ fn cull_bounds_in(symbols: &SymbolBoxes, n: &Node, after_reshape: bool) -> Optio
         }
         _ => {
             let b = n.visual_bounds_with(symbols)?;
+            let b = match &n.kind {
+                NodeKind::Text(t) => vectorcraft_geom::union_opt(Some(b), glyphs_box(t, n.appearance.outset())).unwrap_or(b),
+                _ => b,
+            };
             let a = live_content_reach(symbols, n);
             Some(b.inflate(a, a))
         }
     }
+}
+
+/// The box of type `t`'s glyphs as laid out (its layout bounds, else laid out now), grown by its
+/// characters' strokes, miter spikes included, and by `outset`: on a path they stand above it and
+/// run past its ends, in an area they can hang past its frame, where its own box
+/// ([`Node::visual_bounds_with`]) doesn't.
+fn glyphs_box(t: &vectorcraft_doc::TextObject, outset: f64) -> Option<Rect> {
+    let b = t.cached_bounds.unwrap_or_else(|| vectorcraft_text::layout(vectorcraft_text::FontDb::global(), t).bounds);
+    let o = outset.max(t.char_stroke_reach());
+    (b.width() > 0.0 || b.height() > 0.0).then(|| t.xf.transform_rect_bbox(b).inflate(o, o))
 }
 
 /// How far the content of live object `n` (a blend, envelope or repeat) can paint past its visual
@@ -643,7 +657,7 @@ pub(crate) struct PixelEntry {
     /// For one cropped to the view, or made at a lower resolution, the view and the rect it was
     /// made for: it draws only there, so dragging other art over the object keeps it (a wide blur,
     /// or any blur zoomed in, reaches past the pixel budget).
-    view: Option<ViewKey>,
+    view: Option<ViewCrop>,
     made: Made,
     /// What the content read when the raster was made, with the channels the effects ran on and,
     /// under De-Interlace, the raster resolution.
@@ -672,13 +686,29 @@ fn linear_key(view: Affine) -> [u64; 4] {
     [c[0].to_bits(), c[1].to_bits(), c[2].to_bits(), c[3].to_bits()]
 }
 
-/// A view's six coefficients (its pan included) and the device-pixel rect a frame draws in, as a
-/// cache key: a raster cropped to that rect, or made at a lower resolution than the view's, draws
-/// only in that view of that rect ([`PixelEntry::view`], [`ShadowEntry::view`]).
-type ViewKey = ([u64; 6], [u64; 4]);
+/// The pan of the view a raster was cropped for, or made at a lower resolution than the view's, and
+/// the device-pixel rect of the frame it was made in ([`PixelEntry::view`], [`ShadowEntry::view`]).
+#[derive(Clone, Copy, Debug)]
+struct ViewCrop {
+    pan: Vec2,
+    screen: Rect,
+}
 
-fn view_key(view: Affine, screen: Rect) -> ViewKey {
-    (view.as_coeffs().map(f64::to_bits), [screen.x0, screen.y0, screen.x1, screen.y1].map(f64::to_bits))
+impl ViewCrop {
+    fn of(view: Affine, screen: Rect) -> Self {
+        Self { pan: view.translation(), screen }
+    }
+
+    /// Does the raster draw in a frame through `view` (of the same zoom and rotation) onto
+    /// `screen`? When the view is panned by whole pixels and the frame's rect, panned back, lies
+    /// within the one the raster was made in: the same pixels in the same places, as when a frame
+    /// is drawn again only in a part of it.
+    fn serves(&self, view: Affine, screen: Rect) -> bool {
+        let d = view.translation() - self.pan;
+        let whole = Vec2::new(d.x.round(), d.y.round());
+        let s = screen - whole;
+        (d - whole).hypot() < 1e-6 && s.x0 >= self.screen.x0 && s.y0 >= self.screen.y0 && s.x1 <= self.screen.x1 && s.y1 <= self.screen.y1
+    }
 }
 
 /// Most pixels a raster of [`Renderer::pixel_content`] or [`Renderer::with_filters`] holds while
@@ -768,7 +798,7 @@ pub(crate) struct ShadowEntry {
     /// `None` for a raster of the whole silhouette's reach: it draws after a pan too. For one
     /// cropped to the view, or made over such a raster, the view and the rect it was made for: it
     /// draws only there ([`PixelEntry::view`]).
-    view: Option<ViewKey>,
+    view: Option<ViewCrop>,
     made: Made,
     /// What the silhouette read when the raster was made.
     inputs: Inputs,
@@ -947,6 +977,11 @@ impl Reads {
         self.plugins || self.symbols || self.patterns
     }
 
+    /// Does the content show symbol or pattern art?
+    pub(crate) fn shows_definitions(self) -> bool {
+        self.symbols || self.patterns
+    }
+
     fn add(&mut self, n: &Node) {
         let pattern = |p: &vectorcraft_color::Paint| matches!(p, vectorcraft_color::Paint::Pattern { .. });
         n.walk(&mut |c| {
@@ -1009,7 +1044,8 @@ impl Inputs {
 /// pixels, the address of the color settings, and whether the patterns' and symbols' art has a
 /// plug-in effect. Art, pixels and previews are hashed by the addresses of their shared values,
 /// and names, keys, tiles, tile types and overlaps are hashed by value. The live cache keeps these
-/// inputs with each evaluated live object and with each mesh's quads (`crate::live`), and
+/// inputs with each evaluated live object, with each mesh's quads and with what each walk of a
+/// live object or of effect art found when it found no placed file (`crate::live`), and
 /// [`Renderer::fx_art`] keeps them with art that can be made from evaluated live objects.
 pub(crate) struct DocInputs {
     patterns: u64,
@@ -1023,6 +1059,14 @@ pub(crate) struct DocInputs {
     /// allocation, not the value, so no other value gets one of those addresses while these
     /// inputs are kept.
     _held: Held,
+}
+
+impl DocInputs {
+    /// Whether `self` and `other` were made from the same patterns and symbols: their names,
+    /// tilings and art.
+    pub(crate) fn same_art(&self, other: &DocInputs) -> bool {
+        (self.patterns, self.symbols) == (other.patterns, other.symbols)
+    }
 }
 
 /// The pattern and symbol art, the image pixels and the color settings, held weakly.
@@ -1084,9 +1128,9 @@ impl Renderer {
         // What the silhouette reads: as the raster kept for `n` found it, else found now.
         let reads = self.shadows.get(&key).filter(|e| e.node.is(n)).map_or_else(|| Reads::of(n), |e| e.inputs.reads);
         let inputs = self.raster_inputs(f, n, reads);
-        let in_view = view_key(f.view, screen);
+        let in_view = ViewCrop::of(f.view, screen);
         let exact = |e: &ShadowEntry| {
-            e.linear == linear && e.node.is(n) && e.inputs == inputs && (interacting || !e.moved) && e.view.is_none_or(|v| v == in_view)
+            e.linear == linear && e.node.is(n) && e.inputs == inputs && (interacting || !e.moved) && e.view.is_none_or(|v| v.serves(f.view, screen))
         };
         if interacting && !self.shadows.get(&key).is_some_and(exact) {
             self.move_shadow(f, n, key, fx, reach + Vec2::new(dx, dy), owner, &inputs, paint);
@@ -1453,14 +1497,14 @@ impl Renderer {
         let art = match effects::crop_marks_art(a)
             .or_else(|| effects::revolve_art(a))
             .or_else(|| effects::solid_art(a))
-            .or_else(|| effects::reshape(a, symbol.as_ref()))
+            .or_else(|| effects::reshape(Some(doc), a, symbol.as_ref()))
         {
             Some(r) => r,
-            None if container => effects::evaluate_container(a).unwrap_or_else(|| (**a).clone()),
+            None if container => effects::evaluate_container(Some(doc), a).unwrap_or_else(|| (**a).clone()),
             None if matches!(a.kind, NodeKind::Text(_) | NodeKind::Image(_) | NodeKind::Path { .. } | NodeKind::Compound { .. }) => (**a).clone(),
-            None => effects::outline_art(a, symbol.as_ref()).unwrap_or_else(|| Node::group(a.id, vec![])),
+            None => effects::outline_art(Some(doc), a, symbol.as_ref()).unwrap_or_else(|| Node::group(a.id, vec![])),
         };
-        let art = if effects::has_revolve(a) || effects::has_solid(a) { effects::evaluate_container(&art).unwrap_or(art) } else { art };
+        let art = if effects::has_revolve(a) || effects::has_solid(a) { effects::evaluate_container(Some(doc), &art).unwrap_or(art) } else { art };
         let mut art = self.adjusted_art(art, effects::color_map(&a.appearance.effects).as_ref());
         // A path's geometry effects still apply when it is drawn.
         let path = matches!(art.kind, NodeKind::Path { .. } | NodeKind::Compound { .. });
@@ -1784,7 +1828,7 @@ impl Renderer {
         // The cached raster: of the whole content at full size at this zoom, else of this view.
         let linear = linear_key(f.view);
         let whole = fits && k >= 1.0;
-        let in_view = (!whole).then(|| view_key(f.view, screen));
+        let in_view = (!whole).then(|| ViewCrop::of(f.view, screen));
         let key = content.cache.map(|slot| (content.node as *const Node as usize, slot, f.ink));
         let stamp = self.stamp;
         let channels = match f.ink {
@@ -1803,8 +1847,12 @@ impl Renderer {
             self.raster_inputs(f, content.node, reads).with((std::mem::discriminant(&channels), interlaced.then_some(ppi.to_bits())))
         });
         let interacting = f.opts.interacting;
+        let in_place = |e: &PixelEntry| match e.view {
+            None => whole,
+            Some(v) => !whole && v.serves(f.view, screen),
+        };
         let exact = |e: &PixelEntry| {
-            e.linear == linear && e.view == in_view && e.node.is(content.node) && Some(&e.inputs) == inputs.as_ref() && (interacting || !e.moved)
+            e.linear == linear && in_place(e) && e.node.is(content.node) && Some(&e.inputs) == inputs.as_ref() && (interacting || !e.moved)
         };
         if interacting
             && whole
@@ -2082,6 +2130,7 @@ impl Renderer {
         if reads.images {
             let o = f.opts;
             (doc.images, self.dim_images.map(f32::to_bits), o.smooth_images, o.image_mips, o.trace_views, o.progressive_placed).hash(&mut h);
+            o.trace_source.as_deref().hash(&mut h);
         }
         if reads.brushes {
             self.brushes.library_key(f.doc, self.stamp).hash(&mut h);
@@ -2347,7 +2396,7 @@ impl Renderer {
                 if st.brush.is_some() && self.draw_brush(ctx, f, n, ig, st) {
                     return;
                 }
-                self.draw_stroke(ctx, f, Affine::IDENTITY, ig, rule, st, ib);
+                self.draw_stroke(ctx, f, Affine::IDENTITY, ig, rule, st, None, ib);
             }
         }
     }
@@ -2930,8 +2979,15 @@ mod tests {
         let mut d = Document::new(100.0, 100.0);
         // A PNG signature with nothing after it.
         d.images.insert("cut".into(), ImageBlob::new("image/png", b"\x89PNG\r\n\x1a\n".to_vec()));
-        let im =
-            ImageObject { key: "cut".into(), width: 40, height: 40, xf: Affine::translate((30.0, 30.0)), link: None, placement: Default::default() };
+        let im = ImageObject {
+            key: "cut".into(),
+            width: 40,
+            height: 40,
+            xf: Affine::translate((30.0, 30.0)),
+            link: None,
+            placement: Default::default(),
+            pixels: None,
+        };
         let mut n = Node::new(d.alloc_id(), NodeKind::Image(Box::new(im)));
         n.appearance.effects = vec![Effect { id: "blur.gaussian".into(), params: json!({"radius": 4.0}), visible: true }];
         d.insert(Some(d.layers[0].id), 0, n).unwrap();
@@ -2955,8 +3011,15 @@ mod tests {
         let mut d = Document::new(100.0, 100.0);
         // A PNG signature with nothing after it.
         d.images.insert("cut".into(), ImageBlob::new("image/png", b"\x89PNG\r\n\x1a\n".to_vec()));
-        let im =
-            ImageObject { key: "cut".into(), width: 40, height: 40, xf: Affine::translate((30.0, 30.0)), link: None, placement: Default::default() };
+        let im = ImageObject {
+            key: "cut".into(),
+            width: 40,
+            height: 40,
+            xf: Affine::translate((30.0, 30.0)),
+            link: None,
+            placement: Default::default(),
+            pixels: None,
+        };
         let mut n = Node::new(d.alloc_id(), NodeKind::Image(Box::new(im)));
         n.appearance.effects = [
             ("rasterize", json!({"background": "white"})),

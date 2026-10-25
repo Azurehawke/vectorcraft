@@ -413,6 +413,8 @@ impl Bristle {
     pub const SIZE_RANGE: (f64, f64) = (0.1, 1296.0);
     pub const LENGTH_RANGE: (f64, f64) = (25.0, 300.0);
     pub const PERCENT_RANGE: (f64, f64) = (1.0, 100.0);
+    /// The most characters `brush.new` and `brush.options` take for a new bristle brush name.
+    pub const MAX_NAME_CHARS: usize = 31;
 }
 
 impl Default for Bristle {
@@ -687,6 +689,10 @@ fn leave_out_brushed(doc: &Document, nodes: &mut Vec<Node>, known: &mut Known) {
 /// with the stroke's opacity folded into the piece opacity. `None` if nothing is brushed.
 pub fn node_pieces(doc: &Document, n: &Node) -> Option<Vec<Node>> {
     let bp = node_bezpath(n)?;
+    // The library is parsed for a stroke that names a brush, not for every path.
+    if !n.appearance.items.iter().any(|i| matches!(i, AppearanceItem::Stroke(st) if st.brush.is_some())) {
+        return None;
+    }
     let lib = library(doc);
     let mut out = vec![];
     let mut any = false;

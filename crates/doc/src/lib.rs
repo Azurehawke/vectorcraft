@@ -44,6 +44,7 @@ pub mod perspective;
 mod pixels;
 pub use pixels::MAX_RASTER_ALLOC;
 pub mod placed_document;
+pub mod plugin_data;
 pub mod profiles;
 pub mod puppet;
 pub mod range;
@@ -92,24 +93,24 @@ pub use appearance::{
 };
 pub use assets::ExportAsset;
 pub use corners::LiveCorners;
-pub use depth::MAX_DEPTH;
+pub use depth::{MAX_DEPTH, MAX_SYMBOL_NODES};
 pub use graph::{
     ColumnDesign, ColumnType, Fractions, GraphDesign, GraphKind, GraphSpec, LabelStyles, MAX_GRAPH_CATEGORIES, MAX_GRAPH_SERIES, PiePosition,
     PieSort, SeriesPaint, TickLength, ValueAxisSide,
 };
 pub use hit::{Hit, HitKind};
 pub use links::{LinkInfo, PlacementOptions};
-pub use live::{BlendOrientation, BlendSpacing, BlendSpec, EnvelopeKind, GradientMesh, MeshPoint};
+pub use live::{BlendEase, BlendEaseType, BlendOrientation, BlendSpacing, BlendSpec, EnvelopeKind, GradientMesh, MeshPoint};
 pub use live_paint::{GapOptions, GapSize};
 pub use metadata::{CopyrightStatus, DocMetadata};
 pub use node::Knockout;
 pub use node::Scaling;
 pub use node::{Extras, ExtrasMut, ImageObject, LAYER_COLORS, LayerColor, LiveShape, Node, NodeExtras, NodeId, NodeKind, OpacityMask};
-pub use node::{ImageMap, MAX_SVG_SCRIPTS, ObjectAttributes, SVG_EVENTS};
+pub use node::{ForeignAttribute, ImageMap, MAX_SVG_SCRIPTS, ObjectAttributes, SVG_EVENTS};
 pub use orient::OrientedBox;
 pub use pattern::{Overlap, PatternDef, PatternEdit, RepeatKind, RepeatSpec, TileType};
 pub use perspective::PerspectiveAttachment;
-pub use placed_document::PlacedDocument;
+pub use placed_document::{PageBox, PlacedDocument};
 pub use profiles::ColorProfiles;
 pub use puppet::{PuppetPin, PuppetPins};
 pub use rastersettings::{RasterColorModel, RasterEffectsSettings};
@@ -119,8 +120,8 @@ pub use slices::{CellAlign, CellVAlign, Slice, SliceArea, SliceKind, SliceOption
 pub use style_libs::StyleLibrary;
 pub use text::{
     AreaFit, AreaOptions, Burasagari, CharAlign, CharPosition, CharStyle, Composer, Digits, FirstBaseline, HyphenationOptions, InlineArt,
-    JustificationOptions, Justify, Kinsoku, LeadingModel, Mojikumi, ParaDirection, ParaStyle, PathAlign, PathEffect, ScriptMetrics,
-    SingleWordJustify, TabAlign, TabStop, TextKind, TextObject, TextRun, TextStyleDef, TextWrap, VerticalAlign, WrapShape,
+    JustificationOptions, Justify, Kinsoku, LeadingModel, Mojikumi, ParaDirection, ParaStyle, PathAlign, PathEffect, RubyAlign, RubyPosition,
+    RubySpan, ScriptMetrics, SingleWordJustify, TabAlign, TabStop, TextKind, TextObject, TextRun, TextStyleDef, TextWrap, VerticalAlign, WrapShape,
 };
 pub use trace::TraceView;
 pub use variables::{DataSet, DataValue, Variable, VariableKind, Variables};
@@ -378,7 +379,9 @@ fn parse_measure(s: &str, default: Unit) -> Option<f64> {
 /// A number with an optional unit suffix (`12`, `3 mm`, `2in`) → (the number, its unit).
 fn number_unit(s: &str) -> Option<(f64, Option<Unit>)> {
     let s = s.trim();
-    let num_end = s.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-')).unwrap_or(s.len());
+    // A leading `+` is a sign (`+5`), like `-`.
+    let sign = usize::from(s.starts_with('+'));
+    let num_end = s.get(sign..)?.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-')).map_or(s.len(), |i| i + sign);
     let v: f64 = s.get(..num_end)?.trim().parse().ok()?;
     let unit = match s.get(num_end..)?.trim() {
         "" => None,
@@ -438,16 +441,165 @@ pub struct Artboard {
     pub name: String,
     /// Artboard rectangle in document points.
     pub rect: Rect,
+    /// Locked (the Artboards panel's lock column): the Artboard tool and the artboard commands
+    /// don't move, resize or delete it, Rearrange leaves it where it is, and the art on it can't be
+    /// selected or edited ([`Document::on_locked_artboard`]), except new art while it stays
+    /// selected ([`Document::new_art`]).
+    #[serde(default, skip_serializing_if = "skip::is_default")]
+    pub locked: bool,
+    /// Show Center Mark (Artboard Options): the canvas draws a mark at the artboard's center.
+    /// Exports and print leave it out. Always written, as before it could be set.
     #[serde(default)]
     pub show_center_mark: bool,
+    /// Show Cross Hairs (Artboard Options): the canvas draws a line from the middle of each side
+    /// through the center. Exports and print leave them out. Always written, as before it could
+    /// be set.
     #[serde(default)]
     pub show_cross_hairs: bool,
+    /// Show Video Safe Areas (Artboard Options): the canvas draws the artboard's action-safe and
+    /// title-safe areas ([`Artboard::video_safe_areas`]). Exports and print leave them out. Written
+    /// only when on, so a document that never shows them saves as before.
+    #[serde(default, skip_serializing_if = "skip::is_default")]
+    pub show_video_safe_areas: bool,
+    /// Video Ruler Pixel Aspect Ratio (Artboard Options): the width of one video pixel over its
+    /// height, which View › Rulers › Show Video Rulers counts the artboard in: a pixel is this many
+    /// points wide and one point tall. 1 (square pixels) unless set, and written only when it isn't
+    /// 1; always within [`VIDEO_PIXEL_ASPECT_RANGE`]: the commands refuse others, and a file's is
+    /// brought into it as it opens.
+    #[serde(default = "square_pixels", deserialize_with = "pixel_aspect_within_range", skip_serializing_if = "is_square_pixels")]
+    pub video_ruler_pixel_aspect_ratio: f64,
     /// Background color (Properties › Artboards › Fill, Artboard Options). The canvas draws the
     /// artboard's paper in it, multiplied with the Simulate Colored Paper color while that is on;
     /// without one the paper is white, or the Simulate Colored Paper color. Exports and print leave
     /// it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<vectorcraft_color::Color>,
+}
+
+/// The Video Ruler Pixel Aspect Ratios an artboard takes (Artboard Options): from a pixel ten times
+/// as tall as it is wide to one ten times as wide as it is tall, which holds the anamorphic and
+/// standard-definition ratios video uses (0.9, 1.2, 1.33, 2) with room to spare.
+pub const VIDEO_PIXEL_ASPECT_RANGE: std::ops::RangeInclusive<f64> = 0.1..=10.0;
+
+/// How far in from each edge of an artboard the video safe areas lie, as a share of its width
+/// (left and right) and of its height (top and bottom): the action-safe area 3.5% and the
+/// title-safe (graphics-safe) area 5%, as EBU R 95 sets them for 16:9 television
+/// (https://tech.ebu.ch/docs/r/r095.pdf, note 5).
+pub const VIDEO_SAFE_INSETS: [f64; 2] = [0.035, 0.05];
+
+fn square_pixels() -> f64 {
+    1.0
+}
+
+fn is_square_pixels(v: &f64) -> bool {
+    *v == 1.0
+}
+
+/// A file's Video Ruler Pixel Aspect Ratio, brought into [`VIDEO_PIXEL_ASPECT_RANGE`]: one that
+/// isn't a number (NaN, infinite) reads as square pixels.
+fn pixel_aspect_within_range<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    let v = f64::deserialize(d)?;
+    let (lo, hi) = (*VIDEO_PIXEL_ASPECT_RANGE.start(), *VIDEO_PIXEL_ASPECT_RANGE.end());
+    Ok(if v.is_finite() { v.clamp(lo, hi) } else { 1.0 })
+}
+
+impl Artboard {
+    /// The action-safe and the title-safe area of the artboard, in that order, each inset from its
+    /// edges by the share of [`VIDEO_SAFE_INSETS`] (Show Video Safe Areas).
+    pub fn video_safe_areas(&self) -> [Rect; 2] {
+        let r = self.rect;
+        VIDEO_SAFE_INSETS.map(|k| r.inflate(-k * r.width(), -k * r.height()))
+    }
+}
+
+/// A document's locked artboards ([`Document::locked_artboards`]).
+pub struct LockedArtboards<'a> {
+    rects: Vec<Rect>,
+    symbols: SymbolBoxes<'a>,
+    /// The new art, which isn't on them ([`Document::new_art`]).
+    new_art: Arc<std::collections::HashSet<NodeId>>,
+    /// The objects of pattern editing mode's layer ([`Document::pattern_edit`]), which are on no
+    /// artboard.
+    pattern_art: std::collections::HashSet<NodeId>,
+    /// What [`LockedArtboards::overlaps`] found for each object it measured: the members of a
+    /// group are each answered with one measurement of the group.
+    held: std::cell::RefCell<std::collections::HashMap<NodeId, bool>>,
+}
+
+impl LockedArtboards<'_> {
+    /// No artboard is locked.
+    pub fn is_empty(&self) -> bool {
+        self.rects.is_empty()
+    }
+    /// Is `n`, an object of a layer or sublayer, on a locked artboard: shown, not a guide, and its
+    /// visual bounds (with its strokes, a symbol instance by its art) overlapping the artboard? An
+    /// object counts for every artboard it overlaps, as Fit to Artwork Bounds counts it. A layer or
+    /// sublayer is on none, nor is the art of pattern editing mode ([`Document::pattern_edit`]) or
+    /// new art while it stays selected ([`Document::new_art`]).
+    pub fn holds(&self, n: &Node) -> bool {
+        !self.new_art.contains(&n.id) && self.overlaps(n)
+    }
+    /// [`LockedArtboards::holds`] for new art too: is `n` on a locked artboard, whether or not it
+    /// is new art?
+    pub fn overlaps(&self, n: &Node) -> bool {
+        if self.rects.is_empty()
+            || !n.visible
+            || n.is_layer()
+            || matches!(n.kind, NodeKind::Path { guide: true, .. })
+            || self.pattern_art.contains(&n.id)
+        {
+            return false;
+        }
+        if let Some(held) = self.held.borrow().get(&n.id) {
+            return *held;
+        }
+        let held =
+            n.visual_bounds_with(&self.symbols).is_some_and(|b| self.rects.iter().any(|r| b.x0 < r.x1 && b.x1 > r.x0 && b.y0 < r.y1 && b.y1 > r.y0));
+        self.held.borrow_mut().insert(n.id, held);
+        held
+    }
+    /// Is node `id` on a locked artboard: is the object of a layer or sublayer that holds it (`id`
+    /// itself when it is one, a group counting as one object) on one ([`LockedArtboards::holds`])?
+    pub fn holds_id(&self, id: NodeId) -> bool {
+        !self.rects.is_empty() && self.symbols.document().layer_object(id).is_some_and(|n| self.holds(n))
+    }
+}
+
+/// New art on a locked artboard ([`Document::new_art`]). Setting it changes the document in
+/// place, so a selection change that sets it doesn't replace the document.
+#[derive(Default)]
+pub struct NewArtIds(std::sync::RwLock<Arc<std::collections::HashSet<NodeId>>>);
+
+impl NewArtIds {
+    /// The objects.
+    pub fn get(&self) -> Arc<std::collections::HashSet<NodeId>> {
+        self.0.read().map(|g| g.clone()).unwrap_or_default()
+    }
+    /// Make `ids` the objects.
+    pub fn set(&self, ids: Arc<std::collections::HashSet<NodeId>>) {
+        if let Ok(mut g) = self.0.write() {
+            *g = ids;
+        }
+    }
+}
+
+impl Clone for NewArtIds {
+    fn clone(&self) -> Self {
+        NewArtIds(std::sync::RwLock::new(self.get()))
+    }
+}
+
+/// Editing state, not document content: two documents are equal whatever new art they name.
+impl PartialEq for NewArtIds {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for NewArtIds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("NewArtIds").field(&self.get()).finish()
+    }
 }
 
 /// Opacity-mask editing mode: `object`'s mask art lives on the temporary `layer` while editing.
@@ -801,6 +953,18 @@ pub struct Document {
     /// state, never saved.
     #[serde(skip)]
     pub puppet: Option<Arc<PuppetPins>>,
+    /// New art on a locked artboard: objects of layers on a locked artboard that an edit made and
+    /// left selected (a group with selected members counts), kept while they stay selected and on
+    /// one. They and their contents can be selected and edited ([`LockedArtboards::holds`]). The
+    /// engine sets it from the selection's ([`Selection::new_art`]). Editing state, never saved.
+    #[serde(skip)]
+    pub new_art: NewArtIds,
+    /// The highest artboard id given out ([`Document::next_artboard_id`]) or deleted from the
+    /// document ([`Document::retire_artboard_id`]): a new artboard takes a higher one. Shared by
+    /// every copy of the document, the undo history's included, so an undo does not lower it.
+    /// Never saved.
+    #[serde(skip)]
+    pub retired_artboard_id: RetiredArtboardId,
     /// Some object is a dimension (the Dimension tool): edits refresh dimensions only while this
     /// is set, so documents without any pay nothing for them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -808,6 +972,27 @@ pub struct Document {
     /// Where each node is in the tree, for lookups by id ([`id_index`]): a cache, never saved.
     #[serde(skip)]
     index: id_index::IdIndex,
+}
+
+/// [`Document::retired_artboard_id`]: not document content, so two documents are equal whatever it
+/// holds. A clone shares the value with the document it was cloned from.
+#[derive(Clone, Debug, Default)]
+pub struct RetiredArtboardId(Arc<std::sync::atomic::AtomicU32>);
+
+impl RetiredArtboardId {
+    pub fn get(&self) -> u32 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Raise the value to `id` when `id` is higher.
+    pub fn raise(&self, id: u32) {
+        self.0.fetch_max(id, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl PartialEq for RetiredArtboardId {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 fn ppi72() -> f64 {
@@ -833,6 +1018,137 @@ type Places = BTreeMap<Vec<usize>, Vec<(usize, usize)>>;
 pub const FORMAT_VERSION: u32 = 1;
 
 impl Document {
+    /// Is everything but the layers the same in `other`, as the next version of the document after
+    /// an edit of its art? The id counter and the id index are left out, and art outside the layers
+    /// (symbols, patterns, graph designs) compares by identity, which an edit keeps for what it
+    /// doesn't change: quick for every frame of an animation.
+    pub fn same_outside_layers(&self, other: &Self) -> bool {
+        let same_art = |a: &[Arc<Node>], b: &[Arc<Node>]| a.len() == b.len() && a.iter().zip(b).all(|(a, b)| Arc::ptr_eq(a, b));
+        let same_pattern = |a: &PatternDef, b: &PatternDef| {
+            same_art(&a.art, &b.art) && PatternDef { art: Vec::new(), ..a.clone() } == PatternDef { art: Vec::new(), ..b.clone() }
+        };
+        let Self {
+            version,
+            title,
+            template,
+            units,
+            ruler_origin,
+            rulers,
+            artboard_ruler_origins,
+            color_mode,
+            artboards,
+            layers: _,
+            swatches,
+            swatch_groups,
+            graphic_styles,
+            char_styles,
+            para_styles,
+            text_threads,
+            symbols,
+            graph_designs,
+            guides,
+            views,
+            saved_selections,
+            variables,
+            grid,
+            raster_effects_ppi,
+            images,
+            patterns,
+            pattern_edit,
+            mask_edit,
+            next_id: _,
+            unknown,
+            page_isolate,
+            page_knockout,
+            spot_use_lab,
+            setup,
+            paste_remembers_layers,
+            metadata,
+            raster_effects,
+            last_view,
+            transparency_grid,
+            layers_open,
+            color_profiles,
+            export_settings,
+            extra,
+            slices,
+            slices_clip_to_artboard,
+            print_setup,
+            assets,
+            svg_scripts,
+            puppet,
+            new_art,
+            dimensions,
+            retired_artboard_id: _,
+            index: _,
+        } = self;
+        *version == other.version
+            && *title == other.title
+            && *template == other.template
+            && *units == other.units
+            && *ruler_origin == other.ruler_origin
+            && *rulers == other.rulers
+            && *artboard_ruler_origins == other.artboard_ruler_origins
+            && *color_mode == other.color_mode
+            && *artboards == other.artboards
+            && *swatches == other.swatches
+            && *swatch_groups == other.swatch_groups
+            && *graphic_styles == other.graphic_styles
+            && *char_styles == other.char_styles
+            && *para_styles == other.para_styles
+            && *text_threads == other.text_threads
+            && symbols.len() == other.symbols.len()
+            && symbols.iter().zip(&other.symbols).all(|(a, b)| a.name == b.name && Arc::ptr_eq(&a.art, &b.art))
+            && graph_designs.len() == other.graph_designs.len()
+            && graph_designs.iter().zip(&other.graph_designs).all(|(a, b)| a.name == b.name && Arc::ptr_eq(&a.art, &b.art))
+            && *guides == other.guides
+            && *views == other.views
+            && *saved_selections == other.saved_selections
+            && *variables == other.variables
+            && *grid == other.grid
+            && *raster_effects_ppi == other.raster_effects_ppi
+            && *images == other.images
+            && patterns.len() == other.patterns.len()
+            && patterns.iter().zip(&other.patterns).all(|(a, b)| same_pattern(a, b))
+            && match (pattern_edit, &other.pattern_edit) {
+                (Some(a), Some(b)) => {
+                    a.pattern == b.pattern
+                        && a.layer == b.layer
+                        && match (&a.original, &b.original) {
+                            (Some(a), Some(b)) => same_pattern(a, b),
+                            (a, b) => a.is_none() && b.is_none(),
+                        }
+                }
+                (a, b) => a.is_none() && b.is_none(),
+            }
+            && *mask_edit == other.mask_edit
+            && *unknown == other.unknown
+            && *page_isolate == other.page_isolate
+            && *page_knockout == other.page_knockout
+            && *spot_use_lab == other.spot_use_lab
+            && *setup == other.setup
+            && *paste_remembers_layers == other.paste_remembers_layers
+            && *metadata == other.metadata
+            && *raster_effects == other.raster_effects
+            && *last_view == other.last_view
+            && *transparency_grid == other.transparency_grid
+            && *layers_open == other.layers_open
+            && *color_profiles == other.color_profiles
+            && *export_settings == other.export_settings
+            && *extra == other.extra
+            && *slices == other.slices
+            && *slices_clip_to_artboard == other.slices_clip_to_artboard
+            && *print_setup == other.print_setup
+            && *assets == other.assets
+            && *svg_scripts == other.svg_scripts
+            && match (puppet, &other.puppet) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (a, b) => a.is_none() && b.is_none(),
+            }
+            && *new_art == other.new_art
+            && *dimensions == other.dimensions
+    }
+
     /// Document Raster Effects Settings › Resolution in ppi, 1 to 2400 (72 when the stored value
     /// isn't a number).
     pub fn raster_ppi(&self) -> f64 {
@@ -888,8 +1204,11 @@ impl Document {
                 id: 1,
                 name: "Artboard 1".into(),
                 rect: Rect::new(0.0, 0.0, width, height),
+                locked: false,
                 show_center_mark: false,
                 show_cross_hairs: false,
+                show_video_safe_areas: false,
+                video_ruler_pixel_aspect_ratio: 1.0,
                 color: None,
             }],
             layers: vec![],
@@ -932,7 +1251,9 @@ impl Document {
             assets: vec![],
             svg_scripts: vec![],
             puppet: None,
+            new_art: Default::default(),
             dimensions: false,
+            retired_artboard_id: Default::default(),
             index: Default::default(),
         };
         let id = d.alloc_id();
@@ -1365,9 +1686,69 @@ impl Document {
     pub fn node_count(&self) -> usize {
         self.layers.iter().map(|l| l.count()).sum()
     }
-    /// Is the node (and every ancestor) visible and unlocked?
+    /// Is the node (and every ancestor) visible and unlocked, and not on a locked artboard
+    /// ([`Document::on_locked_artboard`])?
     pub fn is_editable(&self, id: NodeId) -> bool {
-        self.ancestry(id).is_some_and(|a| a.iter().all(|i| self.node(*i).is_some_and(|n| n.visible && !n.locked)))
+        self.is_editable_with(&self.locked_artboards(), id)
+    }
+    /// [`Document::is_editable`] with the locked artboards `locks` of this document, measured
+    /// once for many ids.
+    pub fn is_editable_with(&self, locks: &LockedArtboards, id: NodeId) -> bool {
+        self.ancestry(id).is_some_and(|a| a.iter().all(|i| self.node(*i).is_some_and(|n| n.visible && !n.locked))) && !locks.holds_id(id)
+    }
+    /// [`Document::is_editable`] for many ids: the art on the locked artboards is measured once
+    /// for all of them, a group once for all its members.
+    pub fn editable(&self) -> impl Fn(NodeId) -> bool + '_ {
+        let locks = self.locked_artboards();
+        move |id| self.is_editable_with(&locks, id)
+    }
+    /// The locked artboards, for asking which art is on them ([`LockedArtboards::holds`]).
+    pub fn locked_artboards(&self) -> LockedArtboards<'_> {
+        self.locked_artboards_except(usize::MAX)
+    }
+    /// [`Document::locked_artboards`] leaving out artboard `index`.
+    pub fn locked_artboards_except(&self, index: usize) -> LockedArtboards<'_> {
+        // Art flush with an edge from outside can overlap it by a rounding error, as in
+        // `art_bounds_on` (#1295).
+        let rects: Vec<Rect> =
+            self.artboards.iter().enumerate().filter(|(i, a)| a.locked && *i != index).map(|(_, a)| a.rect.inflate(-1e-6, -1e-6)).collect();
+        // The objects of pattern editing mode's layer, a sublayer's objects included.
+        fn objects(n: &Node, out: &mut std::collections::HashSet<NodeId>) {
+            for c in n.children().into_iter().flatten() {
+                if c.is_layer() {
+                    objects(c, out);
+                } else {
+                    out.insert(c.id);
+                }
+            }
+        }
+        let mut pattern_art = std::collections::HashSet::new();
+        if let Some(layer) = self.pattern_edit.as_ref().filter(|_| !rects.is_empty()).and_then(|e| self.layers.iter().find(|l| l.id == e.layer)) {
+            objects(layer, &mut pattern_art);
+        }
+        LockedArtboards { rects, symbols: self.symbol_boxes(), new_art: self.new_art.get(), pattern_art, held: Default::default() }
+    }
+    /// Is `id` on a locked artboard ([`LockedArtboards::holds_id`])? A layer or sublayer is on none.
+    pub fn on_locked_artboard(&self, id: NodeId) -> bool {
+        self.locked_artboards().holds_id(id)
+    }
+    /// The object of a layer or sublayer that holds node `id`: `id` itself when it is one, else
+    /// the group or other object around it right inside a layer. None for a layer or sublayer.
+    pub fn layer_object(&self, id: NodeId) -> Option<&Node> {
+        self.layer_object_at(&self.index_path(id)?)
+    }
+    /// [`Document::layer_object`] for the node at index path `path`.
+    pub fn layer_object_at(&self, path: &[usize]) -> Option<&Node> {
+        // Down the path to the first node that isn't a layer.
+        let mut nodes = &self.layers;
+        for &i in path {
+            let n = nodes.get(i)?;
+            if !n.is_layer() {
+                return Some(n.as_ref());
+            }
+            nodes = n.children()?;
+        }
+        None
     }
     pub fn is_visible(&self, id: NodeId) -> bool {
         self.ancestry(id).is_some_and(|a| a.iter().all(|i| self.node(*i).is_some_and(|n| n.visible)))
@@ -1378,9 +1759,16 @@ impl Document {
         a.iter().rev().copied().find(|i| self.node(*i).is_some_and(Node::is_layer))
     }
     /// Every art object the Selection tool can reach (Select All): the visible, unlocked objects
-    /// of the visible, unlocked, non-template layers, looking through sublayers (bottom first).
+    /// of the visible, unlocked, non-template layers, looking through sublayers (bottom first),
+    /// except those on a locked artboard.
     pub fn selectable_art(&self) -> Vec<NodeId> {
-        self.layers.iter().filter(|l| l.visible && !l.locked && !l.is_template()).flat_map(|l| l.layer_art(true)).collect()
+        let locks = self.locked_artboards();
+        self.layers
+            .iter()
+            .filter(|l| l.visible && !l.locked && !l.is_template())
+            .flat_map(|l| l.layer_art(true))
+            .filter(|id| locks.is_empty() || !self.node(*id).is_some_and(|n| locks.holds(n)))
+            .collect()
     }
     /// Colour of the innermost layer or sublayer containing `id` (selection highlight colour).
     pub fn layer_color(&self, id: NodeId) -> [u8; 3] {
@@ -1450,6 +1838,18 @@ impl Document {
         let mut art = vec![];
         for l in self.layers.iter().filter(|l| l.rides_with_artboard(locked_and_hidden)) {
             collect(l, &symbols, rect, locked_and_hidden, &mut art);
+        }
+        art
+    }
+    /// The art that moves, scales or is cut with artboard `index`: [`Document::art_on_artboard`]
+    /// without the objects on another locked artboard, which stay unless `locked_and_hidden`, as
+    /// locked art does.
+    pub fn art_moving_with(&self, index: usize, locked_and_hidden: bool) -> Vec<NodeId> {
+        let Some(rect) = self.artboards.get(index).map(|a| a.rect) else { return vec![] };
+        let mut art = self.art_on_artboard(rect, locked_and_hidden);
+        let locks = self.locked_artboards_except(index);
+        if !locked_and_hidden && !locks.is_empty() {
+            art.retain(|id| !self.node(*id).is_some_and(|n| locks.holds(n)));
         }
         art
     }
@@ -1569,8 +1969,18 @@ impl Document {
             self.guides.iter().filter(|g| g.artboard == Some(from)).map(|g| Guide { artboard: Some(to), ..g.moved(d) }).collect();
         self.guides.extend(copies);
     }
+    /// An id for a new artboard: one no artboard has, above the ids given out before and the ids of
+    /// the artboards deleted from the document ([`Document::retired_artboard_id`]). The id counts
+    /// as given out, so an artboard made after an undo does not take the id of one the undo took
+    /// away.
     pub fn next_artboard_id(&self) -> u32 {
-        free_id(self.artboards.iter().map(|a| a.id))
+        let id = free_id(self.artboards.iter().map(|a| a.id).chain([self.retired_artboard_id.get()]));
+        self.retired_artboard_id.raise(id);
+        id
+    }
+    /// Record that the artboard with `id` was deleted: no later artboard takes its id.
+    pub fn retire_artboard_id(&self, id: u32) {
+        self.retired_artboard_id.raise(id);
     }
     pub fn pattern(&self, name: &str) -> Option<&PatternDef> {
         self.patterns.iter().find(|p| p.name == name)
@@ -1578,16 +1988,29 @@ impl Document {
     pub fn pattern_mut(&mut self, name: &str) -> Option<&mut PatternDef> {
         self.patterns.iter_mut().find(|p| p.name == name)
     }
-    /// Deep-clone `node` with fresh ids for it and all descendants.
+    /// Deep-clone `node` with fresh ids for it and all descendants, its images' own pixels taken
+    /// in ([`Self::adopt_pixels`]).
     pub fn reid(&mut self, node: &Node) -> Node {
         let mut n = node.clone();
         n.id = self.alloc_id();
+        if let NodeKind::Image(im) = &mut n.kind {
+            self.adopt_image_pixels(im);
+        }
         // A copied annotation must never bind its source ids to unrelated art in a different
         // document. Keep the measured geometry; new measurements can be linked after pasting.
         if let Some(e) = n.extras_if_any()
             && let Some(dimension) = &mut e.dimension
         {
             dimension.source = None;
+        }
+        // A copy of a threaded frame is in no thread, so its first paragraph starts in it and its
+        // layout caches are dropped. A caller that keeps the copy as an object fills them again.
+        if let NodeKind::Text(t) = &mut n.kind
+            && t.first_para_continues
+        {
+            t.first_para_continues = false;
+            t.cached_bounds = None;
+            t.cached_baselines.clear();
         }
         let mut renamed = std::collections::HashMap::new();
         if let Some(ch) = n.children_mut() {
@@ -1606,6 +2029,48 @@ impl Document {
 }
 
 impl Document {
+    /// The pixels image `im` shows: its own ([`ImageObject::pixels`]) or this document's.
+    pub fn image_blob<'a>(&'a self, im: &'a ImageObject) -> Option<&'a ImageBlob> {
+        im.pixels.as_deref().or_else(|| self.images.get(&im.key))
+    }
+
+    /// Take the pixels the images in `n` (its opacity masks' art included) hold themselves (art
+    /// made outside a document) into [`Self::images`]: under the image's key, or a free one when
+    /// the key shows other pixels.
+    pub fn adopt_pixels(&mut self, n: &mut Node) {
+        // Only what holds such pixels is copied out of the art it shares.
+        fn holds(n: &Node) -> bool {
+            matches!(&n.kind, NodeKind::Image(im) if im.pixels.is_some())
+                || n.extras().mask.as_ref().is_some_and(|m| holds(&m.art))
+                || n.children().into_iter().flatten().any(|c| holds(c))
+        }
+        if let NodeKind::Image(im) = &mut n.kind {
+            self.adopt_image_pixels(im);
+        }
+        if let Some(m) = n.extras_if_any().and_then(|e| e.mask.as_deref_mut())
+            && holds(&m.art)
+        {
+            self.adopt_pixels(Arc::make_mut(&mut m.art));
+        }
+        for c in n.children_mut().into_iter().flatten() {
+            if holds(c) {
+                self.adopt_pixels(Arc::make_mut(c));
+            }
+        }
+    }
+
+    fn adopt_image_pixels(&mut self, im: &mut ImageObject) {
+        let Some(blob) = im.pixels.take() else { return };
+        let mut key = im.key.clone();
+        let mut i = 1;
+        while self.images.get(&key).is_some_and(|b| b.bytes != blob.bytes) {
+            i += 1;
+            key = format!("{}-{i}", im.key);
+        }
+        self.images.entry(key.clone()).or_insert_with(|| (*blob).clone());
+        im.key = key;
+    }
+
     /// Saved selections as a file gives them, made safe to list and recall: at most
     /// [`SavedSelection::MAX`], each with a clean, unique name and naming objects this document
     /// has, each once. (An id it doesn't have would select whatever object takes that id later.)
@@ -1937,6 +2402,101 @@ mod tests {
         {
             assert!(d.art_on_artboard(board, false).is_empty(), "overhang at {board:?}");
         }
+    }
+
+    /// The art on a locked artboard (each object of a layer whose bounds overlap it, a group as one
+    /// object) can't be edited, and Select All, a click and a marquee pass over it; art flush with
+    /// the artboard from outside isn't on it, a layer is on no artboard, and new art isn't on one.
+    /// Unlocking the artboard gives the art back.
+    #[test]
+    fn art_on_a_locked_artboard_cannot_be_selected_or_edited() {
+        use crate::hit::{HitOptions, hit_test, marquee, objects_at};
+        let (mut d, a, b) = doc_with_rects();
+        let layer = d.layers[0].id;
+        d.artboards.push(Artboard {
+            id: 2,
+            name: "Artboard 2".into(),
+            rect: Rect::new(700.0, 0.0, 900.0, 200.0),
+            locked: false,
+            show_center_mark: false,
+            show_cross_hairs: false,
+            show_video_safe_areas: false,
+            video_ruler_pixel_aspect_ratio: 1.0,
+            color: None,
+        });
+        let rect = |d: &mut Document, r: Rect, appearance: Appearance| {
+            let id = d.alloc_id();
+            d.insert(Some(layer), usize::MAX, Node::path(id, shapes::rectangle(r), appearance)).unwrap();
+            id
+        };
+        let c = rect(&mut d, Rect::new(710.0, 10.0, 730.0, 30.0), Appearance::default_art());
+        // A group with one member on the artboard and one right of it.
+        let (g, m1, m2) = (d.alloc_id(), d.alloc_id(), d.alloc_id());
+        let members = [(m1, 750.0), (m2, 950.0)]
+            .map(|(id, x)| Arc::new(Node::path(id, shapes::rectangle(Rect::new(x, 50.0, x + 10.0, 60.0)), Appearance::default_art())));
+        d.insert(Some(layer), usize::MAX, Node::group(g, members.to_vec())).unwrap();
+        // Unstroked and flush with the artboard's left edge, from outside.
+        let e = rect(&mut d, Rect::new(680.0, 10.0, 700.0, 30.0), Appearance::default());
+        let opt = HitOptions::default();
+        let top = |d: &Document, x, y| hit_test(d, Point::new(x, y), opt).map(|h| h.top_object(None));
+        let all = Rect::new(-10.0, -10.0, 1000.0, 800.0);
+        assert_eq!(top(&d, 720.0, 20.0), Some(c));
+        d.artboards[1].locked = true;
+        for id in [c, g, m1, m2] {
+            assert!(d.on_locked_artboard(id) && !d.is_editable(id), "{id:?} is on the locked artboard");
+        }
+        for id in [a, b, e, layer] {
+            assert!(!d.on_locked_artboard(id) && d.is_editable(id), "{id:?} isn't");
+        }
+        assert_eq!(d.selectable_art(), [a, b, e]);
+        assert_eq!(top(&d, 720.0, 20.0), None, "a click passes over c");
+        assert_eq!(top(&d, 955.0, 55.0), None, "and over the group's member off the artboard");
+        let isolated = HitOptions { scope: Some(g), ..opt };
+        assert!(hit_test(&d, Point::new(755.0, 55.0), isolated).is_none(), "and inside the group isolated before the lock");
+        assert!(objects_at(&d, Point::new(720.0, 20.0), opt, None).is_empty());
+        assert_eq!(marquee(&d, all, None, false), [a, b, e]);
+        assert_eq!(marquee(&d, all, None, true), [a, b, e], "the Direct Selection tool's marquee too");
+        // Deselected in one pass, with the key object and the anchors.
+        let mut sel = Selection::default();
+        sel.set([a, c]);
+        sel.key = Some(c);
+        sel.anchors.insert(c, [(0, 0)].into());
+        sel.deselect_on_locked_artboards(&d);
+        assert_eq!((sel.objects.clone(), sel.key, sel.anchors.is_empty()), (vec![a], None, true));
+        // A targeted layer stays targeted, with its art off the locked artboard selected.
+        sel.set_target(&d, layer);
+        sel.deselect_on_locked_artboards(&d);
+        assert_eq!((sel.objects.clone(), sel.target), (vec![a, b, e], Some(layer)));
+        // Shift-clicking the layer's target circle removes its art off the locked artboard, and
+        // a second Shift-click adds it again.
+        sel.toggle_target(&d, layer);
+        sel.deselect_on_locked_artboards(&d);
+        assert_eq!((sel.objects.clone(), sel.target), (vec![], None));
+        sel.toggle_target(&d, layer);
+        sel.deselect_on_locked_artboards(&d);
+        assert_eq!(sel.objects, [a, b, e]);
+        // A sublayer with art on both artboards: its art off the locked artboard can still be clicked.
+        let (sub, s1, s2) = (d.alloc_id(), d.alloc_id(), d.alloc_id());
+        d.insert(Some(layer), usize::MAX, Node::layer(sub, "Sub", LayerColor::Preset(2))).unwrap();
+        for (id, x, y) in [(s1, 300.0, 300.0), (s2, 800.0, 100.0)] {
+            d.insert(Some(sub), usize::MAX, Node::path(id, shapes::rectangle(Rect::new(x, y, x + 10.0, y + 10.0)), Appearance::default_art()))
+                .unwrap();
+        }
+        assert_eq!((top(&d, 305.0, 305.0), top(&d, 805.0, 105.0)), (Some(s1), None));
+        assert!(!d.on_locked_artboard(sub));
+        let mut both = Selection::default();
+        both.set([s1, s2]);
+        both.deselect_on_locked_artboards(&d);
+        assert_eq!(both.objects, [s1]);
+        // New art on it is editable and can be clicked while it is new art.
+        d.new_art.set(Arc::new([c].into()));
+        assert!(!d.on_locked_artboard(c) && d.is_editable(c), "new art");
+        assert_eq!(top(&d, 720.0, 20.0), Some(c));
+        d.new_art.set(Default::default());
+        d.artboards[1].locked = false;
+        assert_eq!(d.selectable_art(), [a, b, c, g, e, s1, s2]);
+        assert_eq!(top(&d, 955.0, 55.0), Some(g));
+        assert_eq!(marquee(&d, all, None, false), [a, b, c, g, e, s1, s2]);
     }
 
     #[test]

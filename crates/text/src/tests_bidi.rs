@@ -1,8 +1,9 @@
 //! Direction, source-cluster and editing regressions; no RTL font assets required.
 use super::*;
 use kurbo::{Affine, BezPath, Point, Rect, Shape};
+use std::ops::Range;
 use std::sync::Arc;
-use vectorcraft_doc::{CharStyle, TextKind, TextRun};
+use vectorcraft_doc::{CharStyle, ParaDirection, TextKind, TextRun};
 
 fn text_layout(s: &str) -> TextLayout {
     layout(FontDb::global(), &TextObject::point(Point::ZERO, s, CharStyle::default()))
@@ -88,6 +89,40 @@ fn mixed_text_preserves_latin_and_number_order() {
     assert_eq!(s, "שלום Rust 123", "layout must not rewrite source text");
 }
 
+/// The characters of `s` in the order a layout of it draws them, left to right, with the bytes
+/// `set` given Character Direction `d`.
+fn drawn_with_direction(s: &str, set: Range<usize>, d: Option<ParaDirection>) -> String {
+    let mut t = TextObject::point(Point::ZERO, s, CharStyle::default());
+    edit::style_range(&mut t.runs, set.start, set.end, |st| st.char_direction = d);
+    let l = layout(FontDb::global(), &t);
+    let mut glyphs: Vec<_> = l.glyphs.iter().collect();
+    glyphs.sort_by(|a, b| a.origin.x.total_cmp(&b.origin.x));
+    glyphs.iter().filter_map(|g| s.get(g.byte..)?.chars().next()).collect()
+}
+
+/// Character Direction Left to Right keeps a date written with spaces in its own order inside a
+/// right-to-left paragraph, where the bidi algorithm alone sets its numbers right to left.
+#[test]
+fn left_to_right_characters_keep_a_date_in_order_in_right_to_left_text() {
+    let s = "שלום 21 10 2026";
+    let date = s.find('2').unwrap_or_default()..s.len();
+    assert_eq!(drawn_with_direction(s, date.clone(), None), "2026 10 21 םולש");
+    assert_eq!(drawn_with_direction(s, date, Some(ParaDirection::LeftToRight)), "21 10 2026 םולש");
+}
+
+/// Character Direction Right to Left sets a Hebrew word and the exclamation mark after it right to
+/// left inside a left-to-right paragraph, where the bidi algorithm alone leaves the mark after the
+/// word in the paragraph's direction.
+#[test]
+fn right_to_left_characters_set_a_word_and_its_mark_right_to_left_in_left_to_right_text() {
+    let s = "abc שלום! def";
+    let word = s.find('ש').unwrap_or_default()..s.find('!').map_or(0, |i| i + 1);
+    assert_eq!(drawn_with_direction(s, word.clone(), None), "abc םולש! def");
+    assert_eq!(drawn_with_direction(s, word.clone(), Some(ParaDirection::RightToLeft)), "abc !םולש def");
+    // Left to Right on the same characters of a left-to-right paragraph draws them as without it.
+    assert_eq!(drawn_with_direction(s, word, Some(ParaDirection::LeftToRight)), "abc םולש! def");
+}
+
 #[test]
 fn rtl_hit_testing_arrows_and_selection_follow_visual_positions() {
     let s = "שלום";
@@ -125,6 +160,8 @@ fn lines_of_clusters(lines: &[&[(usize, usize, f64)]], rtl: bool) -> TextLayout 
                 xf: Affine::IDENTITY,
                 rtl,
                 scale: 1.0,
+                image: None,
+                colour: None,
             });
             x += advance;
         }
@@ -550,4 +587,64 @@ fn digits_draw_every_digit_in_the_styles_numeral_system() {
     assert_eq!(clusters(&arabic), clusters(&lay("صفحة ٣", Digits::Default)));
     // Default leaves each digit as typed.
     assert_ne!(gids(&lay("3 ٣ ۳", Digits::Default)), gids(&lay("3 ٣ ۳", Digits::Hindi)));
+}
+
+/// Right-to-left type on a path that overflows shows the start of its text, as a line of area
+/// type does, not whatever comes first in visual order.
+#[test]
+fn overflowing_rtl_type_on_a_path_keeps_the_start_of_its_text() {
+    let s = "שלום עולם ".repeat(8);
+    let mut t = TextObject::point(Point::ZERO, &s, CharStyle::default());
+    let line = kurbo::Line::new((0.0, 0.0), (100.0, 0.0)).to_path(0.1);
+    t.kind = TextKind::OnPath { path: vectorcraft_geom::PathData::from_bezpath(&line), start: 0.0, end: None };
+    let l = layout(FontDb::global(), &t);
+    assert!(l.overflow && !l.glyphs.is_empty());
+    let shown: Vec<_> = source_clusters(&l).into_iter().map(|(byte, _)| byte).collect();
+    let last = shown.last().copied().unwrap_or(0);
+    let start: Vec<_> = s.char_indices().map(|(i, _)| i).take_while(|i| *i <= last).collect();
+    assert_eq!(shown, start, "the glyphs shown are the text's start");
+    let x = |byte: usize| l.glyphs.iter().find(|g| g.byte == byte).map(|g| g.origin.x).unwrap();
+    assert!(x(0) > x(last), "the text runs right to left along the path");
+}
+
+/// On a curve with spacing, where a glyph's step depends on where it sits, what fits is measured
+/// where the glyphs are placed: the start of the text shows, and every glyph of it.
+#[test]
+fn overflowing_rtl_type_on_a_spaced_curve_keeps_the_start_of_its_text() {
+    let s = "שלום, עולם! אבג ".repeat(6);
+    // Straight, then tightly curved: glyphs take other steps there.
+    let mut path = BezPath::new();
+    path.move_to((0.0, 0.0));
+    path.line_to((60.0, 0.0));
+    path.extend(kurbo::Arc::new((60.0, 12.0), (12.0, 12.0), -std::f64::consts::FRAC_PI_2, std::f64::consts::PI, 0.0).append_iter(0.1));
+    let mut t = TextObject::point(Point::ZERO, &s, CharStyle::default());
+    t.kind = TextKind::OnPath { path: vectorcraft_geom::PathData::from_bezpath(&path), start: 0.0, end: None };
+    for spacing in (-12..=12).map(|i| f64::from(i) * 5.0) {
+        t.path_spacing = spacing;
+        let l = layout(FontDb::global(), &t);
+        assert!(l.overflow && !l.glyphs.is_empty());
+        let shown: Vec<_> = source_clusters(&l).into_iter().map(|(byte, _)| byte).collect();
+        let last = shown.last().copied().unwrap_or(0);
+        let start: Vec<_> = s.char_indices().map(|(i, _)| i).take_while(|i| *i <= last).collect();
+        assert_eq!(shown, start, "the glyphs shown are the text's start ({spacing})");
+    }
+}
+
+/// A left-to-right line with right-to-left text in it fits as it is laid out: a period that
+/// hangs past the end bracket (Roman Hanging Punctuation) stays, and nothing overflows.
+#[test]
+fn mixed_type_on_a_path_hangs_its_final_period() {
+    let s = "bא.";
+    let line = kurbo::Line::new((0.0, 0.0), (400.0, 0.0)).to_path(0.1);
+    let mut t = TextObject::point(Point::ZERO, s, CharStyle::default());
+    t.kind = TextKind::OnPath { path: vectorcraft_geom::PathData::from_bezpath(&line), start: 0.0, end: None };
+    t.para.roman_hanging = true;
+    let advances: Vec<f64> = layout(FontDb::global(), &t).glyphs.iter().map(|g| g.advance).collect();
+    assert_eq!(advances.len(), 3);
+    // The end bracket halfway through the period, with path beyond it.
+    let end = advances[0] + advances[1] + advances[2] * 0.5;
+    t.kind = TextKind::OnPath { path: vectorcraft_geom::PathData::from_bezpath(&line), start: 0.0, end: Some(end / 400.0) };
+    let l = layout(FontDb::global(), &t);
+    assert!(l.glyphs.iter().any(|g| g.byte == s.len() - 1), "the period shows");
+    assert!(!l.overflow, "all of it fits");
 }

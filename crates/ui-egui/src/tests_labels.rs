@@ -86,11 +86,47 @@ fn effect_menu_lists_the_artistic_filters_before_blur() {
     let entries = menus::menu_entries(&app);
     let artistic: Vec<_> = entries.iter().filter(|e| e.path == ["Effect", "Artistic"]).collect();
     let labels: Vec<&str> = artistic.iter().map(|e| e.label.as_str()).collect();
-    assert_eq!(labels, ["Cutout…", "Film Grain…", "Neon Glow…", "Plastic Wrap…", "Poster Edges…", "Smudge Stick…", "Sponge…", "Watercolor…"]);
+    assert_eq!(
+        labels,
+        [
+            "Colored Pencil…",
+            "Cutout…",
+            "Dry Brush…",
+            "Film Grain…",
+            "Fresco…",
+            "Neon Glow…",
+            "Paint Daubs…",
+            "Palette Knife…",
+            "Plastic Wrap…",
+            "Poster Edges…",
+            "Rough Pastels…",
+            "Smudge Stick…",
+            "Sponge…",
+            "Underpainting…",
+            "Watercolor…"
+        ]
+    );
     assert!(artistic.iter().all(|e| e.command.as_deref() == Some("effect.dialog")));
-    assert_eq!(artistic[2].params, json!({"effect": "artistic.neonGlow"}));
+    assert_eq!(artistic[2].params, json!({"effect": "artistic.dryBrush"}));
+    assert_eq!(artistic[5].params, json!({"effect": "artistic.neonGlow"}));
     let at = |name: &str| entries.iter().position(|e| e.path == ["Effect", name]).unwrap();
     assert!(at("Artistic") < at("Blur"));
+}
+
+/// Paint Daubs' Brush Type menu matches Illustrator's list and uses the effect choice labels.
+#[test]
+fn paint_daubs_brush_type_menu_matches_illustrator() {
+    use crate::dialogs::PAINT_DAUB_BRUSH_TYPE_LABELS;
+    use serde_json::Map;
+    use vectorcraft_effects::pixel::PAINT_DAUB_BRUSH_TYPES;
+    let catalog: Vec<&str> = PAINT_DAUB_BRUSH_TYPES.iter().map(|(label, _)| *label).collect();
+    assert_eq!(PAINT_DAUB_BRUSH_TYPE_LABELS.as_slice(), catalog.as_slice());
+    let params = Map::new();
+    let shown = crate::dialogs::shown_choices("artistic.paintDaubs", "brushType", &params, false).unwrap();
+    assert_eq!(shown.len(), PAINT_DAUB_BRUSH_TYPES.len());
+    for ((label, value), (english, id)) in shown.iter().zip(PAINT_DAUB_BRUSH_TYPES.iter()) {
+        assert_eq!((label.as_str(), value.as_str()), (*english, *id));
+    }
 }
 
 #[test]
@@ -185,6 +221,7 @@ fn effect_menu_lists_the_sketch_filters_between_sharpen_and_stylize() {
             "Chalk & Charcoal…",
             "Charcoal…",
             "Chrome…",
+            "Conté Crayon…",
             "Graphic Pen…",
             "Halftone Pattern…",
             "Note Paper…",
@@ -192,6 +229,7 @@ fn effect_menu_lists_the_sketch_filters_between_sharpen_and_stylize() {
             "Plaster…",
             "Reticulation…",
             "Stamp…",
+            "Torn Edges…",
             "Water Paper…"
         ]
     );
@@ -200,20 +238,23 @@ fn effect_menu_lists_the_sketch_filters_between_sharpen_and_stylize() {
     assert_eq!(sketch[1].params, json!({"effect": "sketch.chalkCharcoal"}));
     assert_eq!(sketch[2].params, json!({"effect": "sketch.charcoal"}));
     assert_eq!(sketch[3].params, json!({"effect": "sketch.chrome"}));
-    assert_eq!(sketch[4].params, json!({"effect": "sketch.graphicPen"}));
-    assert_eq!(sketch[5].params, json!({"effect": "sketch.halftonePattern"}));
-    assert_eq!(sketch[6].params, json!({"effect": "sketch.notePaper"}));
-    assert_eq!(sketch[7].params, json!({"effect": "sketch.photocopy"}));
-    assert_eq!(sketch[8].params, json!({"effect": "sketch.plaster"}));
-    assert_eq!(sketch[9].params, json!({"effect": "sketch.reticulation"}));
-    assert_eq!(sketch[10].params, json!({"effect": "sketch.stamp"}));
-    assert_eq!(sketch[11].params, json!({"effect": "sketch.waterPaper"}));
+    assert_eq!(sketch[4].params, json!({"effect": "sketch.conteCrayon"}));
+    assert_eq!(sketch[5].params, json!({"effect": "sketch.graphicPen"}));
+    assert_eq!(sketch[6].params, json!({"effect": "sketch.halftonePattern"}));
+    assert_eq!(sketch[7].params, json!({"effect": "sketch.notePaper"}));
+    assert_eq!(sketch[8].params, json!({"effect": "sketch.photocopy"}));
+    assert_eq!(sketch[9].params, json!({"effect": "sketch.plaster"}));
+    assert_eq!(sketch[10].params, json!({"effect": "sketch.reticulation"}));
+    assert_eq!(sketch[11].params, json!({"effect": "sketch.stamp"}));
+    assert_eq!(sketch[12].params, json!({"effect": "sketch.tornEdges"}));
+    assert_eq!(sketch[13].params, json!({"effect": "sketch.waterPaper"}));
     let at = |label: &str| entries.iter().position(|e| e.path[0] == "Effect" && e.label == label).unwrap();
-    assert!(at("Unsharp Mask…") < at("Chalk & Charcoal…") && at("Chalk & Charcoal…") < at("Chrome…"));
-    assert!(at("Chrome…") < at("Graphic Pen…") && at("Graphic Pen…") < at("Halftone Pattern…"));
+    assert!(at("Unsharp Mask…") < at("Bas Relief…") && at("Bas Relief…") < at("Chalk & Charcoal…"));
+    assert!(at("Chalk & Charcoal…") < at("Chrome…"));
+    assert!(at("Chrome…") < at("Conté Crayon…") && at("Conté Crayon…") < at("Graphic Pen…") && at("Graphic Pen…") < at("Halftone Pattern…"));
     assert!(at("Halftone Pattern…") < at("Note Paper…") && at("Note Paper…") < at("Plaster…"));
     assert!(at("Plaster…") < at("Reticulation…"));
-    assert!(at("Reticulation…") < at("Water Paper…") && at("Water Paper…") < at("Glowing Edges…"));
+    assert!(at("Reticulation…") < at("Torn Edges…") && at("Torn Edges…") < at("Water Paper…") && at("Water Paper…") < at("Glowing Edges…"));
 }
 
 /// Effect › Stylize under Raster Effects, between Sharpen and Texture: Glowing Edges opens its
@@ -251,15 +292,13 @@ fn effect_menu_keeps_glowing_edges_out_of_the_vector_stylize() {
 }
 
 #[test]
-fn library_submenus_are_disabled_placeholders() {
+fn brush_libraries_submenu_is_a_disabled_placeholder() {
     let app = app();
     let entries = menus::menu_entries(&app);
-    for lib in ["Brush Libraries", "Symbol Libraries"] {
-        let items: Vec<_> = entries.iter().filter(|e| e.path == ["Window", lib]).collect();
-        let labels: Vec<&str> = items.iter().map(|e| e.label.as_str()).collect();
-        assert_eq!(labels, ["Built-in Libraries", "User Defined", "Other Library…"], "{lib}");
-        assert!(items.iter().all(|e| !e.enabled && e.command.is_none()), "{lib}");
-    }
+    let items: Vec<_> = entries.iter().filter(|e| e.path == ["Window", "Brush Libraries"]).collect();
+    let labels: Vec<&str> = items.iter().map(|e| e.label.as_str()).collect();
+    assert_eq!(labels, ["Built-in Libraries", "User Defined", "Other Library…"]);
+    assert!(items.iter().all(|e| !e.enabled && e.command.is_none()));
 }
 
 #[test]

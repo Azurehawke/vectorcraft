@@ -233,6 +233,12 @@ pub fn page(bytes: &[u8]) -> Result<Rect, String> {
 /// [`import`], an Illustrator EPS through the editing copy of its art only when `editing_data`
 /// (else what its page prints, as any EPS).
 pub fn import_with(bytes: &[u8], editing_data: bool) -> Result<Imported, String> {
+    import_trusting(bytes, editing_data, false)
+}
+
+/// [`import_with`]; `trust`: an Illustrator EPS's layers are used even where they draw differently
+/// from its page, with a note (`editingData: "always"`, as for a `.ai`).
+pub fn import_trusting(bytes: &[u8], editing_data: bool, trust: bool) -> Result<Imported, String> {
     let ps = program(bytes)?;
     let dsc = Dsc::read(ps);
     // A legacy `.ai` VectorCraft wrote: its prolog prints the art plainly (gradients flat, no
@@ -260,7 +266,7 @@ pub fn import_with(bytes: &[u8], editing_data: bool) -> Result<Imported, String>
     }
     let drew = !out.drawn.is_empty();
     let why = match (&result, drew) {
-        (Ok(()), true) if editing_data => return Ok(native::layered(ps, finish(out))),
+        (Ok(()), true) if editing_data => return Ok(native::layered(ps, finish(out), trust)),
         (Ok(()), true) => return Ok(finish(out)),
         (Ok(()), false) => "it draws nothing VectorCraft's PostScript reader can show".to_string(),
         (Err(e), _) => reason(e, fault.as_ref()),

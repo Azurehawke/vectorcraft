@@ -61,9 +61,10 @@ fn lengths(kind: &str) -> &'static [&'static str] {
         "move" => &["dx", "dy", "distance"],
         "rectangle" | "ellipse" | "rectangularGrid" | "polarGrid" | "artboardOptions" => &["width", "height"],
         "roundedRectangle" => &["width", "height", "radius"],
-        "polygon" => &["radius"],
+        "polygon" | "spiral" => &["radius"],
         "star" => &["radius1", "radius2"],
         "lineSegment" => &["length"],
+        "arc" => &["lengthX", "lengthY"],
         "offsetPath" => &["offset"],
         _ => &[],
     }
@@ -73,8 +74,8 @@ fn lengths(kind: &str) -> &'static [&'static str] {
 /// number: fields that ↑/↓ step by one (Shift: ten) and that do math, as the distances do.
 fn suffix(kind: &str, key: &str) -> Option<&'static str> {
     match (kind, key) {
-        ("rotate" | "shear" | "reflect" | "move", "angle") => Some("°"),
-        ("scale", "sx" | "sy") => Some("%"),
+        ("rotate" | "shear" | "reflect" | "move" | "lineSegment", "angle") => Some("°"),
+        ("scale", "sx" | "sy") | ("spiral", "decay") => Some("%"),
         _ => None,
     }
 }
@@ -82,7 +83,9 @@ fn suffix(kind: &str, key: &str) -> Option<&'static str> {
 /// The fields of the form dialogs ([`grid`]) that the dialog's own body draws, by dialog kind.
 fn own_rows(kind: &str) -> &'static [&'static str] {
     match kind {
-        "artboardOptions" => &["color"],
+        "artboardOptions" => &["color", super::artboard_options::PIXEL_ASPECT],
+        // The grids' Reference Point is their 9-point locator.
+        "rectangularGrid" | "polarGrid" => &["reference"],
         _ => &[],
     }
 }
@@ -95,7 +98,9 @@ fn order(kind: &str) -> &'static [&'static str] {
         "offsetPath" => &["offset", "joins", "miterLimit"],
         "rectangularGrid" => &["width", "height", "rows", "rowSkew", "columns", "columnSkew"],
         "polarGrid" => &["width", "height", "concentric", "concentricSkew", "radial", "radialSkew"],
+        "spiral" => &["radius", "decay", "segments"],
         "artboardOptions" => &["name", "width", "height"],
+        "lineSegment" => &["length", "angle"],
         _ => &[],
     }
 }
@@ -134,6 +139,13 @@ pub(super) fn text(ui: &mut egui::Ui, d: &mut Dialog, key: &str, width: f32) -> 
 
 /// [`text`] returning the field's response (focus, Enter).
 pub(super) fn text_edit(ui: &mut egui::Ui, d: &mut Dialog, key: &str, width: f32) -> egui::Response {
+    text_edit_limited(ui, d, key, width, usize::MAX)
+}
+
+/// [`text_edit`] that takes at most `max_chars` characters: typing and pasting stop at the limit,
+/// and a longer value already in the field is kept, with nothing added to it until it has fewer
+/// than `max_chars` characters.
+pub(super) fn text_edit_limited(ui: &mut egui::Ui, d: &mut Dialog, key: &str, width: f32, max_chars: usize) -> egui::Response {
     let t = Tokens::get(ui.ctx());
     let mut s = d.str(key);
     let id = ui.id().with(("dlg-text", key));
@@ -145,7 +157,7 @@ pub(super) fn text_edit(ui: &mut egui::Ui, d: &mut Dialog, key: &str, width: f32
         .inner_margin(egui::Margin::symmetric(6, 3))
         .show(ui, |ui| {
             crate::theme::strong_selected_text(ui);
-            ui.add(egui::TextEdit::singleline(&mut s).id(id).frame(egui::Frame::NONE).desired_width(width))
+            ui.add(egui::TextEdit::singleline(&mut s).id(id).frame(egui::Frame::NONE).desired_width(width).char_limit(max_chars))
         });
     if r.inner.changed() {
         d.fields.insert(key.into(), Value::String(s));
@@ -579,6 +591,8 @@ pub(crate) fn humanize(k: &str) -> String {
         "Align To Path" => "Align to Path:".into(),
         "Overlap Variation" | "Curviness Variation" | "Spacing Variation" => "Variation:".into(),
         "Create" => "Create New Fields by:".into(),
+        "Height Width" => "Height/Width:".into(),
+        "Traps With Process Color" => "Traps with Process Color:".into(),
         _ => format!("{s}:"),
     }
 }
@@ -642,14 +656,16 @@ pub(super) fn slider_field_named(
     let v = d.f64(key, 0.0).clamp(min, max);
     let shown = crate::widgets::SliderValue::field(v, range.clone(), suffix, 0);
     slider_rail_valued(ui, d, key, name, range, Some(shown), track);
-    if let Some(n) = crate::widgets::plain_field(ui, ("dlg-field", key), v, suffix, 0, 52.0).map(|x| x.round().clamp(min, max)).filter(|n| *n != v) {
+    if let Some(n) = crate::widgets::range_field(ui, ("dlg-field", key), v, min..=max, suffix, 0, 52.0).filter(|n| *n != v) {
         d.fields.insert(key.into(), json!(n));
     }
 }
 
 /// The rail of [`slider_field_named`] alone: dragging it sets the number `d.fields[key]` to a
-/// whole number in `range` (a value past the range shows at its end until the rail moves); screen
-/// readers call it `name` (already translated), with the number `d.fields[key]` as its value.
+/// whole number in `range`, and its keys step the number while it has the keyboard focus
+/// ([`crate::widgets::color_slider_stepped`]); a value past the range shows at its end until the
+/// rail moves. Screen readers call it `name` (already translated), with the number
+/// `d.fields[key]` as its value.
 pub(super) fn slider_rail_named(
     ui: &mut egui::Ui,
     d: &mut Dialog,
@@ -663,7 +679,9 @@ pub(super) fn slider_rail_named(
 }
 
 /// [`slider_rail_named`] that screen readers get `shown` from: the number and text of the field
-/// the row draws beside it (no value for `None`, as for a blank field).
+/// the row draws beside it (no value for `None`, as for a blank field). Its keys step `shown`'s
+/// number, which sets `d.fields[key]` to the number at the same place on `range` (`shown`'s range
+/// and `range` are the same span in two units, such as millimeters and points).
 pub(super) fn slider_rail_valued(
     ui: &mut egui::Ui,
     d: &mut Dialog,
@@ -674,10 +692,14 @@ pub(super) fn slider_rail_valued(
     track: &dyn Fn(f32) -> egui::Color32,
 ) {
     let (min, max) = (*range.start(), *range.end());
-    let v = d.f64(key, 0.0).clamp(min, max);
-    let (dragged, _) =
-        crate::widgets::color_slider_valued(ui, ("dlg-slider", key), name, shown, ((v - min) / (max - min)) as f32, SLIDER_WIDTH, track);
-    if let Some(n) = dragged.map(|x| (min + x as f64 * (max - min)).round()).filter(|n| *n != v) {
+    let held = d.f64(key, 0.0);
+    let v = held.clamp(min, max);
+    let units = shown.as_ref().map(|s| s.range.clone());
+    let (dragged, _, keyed) =
+        crate::widgets::color_slider_stepped(ui, ("dlg-slider", key), name, shown, ((v - min) / (max - min)) as f32, SLIDER_WIDTH, track);
+    let keyed =
+        keyed.zip(units).map(|(k, u)| if u == range { k } else { (min + (k - u.start()) / (u.end() - u.start()) * (max - min)).clamp(min, max) });
+    if let Some(n) = dragged.map(|x| (min + x as f64 * (max - min)).round()).or(keyed).filter(|n| *n != held) {
         d.fields.insert(key.into(), json!(n));
     }
 }
@@ -874,5 +896,40 @@ mod typed_number_tests {
         assert_eq!(typed_number(2.5), json!(2.5));
         // Numbers past exact integers stay floats.
         assert!(typed_number(1e20).is_f64());
+    }
+}
+
+#[cfg(test)]
+mod selected_text_tests {
+    use super::*;
+    use crate::widgets::look_tests::{frame, glyph_colours, themed};
+
+    // Regression test for #1465: selected text in a dialog's text field was in the accent, on a
+    // selection tinted with the same accent. It is in the strong text colour.
+    #[test]
+    fn selected_text_in_a_dialog_text_field_is_in_the_strong_text_colour() {
+        for brightness in crate::theme::Brightness::ALL {
+            let ctx = themed(brightness);
+            let t = Tokens::get(&ctx);
+            let mut d = Dialog::new("test", json!({"name": "Artboard 1"}));
+            let id = std::cell::Cell::new(egui::Id::NULL);
+            let mut add = |ui: &mut egui::Ui| {
+                id.set(ui.id().with(("dlg-text", "name")));
+                text_edit(ui, &mut d, "name", 120.0);
+            };
+            frame(&ctx, 0.0, vec![], &mut add);
+            // Focus the field and select all of its text.
+            ctx.memory_mut(|m| m.request_focus(id.get()));
+            frame(&ctx, 0.1, vec![], &mut add);
+            let mut state = egui::TextEdit::load_state(&ctx, id.get()).unwrap_or_default();
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(10))));
+            state.store(&ctx, id.get());
+            let shapes = frame(&ctx, 0.2, vec![], &mut add);
+            let colours = glyph_colours(&shapes);
+            assert!(!colours.is_empty(), "{brightness:?}: the text is drawn");
+            let mut used = colours.clone();
+            used.dedup();
+            assert_eq!(used, [t.text_strong], "{brightness:?}: selected text in {used:?}");
+        }
     }
 }

@@ -145,6 +145,12 @@ pub fn all_panels() -> impl Iterator<Item = (&'static str, &'static str)> {
     tabs.chain(ICON_PANELS.iter().map(|&(id, label, _)| (id, label)))
 }
 
+/// Panel `id`'s id, English label and icon if it can live in the icon column: an icon panel, or
+/// one of the tabbed group's panels dropped there.
+pub fn rail_panel(id: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    ICON_PANELS.iter().find(|entry| entry.0 == id).copied().or_else(|| DockTab::from_id(id).map(DockTab::info))
+}
+
 /// Panels that live as collapsed icons in the dock (Essentials Classic).
 pub const ICON_PANELS: &[(&str, &str, &str)] = &[
     ("color", "Color", "palette"),
@@ -208,6 +214,10 @@ pub const ICON_PANEL_GROUPS: &[&[&str]] = &[
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ViewFlags {
     pub rulers: bool,
+    /// View › Rulers › Show Video Rulers: while the rulers show, they count the active artboard in
+    /// video pixels, honouring its Video Ruler Pixel Aspect Ratio.
+    #[serde(default)]
+    pub video_rulers: bool,
     pub grid: bool,
     pub guides: bool,
     pub smart_guides: bool,
@@ -246,6 +256,7 @@ impl Default for ViewFlags {
     fn default() -> Self {
         Self {
             rulers: false,
+            video_rulers: false,
             grid: false,
             guides: true,
             smart_guides: true,
@@ -309,6 +320,9 @@ pub struct UiState {
     pub legacy_language: Option<String>,
     pub brightness: Brightness,
     pub dock_tab: DockTab,
+    /// Tab order in the dock's tabbed group when it differs from [`DockTab::ALL`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dock_tab_order: Vec<DockTab>,
     /// The dock's tabbed group (Properties | Layers | Libraries) is collapsed to icons at the top of
     /// the icon column (the dock's double arrow, `window.collapseDock`).
     #[serde(default)]
@@ -360,6 +374,10 @@ pub struct UiState {
     /// Panels whose saved return destination is the iconic rail.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub docking_icons: std::collections::BTreeSet<String>,
+    /// The panels shown by dock groups collapsed to their tabs (a double-click on a tab); a group
+    /// showing another of its panels is expanded.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub docking_collapsed: std::collections::BTreeSet<String>,
     /// Invalidates in-flight gestures when a workspace is replaced.
     #[serde(skip)]
     pub docking_generation: u64,
@@ -407,21 +425,33 @@ pub struct UiState {
     /// Recorded actions (Actions panel), persisted with the UI preferences.
     #[serde(default = "crate::panels::actions::default_sets")]
     pub action_sets: Vec<crate::panels::actions::ActionSet>,
+    /// The current set of the Actions panel (its name clicked, one of its actions clicked, or made
+    /// with New Set): a recording goes into it and Set Options renames it. Not saved.
+    #[serde(skip)]
+    pub action_set: Option<usize>,
     /// Recording in progress: (set index, action name, journal length when recording started).
     #[serde(skip)]
     pub recording: Option<(usize, String, usize)>,
-    /// Keyboard shortcut overrides: command id or `tool:<id>` → chord ("" = none).
-    #[serde(default)]
-    pub shortcut_overrides: std::collections::BTreeMap<String, String>,
+    /// Keyboard shortcut overrides: command id, `tool:<id>` or `panel:<id>` → chord ("" = none),
+    /// stored in the form every earlier version reads.
+    #[serde(default, with = "crate::keymap::stored")]
+    pub shortcut_overrides: craft_keymap::Overrides,
     /// Name of the shortcut set (preset or "Custom").
     #[serde(default = "default_shortcut_set", deserialize_with = "crate::shortcut_editor::deserialize_set_name")]
     pub shortcut_set: String,
     /// Current workspace (Window → Workspace).
     #[serde(default = "default_workspace")]
     pub workspace: String,
+    /// Workspace before Preferences › Devices › Enable Touch Workspace switched to Touch (#394).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub touch_workspace_restore: Option<String>,
     /// User-saved workspaces (New Workspace…).
     #[serde(default)]
     pub custom_workspaces: Vec<crate::workspaces::Workspace>,
+    /// Layout changes made in a workspace since it was saved (or last reset), by workspace name:
+    /// switching back to it brings them back; Reset <name> drops them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_changes: Vec<crate::workspaces::Workspace>,
     /// File → Open Recent Files, most recent first.
     #[serde(default)]
     pub recent_files: Vec<String>,
@@ -453,6 +483,11 @@ pub struct UiState {
     /// buttons follow ([`crate::panels::align::with_align_to`]).
     #[serde(default, deserialize_with = "crate::panels::align::deserialize_align_to")]
     pub align_to: crate::panels::align::AlignTo,
+    /// Align panel: the Distribute Spacing value in points, which the Distribute Objects and
+    /// Distribute Spacing buttons and their commands send while there is a key object or a key
+    /// guide ([`crate::panels::align::run_button`]). Not saved.
+    #[serde(skip)]
+    pub align_spacing: f64,
     /// Color panel: the mode picked last from its menu (`None`: never picked), in which the panel
     /// shows the defaults for new art ([`crate::panels::color::deserialize_mode`]).
     #[serde(default, deserialize_with = "crate::panels::color::deserialize_mode")]
@@ -515,6 +550,10 @@ pub struct UiState {
     /// becoming active, leaves it.
     #[serde(skip)]
     pub home: Option<(Option<u64>, usize)>,
+    /// The Image Trace objects the canvas draws with the Source Image view while the Image Trace
+    /// panel's eye button is held down ([`vectorcraft_render::RenderOptions::trace_source`]).
+    #[serde(skip)]
+    pub trace_hold_source: Option<std::sync::Arc<Vec<vectorcraft_doc::NodeId>>>,
     /// Layers panel › Panel Options… (row size, thumbnails, Show Layers Only, Locate Selected Objects).
     #[serde(default)]
     pub layers_panel: crate::panels::layers::PanelOptions,
@@ -525,6 +564,10 @@ pub struct UiState {
     /// The Image Trace panel's Advanced section is open (as it was last left).
     #[serde(default = "yes")]
     pub image_trace_advanced: bool,
+    /// The Image Trace panel's Preview: a setting changed in the panel traces the selected Image
+    /// Trace object again at once. Off, the changes wait in the panel until Trace applies them.
+    #[serde(default = "yes")]
+    pub image_trace_preview: bool,
     /// Glyphs panel preview step, kept with the other panel choices. `0` is the default 30 pt
     /// cell; `1`..=`7` is a step from smallest to largest (`crates/ui-egui/src/panels/glyphs.rs`).
     #[serde(default, skip_serializing_if = "is_zero_u8")]
@@ -759,10 +802,35 @@ impl UiState {
         FloatingPanels::sanitize(&mut self.floating_panels, &mut self.toolbar_pos);
         crate::edit_toolbar::sanitize(&mut self.toolbar_edits);
         self.docking = self.docking.filter(crate::panel_docking::valid);
-        self.docking_icons.retain(|id| ICON_PANELS.iter().any(|entry| entry.0 == id));
+        // The tabbed group's panels live in the icon column too once dropped there.
+        self.docking_icons.retain(|id| rail_panel(id).is_some());
+        self.docking_collapsed = std::mem::take(&mut self.docking_collapsed)
+            .into_iter()
+            .filter(|id| crate::menus::normalize_panel(id) == Some(id.as_str()))
+            .take(64)
+            .collect();
+        // Changes kept for workspaces that still exist, under their saved spelling and one per
+        // workspace whatever the case (a hand-edited file).
+        let mut seen = std::collections::BTreeSet::new();
+        let saved: Vec<String> =
+            self.custom_workspaces.iter().map(|w| w.name.clone()).chain(crate::workspaces::builtins().into_iter().map(|w| w.name)).collect();
+        self.workspace_changes.retain_mut(|w| {
+            let Some(name) = saved.iter().find(|n| n.eq_ignore_ascii_case(&w.name)) else { return false };
+            w.name = name.clone();
+            seen.insert(name.to_ascii_lowercase())
+        });
+        self.workspace_changes.truncate(64);
         // Overrides that can't fire (modifier-only chords recorded by older versions, #487) give
         // the default back.
-        self.shortcut_overrides.retain(|_, c| c.is_empty() || crate::shortcut_editor::normalize(c).is_some());
+        let unusable: Vec<String> = self
+            .shortcut_overrides
+            .iter()
+            .filter(|(_, texts)| !texts.iter().all(|t| craft_keymap::Binding::parse(t).is_ok()))
+            .map(|(k, _)| k.to_string())
+            .collect();
+        for k in unusable {
+            self.shortcut_overrides.remove(&k);
+        }
         self
     }
 }
@@ -773,6 +841,7 @@ impl Default for UiState {
             legacy_language: None,
             brightness: Brightness::MediumDark,
             dock_tab: DockTab::Properties,
+            dock_tab_order: Vec::new(),
             dock_collapsed: false,
             open_panel: None,
             control_bar: false,
@@ -791,6 +860,7 @@ impl Default for UiState {
             docking: None,
             docking_hidden: Default::default(),
             docking_icons: Default::default(),
+            docking_collapsed: Default::default(),
             docking_generation: 0,
             dock_width: None,
             dock_width_pending: false,
@@ -811,11 +881,14 @@ impl Default for UiState {
             draw_mode: 0,
             about: false,
             action_sets: crate::panels::actions::default_sets(),
+            action_set: None,
             recording: None,
             shortcut_overrides: Default::default(),
             shortcut_set: default_shortcut_set(),
             workspace: default_workspace(),
+            touch_workspace_restore: None,
             custom_workspaces: vec![],
+            workspace_changes: vec![],
             recent_files: vec![],
             recent_fonts: vec![],
             favorite_fonts: vec![],
@@ -825,6 +898,7 @@ impl Default for UiState {
             flattener_preview: Default::default(),
             color_guide_limit: String::new(),
             align_to: Default::default(),
+            align_spacing: 0.0,
             color_mode: None,
             color_hide_options: false,
             svg_options: Value::Null,
@@ -841,9 +915,11 @@ impl Default for UiState {
             move_options: Value::Null,
             dxf_import: Value::Null,
             home: None,
+            trace_hold_source: None,
             layers_panel: Default::default(),
             layers_filter: Default::default(),
             image_trace_advanced: true,
+            image_trace_preview: true,
             glyphs_preview: 0,
             window: None,
         }

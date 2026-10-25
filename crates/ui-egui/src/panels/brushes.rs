@@ -122,6 +122,43 @@ fn shown<'a>(list: &'a [(String, String)], hidden: &[String]) -> Vec<&'a str> {
     kinds.flat_map(|(ty, _)| list.iter().filter(move |b| b.1 == *ty).map(|b| b.0.as_str())).collect()
 }
 
+/// A brush dragged over the tile or row `resp` of brush `name`, the `i`th brush of type `ty`
+/// (`list`: rows stack downwards), lands before or after it by the pointer's half; a bar marks the
+/// slot when the dragged brush is of type `ty` too (`types`: the (name, type) of every brush).
+/// Released there, it sets `moved` to the `brush.move` params, which refuse a brush of another type.
+fn reorder_drop(
+    ui: &Ui,
+    resp: &egui::Response,
+    types: &[(String, String)],
+    (name, ty, i): (&str, &str, usize),
+    list: bool,
+    moved: &mut Option<Value>,
+) {
+    let Some(drag) = resp.dnd_hover_payload::<PanelDrag>() else { return };
+    let PanelDrag::Brush { name: moving, .. } = &*drag else { return };
+    if moving == name {
+        // Dropped on itself: it stays where it is.
+        resp.dnd_release_payload::<PanelDrag>();
+        return;
+    }
+    let r = resp.rect;
+    let at = ui.input(|i| i.pointer.interact_pos()).unwrap_or(r.center());
+    let after = if list { at.y > r.center().y } else { at.x > r.center().x };
+    if types.iter().any(|b| &b.0 == moving && b.1 == ty) {
+        let accent = egui::Stroke::new(2.0, Tokens::get(ui.ctx()).accent);
+        if list {
+            let y = if after { r.bottom() } else { r.top() };
+            ui.painter().line_segment([egui::pos2(r.left(), y), egui::pos2(r.right(), y)], accent);
+        } else {
+            let x = if after { r.right() + 1.5 } else { r.left() - 1.5 };
+            ui.painter().line_segment([egui::pos2(x, r.top()), egui::pos2(x, r.bottom())], accent);
+        }
+    }
+    if resp.dnd_release_payload::<PanelDrag>().is_some() {
+        *moved = Some(json!({ "name": moving, "to": i + usize::from(after), "type": ty }));
+    }
+}
+
 pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let (list, current) = brushes(app);
@@ -133,6 +170,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         list.iter().filter_map(|(n, _)| app.run("brush.get", json!({"name": n})).ok().map(|v| (n.clone(), v))).collect();
     let mut clicked: Option<(String, egui::Modifiers)> = None;
     let mut options: Option<String> = None;
+    let mut moved: Option<Value> = None;
     let list_rect = widgets::list_box(ui, |ui| {
         ui.set_min_height(110.0);
         ui.set_width(ui.available_width());
@@ -190,13 +228,17 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
                 }
             };
             if list_view {
-                for (name, _) in group {
-                    pick(row(ui, name, vec2(ui.available_width(), 26.0), true), name);
+                for (i, (name, _)) in group.into_iter().enumerate() {
+                    let resp = row(ui, name, vec2(ui.available_width(), 26.0), true);
+                    reorder_drop(ui, &resp, &list, (name, ty, i), true, &mut moved);
+                    pick(resp, name);
                 }
             } else {
                 ui.horizontal_wrapped(|ui| {
-                    for (name, _) in group {
-                        pick(row(ui, name, vec2(64.0, 28.0), false), name);
+                    for (i, (name, _)) in group.into_iter().enumerate() {
+                        let resp = row(ui, name, vec2(64.0, 28.0), false);
+                        reorder_drop(ui, &resp, &list, (name, ty, i), false, &mut moved);
+                        pick(resp, name);
                     }
                 });
             }
@@ -204,10 +246,17 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         }
         ui.min_rect()
     });
-    // Art dragged off the canvas and dropped on the list becomes an Art brush, as New Brush makes.
+    // Art dragged off the canvas and dropped on the list opens New Brush for that art, as the New
+    // Brush button opens it for the selection.
     let zone = ui.interact(list_rect, ui.id().with("brushes-drop"), Sense::hover());
     if let Some(ids) = widgets::art_drop(ui, &zone)
-        && let Err(e) = app.run("brush.new", json!({ "type": "art", "ids": ids }))
+        && let Err(e) = app.run("ui.newBrush", json!({ "ids": ids }))
+    {
+        app.status(e);
+    }
+    // A brush dragged within the list moves among the brushes of its type.
+    if let Some(p) = moved
+        && let Err(e) = app.run("brush.move", p)
     {
         app.status(e);
     }
@@ -249,7 +298,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     }
     let has_brush = sel_brush.is_some();
     let targets = multi.unwrap_or_else(|| highlighted.into_iter().collect());
-    let has_sel = app.session.active().is_some_and(|d| !d.selection.is_empty());
+    let has_doc = app.session.active().is_some();
     widgets::bottom_bar(ui, |ui| {
         widgets::icon_button_enabled(ui, "library", tl!("Brush Libraries (on the roadmap)"), false, false, 24.0);
         if widgets::icon_button_enabled(ui, "dc-remove-brush", tl!("Remove Brush Stroke"), false, has_brush, 24.0).clicked() {
@@ -259,8 +308,11 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
             app.run("object.expandBrush", json!({})).ok();
         }
         ui.add_space((ui.available_width() - 2.0 * 28.0).max(0.0));
-        if widgets::icon_button_enabled(ui, "dc-new-item", tl!("New Art Brush from Selection"), false, has_sel, 24.0).clicked() {
-            app.run("brush.new", json!({"type": "art"})).ok();
+        // New Brush asks for the type, then opens that type's Brush Options.
+        if widgets::icon_button_enabled(ui, "dc-new-item", tl!("New Brush"), false, has_doc, 24.0).clicked()
+            && let Err(e) = app.run("ui.newBrush", json!({}))
+        {
+            app.status(e);
         }
         if widgets::icon_button_enabled(ui, "trash-2", tl!("Delete Brush"), false, !targets.is_empty(), 24.0).clicked() {
             run_on(app, "brush.delete", &targets);
@@ -273,6 +325,12 @@ pub fn menu(app: &mut VectorcraftApp, ui: &mut Ui) {
     let (list, current) = brushes(app);
     let targets = targets(app, ui.ctx(), &list, current.as_deref());
     let has_sel = app.session.active().is_some_and(|d| !d.selection.is_empty());
+    if menu_item(ui, tl!("New Brush…"), app.session.active().is_some(), false)
+        && let Err(e) = app.run("ui.newBrush", json!({}))
+    {
+        app.status(e);
+    }
+    // The types' own items make a brush at once, without its Brush Options.
     for (label, ty) in [(tl!("New Calligraphic Brush"), "calligraphic"), (tl!("New Bristle Brush"), "bristle")] {
         if menu_item(ui, label, true, false) {
             app.run("brush.new", json!({"type": ty})).ok();
@@ -434,6 +492,26 @@ mod tests {
         let def = app.run("brush.get", json!({"name": "Pressure Round"})).unwrap();
         assert_eq!((def["modes"].clone(), def["variation"][2].clone()), (json!(["fixed", "fixed", "pressure"]), json!(2.0)));
         assert_eq!(brushes(&mut app).1.as_deref(), Some("Pressure Round"), "renamed, still current");
+    }
+
+    /// The New Brush button and the panel menu's New Brush… open New Brush, with nothing selected
+    /// too, and make no brush.
+    #[test]
+    fn the_new_brush_button_and_menu_item_open_new_brush() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 200, "height": 100})).unwrap();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let before = names(&mut app);
+        let out = frame_with(&ctx, &mut app, vec![], egui::Modifiers::NONE, 0.0, show);
+        let new = clickable(&out).into_iter().find(|(l, _)| l.as_deref() == Some("New Brush")).expect("a New Brush button").1.center();
+        click(&ctx, &mut app, new, egui::Modifiers::NONE, 1.0, show);
+        let kind = |app: &VectorcraftApp| app.ui.dialog.as_ref().map(|d| d.kind.clone());
+        assert_eq!(kind(&app).as_deref(), Some(crate::dialogs::new_brush::KIND));
+        app.ui.dialog = None;
+        menu_click(&ctx, &mut app, "New Brush…", 2.0);
+        assert_eq!(kind(&app).as_deref(), Some(crate::dialogs::new_brush::KIND));
+        assert_eq!(names(&mut app), before);
     }
 
     /// The rectangles `out` fills with the selected-row color.
@@ -623,6 +701,12 @@ mod tests {
         let over = pos2(100.0, 60.0);
         egui::DragAndDrop::set_payload(&ctx, PanelDrag::Art(vec![NodeId(id)]));
         frame(&ctx, &mut app, vec![egui::Event::PointerMoved(over), button(over, false)]);
+        // New Brush opens on Art for the dropped art, and OK twice makes the brush.
+        let d = app.ui.dialog.as_ref().expect("New Brush opened");
+        assert_eq!((d.kind.as_str(), d.str("type"), d.fields.get("__ids")), (crate::dialogs::new_brush::KIND, "art".into(), Some(&json!([id]))));
+        assert_eq!(brushes(&mut app).0, before);
+        crate::dialogs::confirm(&mut app).unwrap();
+        crate::dialogs::confirm(&mut app).unwrap();
         let (after, _) = brushes(&mut app);
         assert_eq!(after.len(), before.len() + 1);
         let new: Vec<_> = after.iter().filter(|b| !before.contains(b)).collect();
@@ -635,5 +719,55 @@ mod tests {
         frame(&ctx, &mut app, vec![egui::Event::PointerMoved(tile + vec2(80.0, 80.0))]);
         let drag = egui::DragAndDrop::payload::<PanelDrag>(&ctx);
         assert!(matches!(drag.as_deref(), Some(PanelDrag::Brush { name, def }) if *name == after[0].0 && def["name"] == json!(name)), "{drag:?}");
+    }
+
+    /// A brush dragged onto the left half of another brush of its type goes before it, with a bar
+    /// marking the slot while it is held there, as one undo step; dropped on a brush of another
+    /// type, it stays where it is and the status bar says why.
+    #[test]
+    fn a_brush_dragged_onto_another_of_its_type_moves_before_it() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 200, "height": 100})).unwrap();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let out = frame_with(&ctx, &mut app, vec![], egui::Modifiers::NONE, 0.0, show);
+        let tiles: Vec<Rect> = clickable(&out).into_iter().map(|c| c.1).filter(|r| r.width() == 64.0).collect();
+        let (list, _) = brushes(&mut app);
+        let order: Vec<String> = shown(&list, &[]).into_iter().map(str::to_string).collect();
+        assert_eq!(order[..4], ["3 pt. Round", "6 pt. Flat", "10 pt. Oval", "Dots"]);
+        let accent = Tokens::get(&ctx).accent;
+        let bars = |out: &egui::FullOutput| -> Vec<f32> {
+            let lines = out.shapes.iter().filter_map(|c| match &c.shape {
+                egui::Shape::LineSegment { points, stroke } if stroke.color == accent => Some(points[0].x),
+                _ => None,
+            });
+            lines.collect()
+        };
+        // Press on a tile, drag it to `to`, hold it there for a frame (its output returned) and release.
+        let drag = |app: &mut VectorcraftApp, from: Pos2, to: Pos2, time: f64| -> egui::FullOutput {
+            frame_with(&ctx, app, vec![egui::Event::PointerMoved(from), button(from, true)], egui::Modifiers::NONE, time, show);
+            frame_with(&ctx, app, vec![egui::Event::PointerMoved(from + vec2(20.0, 0.0))], egui::Modifiers::NONE, time + 0.1, show);
+            frame_with(&ctx, app, vec![egui::Event::PointerMoved(to)], egui::Modifiers::NONE, time + 0.2, show);
+            let held = frame_with(&ctx, app, vec![], egui::Modifiers::NONE, time + 0.3, show);
+            frame_with(&ctx, app, vec![button(to, false)], egui::Modifiers::NONE, time + 0.4, show);
+            held
+        };
+        let undo = |app: &VectorcraftApp| app.session.active().unwrap().history.undo.len();
+        let steps = undo(&app);
+        let calligraphic =
+            |app: &mut VectorcraftApp| -> Vec<String> { brushes(app).0.into_iter().filter(|b| b.1 == "calligraphic").map(|b| b.0).collect() };
+        // "10 pt. Oval" onto the left half of "3 pt. Round".
+        let held = drag(&mut app, tiles[2].center(), tiles[0].center() - vec2(16.0, 0.0), 1.0);
+        assert_eq!(bars(&held), [tiles[0].left() - 1.5]);
+        assert_eq!(calligraphic(&mut app), ["10 pt. Oval", "3 pt. Round", "6 pt. Flat"]);
+        assert_eq!(undo(&app), steps + 1);
+        app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(calligraphic(&mut app), ["3 pt. Round", "6 pt. Flat", "10 pt. Oval"]);
+        // "3 pt. Round" onto "Dots", a scatter brush: no bar, and nothing moves.
+        let held = drag(&mut app, tiles[0].center(), tiles[3].center(), 3.0);
+        assert!(bars(&held).is_empty(), "{:?}", bars(&held));
+        assert_eq!(brushes(&mut app).0, list);
+        assert_eq!(undo(&app), steps);
+        assert!(app.ui.status.contains("brushes move only within their type"), "{}", app.ui.status);
     }
 }

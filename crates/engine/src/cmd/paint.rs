@@ -16,7 +16,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Fill",
             [],
             None,
-            "{color?: \"#rrggbb\"|[r,g,b]|{c,m,y,k}|{gray}|{l,a,b} (CIE Lab), none?: true, swatch?: name (a global or spot colour stays linked, so swatch edits recolour it; a tint swatch links to its base at its tint; a gradient swatch is recorded as the gradient's swatch and fits each object, keeping its aspect; the built-in \"[Registration]\" prints on every plate), tint?: 0..100 (% of a global or spot `swatch`; default 100, or a tint swatch's own), gradient?: {kind?: linear|radial|freeform, stops?: [{offset 0..1, color, opacity? 0..1 (or 0..100), midpoint? 0.13..0.87, swatch?: global or spot colour (or tint) swatch the stop links to (its colour comes from the swatch), tint?: 0..100}] (at least 2; default white→black), angle?: deg, start?: [x,y], end?: [x,y] (the vector in document coordinates, both or neither; type objects keep it in text space), aspect?: % (radial; without start/end the gradient is placed on each object's bounds), focal?: [x,y] (radial, with start/end: the focal point, where the first stop sits), swatch?: linked gradient swatch name}, item?: appearance item index|null (omitted: the Appearance panel's active item if it is a fill, else the top fill), ids?|id?, focus?: true (false keeps the active proxy), keepModel?: false (in a CMYK document, RGB colours and gradient stops are stored as CMYK unless true; Gray stays Gray), target?: \"object\"|\"contents\", span?: \"object\" (default: each target fits a gradient to its own bounds)|\"selection\" (a linear or radial `gradient` without start/end is placed once on the union of the targets' bounds, so it runs across them)} sets the selection's fill and the default (new art fits a gradient to itself); a solid colour recolours only the gradient mesh point last clicked with the Mesh tool or Direct Selection; while the Type tool has characters selected (and no ids or item are given), the paint goes to those characters only",
+            "{color?: \"#rrggbb\"|[r,g,b]|{c,m,y,k}|{gray}|{l,a,b} (CIE Lab), none?: true, swatch?: name (a global or spot colour stays linked, so swatch edits recolour it; a tint swatch links to its base at its tint; a gradient swatch is recorded as the gradient's swatch and fits each object, keeping its aspect; the built-in \"[Registration]\" prints on every plate), tint?: 0..100 (% of a global or spot `swatch`; default 100, or a tint swatch's own), gradient?: {kind?: linear|radial|freeform, method?: classic|perceptual (as paint.editGradient; default classic), stops?: [{offset 0..1, color, opacity? 0..1 (or 0..100), midpoint? 0.13..0.87, swatch?: global or spot colour (or tint) swatch the stop links to (its colour comes from the swatch), tint?: 0..100}] (at least 2; default white→black), angle?: deg, start?: [x,y], end?: [x,y] (the vector in document coordinates, both or neither; type objects keep it in text space), aspect?: % (radial; without start/end the gradient is placed on each object's bounds), focal?: [x,y] (radial, with start/end: the focal point, where the first stop sits), dither?: bool (linear and radial fills: drawn with fine noise that hides banding, and as pixels in SVG and PDF exports; strokes ignore it), swatch?: linked gradient swatch name}, item?: appearance item index|null (omitted: the Appearance panel's active item if it is a fill, else the top fill), ids?|id?, focus?: true (false keeps the active proxy), keepModel?: false (in a CMYK document, RGB colours and gradient stops are stored as CMYK unless true; Gray stays Gray), target?: \"object\"|\"contents\", span?: \"object\" (default: each target fits a gradient to its own bounds)|\"selection\" (a linear or radial `gradient` without start/end is placed once on the union of the targets' bounds, so it runs across them)} sets the selection's fill and the default (new art fits a gradient to itself); a solid colour recolours only the gradient mesh point last clicked with the Mesh tool or Direct Selection; while the Type tool has characters selected (and no ids or item are given), the paint goes to those characters only",
             has_doc,
             |s, p| set_paint(s, p, true)
         ),
@@ -55,7 +55,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "{fill?: bool (true: bring the Fill proxy forward, false: the Stroke proxy; omitted: swap which is in front)} → {fillActive}",
             always,
             |s, p| {
-                s.fill_active = p.get("fill").and_then(Value::as_bool).unwrap_or(!s.fill_active);
+                s.fill_active = switch_or(p, "fill", !s.fill_active, "paint.toggleActive")?;
                 Ok(json!({ "fillActive": s.fill_active }))
             }
         ),
@@ -105,7 +105,7 @@ pub fn proxy_specs() -> Vec<CommandSpec> {
             has_doc,
             |s, p| {
                 let paint = Paint::solid(s.last_solid);
-                apply_to_proxy(s, p, paint)
+                apply_to_proxy(s, p, paint, "paint.lastColor")
             }
         ),
         cmd!(
@@ -117,7 +117,7 @@ pub fn proxy_specs() -> Vec<CommandSpec> {
             has_doc,
             |s, p| {
                 let paint = super::gradient::unplaced(&Paint::Gradient(Box::new(s.last_gradient.clone())));
-                apply_to_proxy(s, p, paint)
+                apply_to_proxy(s, p, paint, "paint.lastGradient")
             }
         ),
         cmd!(
@@ -287,8 +287,15 @@ fn proxies(s: &mut Session, _: &Value) -> Result<Value> {
 }
 
 /// `stroke` param, defaulting to the proxy that is in front.
-fn stroke_param(s: &Session, p: &Value) -> bool {
-    p.get("stroke").and_then(Value::as_bool).unwrap_or(!s.fill_active)
+fn stroke_param(s: &Session, p: &Value, cmd: &str) -> Result<bool> {
+    switch_or(p, "stroke", !s.fill_active, cmd)
+}
+
+/// Error unless `p` gives `keepModel` as true, false or null, or leaves it out ("`keepModel` must
+/// be true or false"). [`paint_from`] calls it first, and each command whose params text lists
+/// `keepModel` calls it before it changes anything.
+pub(crate) fn check_keep_model(p: &Value, cmd: &str) -> Result<()> {
+    check_switches(p, &["keepModel"], cmd)
 }
 
 /// The model RGB colours given in `p` are stored in: the document's in a CMYK document (`None` in
@@ -319,11 +326,13 @@ pub(crate) fn new_color(s: &Session, p: &Value, c: Color) -> Color {
 
 /// Parse a paint from params (color / none / swatch / gradient). None = no paint keys given. A
 /// color or gradient (its stops and freeform points) given in RGB takes the document's color
-/// model ([`new_color_model`]), converted through the color settings.
+/// model ([`new_color_model`]), converted through the color settings. A `none` or `keepModel`
+/// other than true, false or null is an error.
 pub(crate) fn paint_from(s: &Session, p: &Value) -> Result<Option<Paint>> {
+    check_keep_model(p, "paint")?;
     let model = new_color_model(s, p);
     let new_color = |c: Color| stored_color(model, c);
-    if bool_or(p, "none", false) {
+    if switch_or(p, "none", false, "paint")? {
         return Ok(Some(Paint::None));
     }
     if let Some(name) = str_param(p, "swatch") {
@@ -342,6 +351,7 @@ pub(crate) fn paint_from(s: &Session, p: &Value) -> Result<Option<Paint>> {
         };
     }
     if let Some(g) = p.get("gradient") {
+        check_numbers(g, &["angle"], "paint")?;
         // A stop naming a process swatch keeps the swatch's model.
         let stored = super::gradient::stop_colors(s, p, g);
         let g = super::gradient::link_stops(&s.doc()?.doc, g).map_err(|e| bad("paint", e))?;
@@ -391,13 +401,19 @@ fn set_paint(s: &mut Session, p: &Value, fill: bool) -> Result<Value> {
     if p.get("tint").is_some() && p.get("swatch").is_none() {
         return Err(bad(cmd, "`tint` goes with a global or spot `swatch`"));
     }
+    check_keep_model(p, cmd)?;
     let paint = paint_from(s, p)?.ok_or_else(|| bad(cmd, "give color, none, swatch or gradient"))?;
+    // As `paint.editGradient`: a `dither` given applies to gradient fills only. A gradient swatch
+    // (named) keeps its own dither; `"swatch": null` names none.
+    if !fill && matches!(&paint, Paint::Gradient(g) if g.gradient.dither) && p.get("swatch").and_then(Value::as_str).is_none() {
+        return Err(bad(cmd, "`dither` applies to gradient fills (paint.setFill)"));
+    }
     apply_paint(s, p, paint, fill)
 }
 
 /// [`apply_paint`] on the proxy named by `stroke` (default: the active one), focusing it.
-fn apply_to_proxy(s: &mut Session, p: &Value, paint: Paint) -> Result<Value> {
-    let fill = !stroke_param(s, p);
+fn apply_to_proxy(s: &mut Session, p: &Value, paint: Paint, cmd: &str) -> Result<Value> {
+    let fill = !stroke_param(s, p, cmd)?;
     apply_paint(s, p, paint, fill)
 }
 
@@ -406,6 +422,7 @@ fn apply_to_proxy(s: &mut Session, p: &Value, paint: Paint) -> Result<Value> {
 /// remember the paint.
 fn apply_paint(s: &mut Session, p: &Value, paint: Paint, fill: bool) -> Result<Value> {
     let cmd = if fill { "paint.setFill" } else { "paint.setStroke" };
+    let focus = switch_or(p, "focus", true, cmd)?;
     let span = spans_targets(p, &paint).map_err(|e| bad(cmd, e))?;
     // Characters selected with the Type tool take the paint, not the whole type object (#1063).
     if p.get("ids").is_none()
@@ -431,7 +448,7 @@ fn apply_paint(s: &mut Session, p: &Value, paint: Paint, fill: bool) -> Result<V
             super::typecmd::refresh_bounds(t);
             Ok(super::appearance::count_changed(d, &before, &[id]))
         })?;
-        if bool_or(p, "focus", true) {
+        if focus {
             s.fill_active = fill;
         }
         s.remember_paint(&paint);
@@ -514,7 +531,7 @@ fn apply_paint(s: &mut Session, p: &Value, paint: Paint, fill: bool) -> Result<V
         }
         s.paint.stroke = unplaced(&paint);
     }
-    if bool_or(p, "focus", true) {
+    if focus {
         s.fill_active = fill;
     }
     s.remember_paint(&paint);
@@ -666,8 +683,8 @@ fn default_paint(s: &mut Session, p: &Value) -> Result<Value> {
 /// default when there are none) and remember the first target's new paint. The Appearance panel's
 /// active item of the proxy's kind is recoloured in each selected object's own stack instead.
 fn proxy_recolor(s: &mut Session, p: &Value, cmd: &str, label: &str, f: &dyn Fn(Color) -> Color) -> Result<Value> {
-    let stroke = stroke_param(s, p);
-    let ids = match ids_param(p, "ids") {
+    let stroke = stroke_param(s, p, cmd)?;
+    let ids = match super::given_objects(s, p, cmd)? {
         Some(ids) => ids,
         None => super::edit::selected_roots(s)?,
     };

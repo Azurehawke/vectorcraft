@@ -58,17 +58,23 @@ pub(crate) fn first_selected_text(app: &VectorcraftApp) -> Option<&vectorcraft_d
 /// caret's style at a caret), else every run of the selected type, groups' included. `None` (a
 /// blank field) where they differ, or with no type.
 pub(crate) fn shared<T: PartialEq>(app: &VectorcraftApp, f: impl Fn(&CharStyle) -> T) -> Option<T> {
-    shared_styles(app, |_, style| Some(f(style)))
+    shared_styles(app, |_, _, style| Some(f(style)))
 }
 
 /// Dimensional controls use document units and tolerate arithmetic roundoff when comparing
 /// compensated runs. Keep raw styles available to font/paragraph controls and style definitions,
 /// even if a collapsed affine prevents editing dimensions.
 fn shared_effective(app: &VectorcraftApp, f: impl Fn(&CharStyle) -> f64) -> Option<f64> {
-    shared_styles(app, |t, style| t.effective_char_style(style).map(|s| Metric(f(&s)))).map(|v| v.0)
+    shared_styles(app, |t, _, style| t.effective_char_style(style).map(|s| Metric(f(&s)))).map(|v| v.0)
 }
 
-struct Metric(f64);
+/// The Leading shown: each character's own, or for Auto leading the share of its size its
+/// paragraph's Justification › Auto Leading sets, as the layout uses.
+fn shared_leading(app: &VectorcraftApp) -> Option<f64> {
+    shared_styles(app, |t, para, style| t.effective_char_style(style).map(|s| Metric(para.effective_leading(&s)))).map(|v| v.0)
+}
+
+pub(crate) struct Metric(pub(crate) f64);
 
 impl PartialEq for Metric {
     fn eq(&self, other: &Self) -> bool {
@@ -76,7 +82,12 @@ impl PartialEq for Metric {
     }
 }
 
-fn shared_styles<T: PartialEq>(app: &VectorcraftApp, f: impl Fn(&vectorcraft_doc::TextObject, &CharStyle) -> Option<T>) -> Option<T> {
+/// `f` of each character style in the selection, with its text object and the paragraph the
+/// characters are in (a run that spans paragraphs counts once for each).
+fn shared_styles<T: PartialEq>(
+    app: &VectorcraftApp,
+    f: impl Fn(&vectorcraft_doc::TextObject, &vectorcraft_doc::ParaStyle, &CharStyle) -> Option<T>,
+) -> Option<T> {
     let st = app.session.active()?;
     let text = |id: NodeId| match st.doc.node(id).map(|n| &n.kind) {
         Some(NodeKind::Text(t)) => Some(t),
@@ -86,21 +97,15 @@ fn shared_styles<T: PartialEq>(app: &VectorcraftApp, f: impl Fn(&vectorcraft_doc
     if let Some((id, a, b)) = text_editing(app) {
         let t = text(id)?;
         if b <= a {
-            return f(t, &vectorcraft_text::edit::insertion_style(&t.runs, a, b));
+            let para = t.plain_text().get(..a).map_or(0, |s| s.bytes().filter(|&c| c == b'\n').count());
+            return f(t, t.para_at(para), &vectorcraft_text::edit::insertion_style(&t.runs, a, b));
         }
-        let mut end = 0;
-        for r in &t.runs {
-            let start = end;
-            end += r.text.len();
-            if start < b && end > a {
-                acc.add(f(t, &r.style));
-            }
-        }
+        each_paragraph_run(t, Some((a, b)), |para, style| acc.add(f(t, para, style)));
     } else {
         for n in st.selection.objects.iter().filter_map(|id| st.doc.node(*id)) {
             n.walk(&mut |c| {
                 if let NodeKind::Text(t) = &c.kind {
-                    t.runs.iter().for_each(|r| acc.add(f(t, &r.style)));
+                    each_paragraph_run(t, None, |para, style| acc.add(f(t, para, style)));
                 }
             });
         }
@@ -108,22 +113,59 @@ fn shared_styles<T: PartialEq>(app: &VectorcraftApp, f: impl Fn(&vectorcraft_doc
     acc.value().flatten()
 }
 
+/// `f` of the paragraph and style of each piece of `t`'s runs that lies in one paragraph (a
+/// paragraph's closing line break belongs to it): the pieces within bytes `a..b`, or with no
+/// range every run's, empty ones included. With no range, a final empty paragraph (the text ends
+/// in a line break) counts too, with the style of the run before it, as the caret there types.
+fn each_paragraph_run<'a>(
+    t: &'a vectorcraft_doc::TextObject,
+    range: Option<(usize, usize)>,
+    mut f: impl FnMut(&'a vectorcraft_doc::ParaStyle, &'a CharStyle),
+) {
+    let (mut end, mut para) = (0, 0);
+    // The style of the last character and whether it is a line break: the paragraph after it has
+    // no characters of its own.
+    let mut last: Option<(&'a CharStyle, bool)> = None;
+    for r in &t.runs {
+        if r.text.is_empty() {
+            if range.is_none_or(|(a, b)| a < end && end < b) {
+                f(t.para_at(para), &r.style);
+            }
+            continue;
+        }
+        for piece in r.text.split_inclusive('\n') {
+            let start = end;
+            end += piece.len();
+            if range.is_none_or(|(a, b)| start < b && end > a) {
+                f(t.para_at(para), &r.style);
+            }
+            para += usize::from(piece.ends_with('\n'));
+            last = Some((&r.style, piece.ends_with('\n')));
+        }
+    }
+    if range.is_none()
+        && let Some((style, true)) = last
+    {
+        f(t.para_at(para), style);
+    }
+}
+
 /// The value a run of styles share so far ([`shared`]).
-enum Shared<T> {
+pub(crate) enum Shared<T> {
     None,
     Same(T),
     Differ,
 }
 
 impl<T: PartialEq> Shared<T> {
-    fn add(&mut self, v: T) {
+    pub(crate) fn add(&mut self, v: T) {
         match self {
             Shared::None => *self = Shared::Same(v),
             Shared::Same(x) if *x != v => *self = Shared::Differ,
             _ => {}
         }
     }
-    fn value(self) -> Option<T> {
+    pub(crate) fn value(self) -> Option<T> {
         match self {
             Shared::Same(v) => Some(v),
             _ => None,
@@ -461,7 +503,7 @@ pub(crate) fn metrics_grid(app: &mut VectorcraftApp, ui: &mut Ui, id: &str, s: &
     egui::Grid::new(id).num_columns(2).spacing([6.0, 4.0]).show(ui, |ui| {
         cell(ui, "T", tl!("Font Size"), |ui| size_field(app, ui, "ch-size", fw));
         cell(ui, "A↕", tl!("Leading"), |ui| {
-            let leading = shared_effective(app, CharStyle::effective_leading);
+            let leading = shared_leading(app);
             let auto = shared(app, |s| s.leading.is_none()) == Some(true);
             match widgets::spin_field_auto(ui, "ch-lead", leading, Some(auto), unit, fw, 1.0, 0.1, &SIZE_PRESETS) {
                 Some(SpinPick::Value(v)) => style(app, json!({"leading": v})),
@@ -712,6 +754,24 @@ fn style_toggle(ui: &mut Ui, g: Glyph, tip: &str, on: bool) -> bool {
     resp.clicked()
 }
 
+/// The Character Direction submenu: Default, Left to Right and Right to Left set the characters the
+/// panel acts on ([`char_cmd`]) as the bidi algorithm sets them, or left to right or right to left
+/// inside their paragraph. The direction those characters share is checked, and none is checked
+/// when they differ.
+fn char_direction_items(app: &mut VectorcraftApp, ui: &mut Ui) {
+    use vectorcraft_doc::ParaDirection;
+    let direction = shared(app, |s| s.char_direction);
+    for (label, d, key) in [
+        (tl!("Default"), None, "default"),
+        (tl!("Left to Right"), Some(ParaDirection::LeftToRight), "leftToRight"),
+        (tl!("Right to Left"), Some(ParaDirection::RightToLeft), "rightToLeft"),
+    ] {
+        if menu_item(ui, label, true, direction == Some(d)) {
+            format(app, json!({"charDirection": key}));
+        }
+    }
+}
+
 pub fn menu(app: &mut VectorcraftApp, ui: &mut Ui) {
     let st = text_style(app);
     let has = st.is_some();
@@ -769,6 +829,11 @@ pub fn menu(app: &mut VectorcraftApp, ui: &mut Ui) {
         if menu_item(ui, tl!("Proportional Metrics"), has, proportional) {
             format(app, json!({"proportionalMetrics": !proportional}));
         }
+        // Tate-chu-yoko: the selected characters stand side by side across one em of a vertical column.
+        let tcy = s.as_ref().is_some_and(|s| s.tate_chu_yoko);
+        if menu_item(ui, tl!("Tate-chu-yoko"), has, tcy) {
+            format(app, json!({"tateChuYoko": !tcy}));
+        }
         ui.separator();
     }
     // Digits: the numeral system the selected characters' digits are drawn in, with the Middle
@@ -790,11 +855,34 @@ pub fn menu(app: &mut VectorcraftApp, ui: &mut Ui) {
                 }
             });
         });
+        ui.add_enabled_ui(has, |ui| {
+            ui.menu_button(format!("   {}", tl!("Character Direction")), |ui| char_direction_items(app, ui));
+        });
         ui.separator();
     }
-    for l in ["Standard Vertical Roman Alignment", "Tate-chu-yoko", "Fractional Widths", "System Layout", "No Break"] {
-        menu_item(ui, tl!(l), false, l == "Fractional Widths");
+    // No Break: the selected characters stay on one line.
+    let no_break = s.as_ref().is_some_and(|s| s.no_break);
+    if menu_item(ui, tl!("No Break"), has, no_break) {
+        format(app, json!({"noBreak": !no_break}));
     }
+    // Fractional Widths: the whole type object's spacing, on unless turned off. Not a character
+    // range, so a selection inside the text sets the object the Type tool is editing.
+    let fractional = fractional_widths_on(app);
+    if menu_item(ui, tl!("Fractional Widths"), has, fractional) {
+        let mut p = json!({});
+        if let Some((id, _, _)) = text_editing(app) {
+            p["id"] = json!(id.0);
+        }
+        app.run("type.fractionalWidths", p).ok();
+    }
+    // System Layout: whole-point spacing for every text object in the document. It does not need
+    // a type selection; a document is enough.
+    let open = app.session.active().is_some();
+    let system = app.session.active().is_some_and(|st| st.doc.setup.system_layout);
+    if menu_item(ui, tl!("System Layout"), open, system) {
+        app.run("type.systemLayout", json!({})).ok();
+    }
+    menu_item(ui, tl!("Standard Vertical Roman Alignment"), false, false);
     ui.separator();
     // The installed fonts are always listed; this picks up fonts installed since the app started.
     #[cfg(not(target_arch = "wasm32"))]
@@ -808,11 +896,23 @@ pub fn menu(app: &mut VectorcraftApp, ui: &mut Ui) {
     }
 }
 
+/// Whether Fractional Widths is on for the type the panel shows: the object being edited, else
+/// the first selected text object. On when there is no type (the item is disabled then).
+fn fractional_widths_on(app: &VectorcraftApp) -> bool {
+    if let Some((id, _, _)) = text_editing(app)
+        && let Some(NodeKind::Text(t)) = app.session.active().and_then(|d| d.doc.node(id)).map(|n| &n.kind)
+    {
+        return t.fractional_widths;
+    }
+    first_selected_text(app).is_none_or(|t| t.fractional_widths)
+}
+
 /// Reset Panel: the characters the panel acts on ([`char_cmd`]) take tracking 0, Auto leading and
 /// kerning, no baseline shift, 100% scales, no rotation, no underline or strikethrough, All Caps
 /// and Small Caps off, the normal position (neither superscript nor subscript), Roman Baseline
-/// character alignment, Proportional Metrics off and the Default digits, whether or not Show
-/// East Asian Options and Show Indic Options are on.
+/// character alignment, Proportional Metrics, Tate-chu-yoko and No Break off, the Default character
+/// direction and the Default digits, whether or not Show East Asian Options and Show Indic Options
+/// are on.
 fn reset_panel(app: &mut VectorcraftApp) {
     let d = CharStyle::default();
     style(app, json!({"tracking": 0, "leading": "auto"}));
@@ -821,7 +921,8 @@ fn reset_panel(app: &mut VectorcraftApp) {
         json!({
             "kerning": "auto", "baselineShift": 0, "hScale": 100, "vScale": 100, "rotation": 0, "underline": false, "strikethrough": false,
             "allCaps": false, "smallCaps": d.small_caps.is_some(), "position": d.position.id(), "charAlign": d.char_align,
-            "proportionalMetrics": d.proportional_metrics, "digits": d.digits
+            "proportionalMetrics": d.proportional_metrics, "tateChuYoko": d.tate_chu_yoko, "noBreak": d.no_break, "charDirection": "default",
+            "digits": d.digits
         }),
     );
 }
@@ -849,6 +950,36 @@ mod tests {
         ] {
             assert!((actual.expect("equal dimensions must not be mixed") - expected).abs() < 1e-8);
         }
+    }
+
+    /// A final empty paragraph counts: with the object selected, its Auto Leading differing from
+    /// the paragraph before it shows Leading as mixed.
+    #[test]
+    fn leading_field_counts_the_final_empty_paragraph() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 200})).unwrap();
+        let id = app.run("text.create", json!({"x": 20, "y": 50, "text": "One\n", "size": 10})).unwrap()["id"].clone();
+        app.run("select.set", json!({"ids": [id]})).unwrap();
+        assert!((shared_leading(&app).unwrap() - 12.0).abs() < 1e-9);
+        app.run("text.setFormat", json!({"autoLeading": 200, "start": 4, "end": 4})).unwrap();
+        assert_eq!(shared_leading(&app), None, "the empty last paragraph differs");
+    }
+
+    /// Auto leading shows the leading the paragraph's Justification › Auto Leading sets.
+    #[test]
+    fn leading_field_shows_the_paragraph_auto_leading() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 200})).unwrap();
+        let id = app.run("text.create", json!({"x": 20, "y": 50, "text": "One\nTwo", "size": 10})).unwrap()["id"].clone();
+        app.run("select.set", json!({"ids": [id]})).unwrap();
+        assert!((shared_leading(&app).unwrap() - 12.0).abs() < 1e-9);
+        app.run("text.setFormat", json!({"autoLeading": 200, "start": 5, "end": 5})).unwrap();
+        assert_eq!(shared_leading(&app), None, "the paragraphs differ");
+        assert_eq!(shared(&app, |s| s.leading.is_none()), Some(true), "still Auto");
+        app.run("text.setFormat", json!({"autoLeading": 200})).unwrap();
+        assert!((shared_leading(&app).unwrap() - 20.0).abs() < 1e-9);
+        app.run("text.setStyle", json!({"leading": 15})).unwrap();
+        assert!((shared_leading(&app).unwrap() - 15.0).abs() < 1e-9, "a set leading is its own");
     }
 
     #[test]
@@ -949,11 +1080,13 @@ mod tests {
         let text = crate::tests_labels::painted_text(&mut app, |app, ui| axis_sliders(app, ui, &face));
         assert!(text.contains("Weight\n") && text.contains("Width\n") && text.contains("400") && text.contains("100"), "{text}");
         // The labels are the font's names in every interface language, not catalog words (ja
-        // translates the interface's Weight as 線幅, the stroke weight).
-        crate::i18n::set_current(crate::i18n::Lang::from_code("ja").unwrap());
+        // translates the interface's Weight as the stroke weight).
+        let ja = crate::i18n::Lang::from_code("ja").unwrap();
+        crate::i18n::set_current(ja);
         let text = crate::tests_labels::painted_text(&mut app, |app, ui| axis_sliders(app, ui, &face));
         crate::i18n::set_current(crate::i18n::Lang::EN);
-        assert!(text.contains("Weight\n") && text.contains("Width\n") && !text.contains("線幅"), "{text}");
+        let weight = crate::i18n::tr(ja, "Weight");
+        assert!(text.contains("Weight\n") && text.contains("Width\n") && (weight == "Weight" || !text.contains(weight)), "{text}");
         // Screen readers name each slider by its axis.
         let tree = crate::widgets::accessibility_tests::tree(|ui| axis_sliders(&mut app, ui, &face));
         for name in ["Weight", "Width"] {
@@ -1137,6 +1270,66 @@ mod tests {
         }
     }
 
+    /// Character panel menu › System Layout is off for a new document, and a click turns whole-point
+    /// spacing on and back off for every text object.
+    #[test]
+    fn system_layout_menu_item_toggles_the_document() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 200})).unwrap();
+        let id = app.run("text.create", json!({"x": 20, "y": 50, "text": "Hi", "size": 13})).unwrap()["id"].as_u64().unwrap();
+        let ctx = egui::Context::default();
+        let on = |app: &VectorcraftApp| {
+            let st = app.session.active().unwrap();
+            let object = match &st.doc.node(NodeId(id)).unwrap().kind {
+                NodeKind::Text(t) => t.system_layout,
+                _ => panic!("text"),
+            };
+            (st.doc.setup.system_layout, object)
+        };
+        let row = |app: &mut VectorcraftApp| {
+            let texts = super::super::tests_appearance::frame_events(&ctx, app, vec![], menu);
+            texts.into_iter().find(|(t, _)| t.trim_start_matches(['✓', ' ']) == "System Layout")
+        };
+        assert_eq!(on(&app), (false, false));
+        assert!(row(&mut app).is_some_and(|(t, _)| !t.starts_with('✓')));
+        let at = row(&mut app).unwrap().1;
+        super::super::tests_appearance::click(&ctx, &mut app, at.center(), menu);
+        assert_eq!(on(&app), (true, true));
+        assert!(row(&mut app).is_some_and(|(t, _)| t.starts_with('✓')));
+        let at = row(&mut app).unwrap().1;
+        super::super::tests_appearance::click(&ctx, &mut app, at.center(), menu);
+        assert_eq!(on(&app), (false, false));
+        assert!(row(&mut app).is_some_and(|(t, _)| !t.starts_with('✓')));
+    }
+
+    /// Character panel menu › Fractional Widths is on for new type, and a click turns it off and
+    /// back on for the whole type object.
+    #[test]
+    fn fractional_widths_menu_item_toggles_the_type_object() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 200})).unwrap();
+        let id = app.run("text.create", json!({"x": 20, "y": 50, "text": "Hi", "size": 13})).unwrap()["id"].as_u64().unwrap();
+        let ctx = egui::Context::default();
+        let flag = |app: &VectorcraftApp| match &app.session.active().unwrap().doc.node(NodeId(id)).unwrap().kind {
+            NodeKind::Text(t) => t.fractional_widths,
+            _ => panic!("text"),
+        };
+        let row = |app: &mut VectorcraftApp| {
+            let texts = super::super::tests_appearance::frame_events(&ctx, app, vec![], menu);
+            texts.into_iter().find(|(t, _)| t.trim_start_matches(['✓', ' ']) == "Fractional Widths")
+        };
+        assert!(flag(&app));
+        assert!(row(&mut app).is_some_and(|(t, _)| t.starts_with('✓')));
+        let at = row(&mut app).unwrap().1;
+        super::super::tests_appearance::click(&ctx, &mut app, at.center(), menu);
+        assert!(!flag(&app));
+        assert!(row(&mut app).is_some_and(|(t, _)| !t.starts_with('✓')));
+        let at = row(&mut app).unwrap().1;
+        super::super::tests_appearance::click(&ctx, &mut app, at.center(), menu);
+        assert!(flag(&app));
+        assert!(row(&mut app).is_some_and(|(t, _)| t.starts_with('✓')));
+    }
+
     /// Character Alignment and Proportional Metrics are in the panel menu with the East Asian
     /// options only (as Mojikumi Set and Top-to-Top Leading are in the Paragraph panel).
     #[test]
@@ -1154,6 +1347,34 @@ mod tests {
         assert_eq!(shown(&mut app), (true, true));
     }
 
+    /// Tate-chu-yoko is in the panel menu with the East Asian options, and choosing it marks the
+    /// selected characters.
+    #[test]
+    fn tate_chu_yoko_menu_item_shows_with_east_asian_options_and_toggles() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 200})).unwrap();
+        let id = app.session.execute("text.create", &json!({"x": 20, "y": 50, "text": "2026"})).unwrap()["id"].as_u64().unwrap();
+        app.session.execute("select.set", &json!({"ids": [id]})).unwrap();
+        let ctx = egui::Context::default();
+        let painted = |app: &mut VectorcraftApp| crate::tests_labels::painted_text(app, menu);
+        assert!(!painted(&mut app).contains("Tate-chu-yoko"));
+        app.session.prefs.show_east_asian_options = true;
+        let on = |app: &VectorcraftApp| match &app.session.active().unwrap().doc.node(NodeId(id)).unwrap().kind {
+            NodeKind::Text(t) => t.runs.iter().all(|r| r.style.tate_chu_yoko),
+            _ => panic!("text"),
+        };
+        assert!(!on(&app));
+        let texts = super::super::tests_appearance::frame_events(&ctx, &mut app, vec![], menu);
+        let at = texts.iter().find(|(t, _)| t.trim_start_matches(['✓', ' ']) == "Tate-chu-yoko").unwrap_or_else(|| panic!("{texts:?}")).1;
+        super::super::tests_appearance::click(&ctx, &mut app, at.center(), menu);
+        assert!(on(&app));
+        assert!(painted(&mut app).contains("✓ Tate-chu-yoko"));
+        let texts = super::super::tests_appearance::frame_events(&ctx, &mut app, vec![], menu);
+        let at = texts.iter().find(|(t, _)| t.trim_start_matches(['✓', ' ']) == "Tate-chu-yoko").unwrap().1;
+        super::super::tests_appearance::click(&ctx, &mut app, at.center(), menu);
+        assert!(!on(&app));
+    }
+
     /// Digits is in the panel menu with the Middle Eastern (Indic) options only, as Paragraph
     /// Direction is in the Paragraph panel.
     #[test]
@@ -1168,10 +1389,67 @@ mod tests {
         assert!(shown(&mut app));
     }
 
+    /// Character Direction is in the panel menu with the Middle Eastern (Indic) options, beside
+    /// Digits. Its submenu checks the direction the characters the panel acts on share: the
+    /// selected type's, or the range the Type tool has selected. It checks no item when they differ.
+    #[test]
+    fn character_direction_checks_the_direction_of_the_selection() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 200})).unwrap();
+        let id = app.run("text.create", json!({"x": 20, "y": 50, "text": "שלום 21 10 2026"})).unwrap()["id"].as_u64().unwrap();
+        app.run("select.set", json!({"ids": [id]})).unwrap();
+        let shown = |app: &mut VectorcraftApp| crate::tests_labels::painted_text(app, menu).contains("Character Direction");
+        assert!(!shown(&mut app));
+        app.session.prefs.show_indic_options = true;
+        assert!(shown(&mut app));
+        let checked = |app: &mut VectorcraftApp| {
+            let text = crate::tests_labels::painted_text(app, char_direction_items);
+            text.lines().filter_map(|l| l.strip_prefix("✓ ")).map(str::to_string).collect::<Vec<_>>()
+        };
+        assert_eq!(checked(&mut app), ["Default"]);
+        app.run("text.setRangeStyle", json!({"id": id, "start": 9, "end": 19, "charDirection": "leftToRight"})).unwrap();
+        // The object's characters differ: nothing is checked.
+        assert!(checked(&mut app).is_empty());
+        // The Type tool's selection: the date, then the Hebrew word.
+        app.select_tool("type");
+        app.session.apply_actions(vec![vectorcraft_tools::Action::Notify("text.editNew".into())]).unwrap();
+        app.session.set_tool_option("select", &json!({"start": 9, "end": 19}));
+        assert_eq!(checked(&mut app), ["Left to Right"]);
+        app.session.set_tool_option("select", &json!({"start": 0, "end": 8}));
+        assert_eq!(checked(&mut app), ["Default"]);
+    }
+
+    /// No Break is in the panel menu, and choosing it marks the selected characters.
+    #[test]
+    fn no_break_menu_item_toggles_the_selected_characters() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 200})).unwrap();
+        let id = app.session.execute("text.create", &json!({"x": 20, "y": 50, "text": "Hello"})).unwrap()["id"].as_u64().unwrap();
+        app.session.execute("select.set", &json!({"ids": [id]})).unwrap();
+        let ctx = egui::Context::default();
+        let painted = |app: &mut VectorcraftApp| crate::tests_labels::painted_text(app, menu);
+        assert!(painted(&mut app).contains("No Break"));
+        assert!(!painted(&mut app).contains("✓ No Break"));
+        let on = |app: &VectorcraftApp| match &app.session.active().unwrap().doc.node(NodeId(id)).unwrap().kind {
+            NodeKind::Text(t) => t.runs.iter().all(|r| r.style.no_break),
+            _ => panic!("text"),
+        };
+        assert!(!on(&app));
+        let texts = super::super::tests_appearance::frame_events(&ctx, &mut app, vec![], menu);
+        let at = texts.iter().find(|(t, _)| t.trim_start_matches(['✓', ' ']) == "No Break").unwrap_or_else(|| panic!("{texts:?}")).1;
+        super::super::tests_appearance::click(&ctx, &mut app, at.center(), menu);
+        assert!(on(&app));
+        assert!(painted(&mut app).contains("✓ No Break"));
+        let texts = super::super::tests_appearance::frame_events(&ctx, &mut app, vec![], menu);
+        let at = texts.iter().find(|(t, _)| t.trim_start_matches(['✓', ' ']) == "No Break").unwrap().1;
+        super::super::tests_appearance::click(&ctx, &mut app, at.center(), menu);
+        assert!(!on(&app));
+    }
+
     /// Reset Panel sets every character attribute the panel shows, except the font family, style
     /// and size, back to its default (Small Caps, the position, Character Alignment, Proportional
-    /// Metrics and Digits included), in the selected type and in the text the Type tool has
-    /// selected while it edits.
+    /// Metrics, Tate-chu-yoko, No Break, Character Direction and Digits included), in the selected
+    /// type and in the text the Type tool has selected while it edits.
     #[test]
     fn reset_panel_resets_every_attribute_but_the_font() {
         let mut app = VectorcraftApp::new(Session::new(), Default::default());
@@ -1197,6 +1475,9 @@ mod tests {
                 s.position != d.position,
                 s.char_align != d.char_align,
                 s.proportional_metrics != d.proportional_metrics,
+                s.tate_chu_yoko != d.tate_chu_yoko,
+                s.no_break != d.no_break,
+                s.char_direction != d.char_direction,
                 s.digits != d.digits,
             ]
         };
@@ -1206,16 +1487,17 @@ mod tests {
                 json!({
                     "id": id, "tracking": 50, "leading": 30, "kerning": 20, "baselineShift": 3, "hScale": 120, "vScale": 90, "rotation": 15,
                     "underline": true, "strikethrough": true, "allCaps": true, "smallCaps": true, "position": "superscript",
-                    "charAlign": "emBoxCenter", "proportionalMetrics": true, "digits": "hindi"
+                    "charAlign": "emBoxCenter", "proportionalMetrics": true, "tateChuYoko": true, "noBreak": true,
+                    "charDirection": "rightToLeft", "digits": "hindi"
                 }),
             )
             .unwrap();
         };
         let plain = runs(&app)[0].1.clone();
-        assert_eq!(differs(&plain, &CharStyle::default()), [false; 15]);
+        assert_eq!(differs(&plain, &CharStyle::default()), [false; 18]);
         custom(&mut app);
         let styled = runs(&app)[0].1.clone();
-        assert_eq!(differs(&styled, &CharStyle::default()), [true; 15]);
+        assert_eq!(differs(&styled, &CharStyle::default()), [true; 18]);
         app.run("select.set", json!({"ids": [id]})).unwrap();
         reset_panel(&mut app);
         assert_eq!(runs(&app), [("One 12".to_string(), plain.clone())]);

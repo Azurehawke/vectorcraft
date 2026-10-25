@@ -10,19 +10,19 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use vectorcraft_brush::{self as brush, Brush};
+use vectorcraft_brush::{self as brush, Bristle, Brush, BrushKind};
 use vectorcraft_color::{Color, Paint};
 use vectorcraft_doc::{AppearanceItem, Document, FillLayer, Node, NodeId, NodeKind, Symbol, SymbolExportType, SymbolNineSlice, SymbolRegistration};
 use vectorcraft_geom::{Affine, Point, Vec2};
 
 use super::edit::{outermost, selected_roots};
 use super::pathops::{remove_each, separate};
-use super::swatch::names_param;
+use super::swatch::{anchor, names_param};
 use super::*;
 use crate::EngineError;
 
 const SIZES_KEY: &str = vectorcraft_doc::SYMBOL_SIZES;
-const CURRENT_SYMBOL: &str = "currentSymbol";
+pub(crate) const CURRENT_SYMBOL: &str = "currentSymbol";
 /// Half the instance box `Node::geometric_bounds` uses for symbol instances.
 const HALF: f64 = vectorcraft_doc::SYMBOL_HALF;
 
@@ -31,6 +31,15 @@ pub fn specs() -> Vec<CommandSpec> {
         // ----- brushes -----
         cmd!(query "brush.list", "Brushes", [], None, "{} → {brushes: [{name, type}], current}", has_doc, brush_list),
         cmd!(query "brush.get", "Brush Definition", [], None, "{name} → the brush definition (JSON)", has_doc, brush_get),
+        cmd!(
+            query "brush.selectionArt",
+            "Brush Art",
+            [],
+            None,
+            "{ids?|id?} → {art: the object brush.new takes as a new scatter or art brush's art and as a new pattern brush's side tile (several objects become one group), or null when nothing is selected or ids name no object}",
+            has_doc,
+            brush_selection_art
+        ),
         cmd!(
             "brush.apply",
             "Apply Brush",
@@ -63,7 +72,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Brush…",
             [],
             None,
-            "{type: calligraphic|scatter|art|pattern|bristle, name? (trimmed; blank: New <Type> Brush), params?: {…definition fields}, ids?|id?} new brush; art/scatter/pattern brushes take the selected art (pattern: side tile) unless params give it → {name}",
+            "{type: calligraphic|scatter|art|pattern|bristle, name? (trimmed; blank: New <Type> Brush; a bristle brush name, with the number a taken name gets, has at most 31 characters), params?: {…definition fields}, ids?|id?} new brush; art/scatter/pattern brushes take the selected art (pattern: side tile) unless params give it → {name}",
             has_doc,
             brush_new
         ),
@@ -75,6 +84,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{name} | {names: [name…]} delete brushes; strokes using them become plain strokes",
             has_doc,
             brush_delete
+        ),
+        cmd!(
+            "brush.move",
+            "Move Brush",
+            [],
+            None,
+            "{name? | names?: [brush names of one type, in order], to?: index among the brushes of that type in brush.list order (they go before the brush of that type now there that isn't moving; default: after the last one), type?: calligraphic|scatter|art|pattern|bristle (the type they go into; default: theirs)} reorder brushes within their type, as one undo step (none when the order stays as it was); brushes of different types, or a type that isn't theirs, are refused (brushes move only within their type) → {moved}",
+            has_doc,
+            brush_move
         ),
         cmd!(
             "brush.duplicate",
@@ -99,7 +117,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Brush Options…",
             [],
             None,
-            "{name, params?: {…fields to change (brush.get shows them; values outside their ranges are clamped). calligraphic: angle −180..180°, roundness 0..100%, size 0..1296 pt, variation: [angle°, roundness%, size pt], modes: [fixed|random|pressure for angle, roundness, size] (pressure goes from value − variation at the lightest pen pressure to value + variation at the heaviest). scatter: size [a, b] 1..10000%, spacing [a, b] 1..10000%, scatter [a, b] −1000..1000%, rotation [a, b] −180..180°, modes: [fixed|random|pressure for size, spacing, scatter, rotation] (fixed: a; random: between a and b; pressure: a at the lightest pen pressure to b at the heaviest), rotation_relative_to_path. art: width 1..1000%, scale: {mode: proportional|stretch|betweenGuides, start, end: 0..1 of the art length}, direction: leftToRight|rightToLeft|topToBottom|bottomToTop, flip_along, flip_across, overlap. pattern: scale 1..10000%, spacing 0..10000%, fit: stretch|addSpace|approximate, flip_along, flip_across. scatter, art and pattern: colorization: {method: none|tints|tintsAndShades|hueShift, key: colour (hueShift: the art colour that becomes the stroke colour; without a key: the solid color the art's fills and strokes use most, black when they use none)}; colorization and the art brush's scale change only the fields given}, newName? (trimmed; blank: the name is kept)} edit a brush definition (strokes using it update) → {name}",
+            "{name, params?: {…fields to change (brush.get shows them; values outside their ranges are clamped). calligraphic: angle −180..180°, roundness 0..100%, size 0..1296 pt, variation: [angle°, roundness%, size pt], modes: [fixed|random|pressure for angle, roundness, size] (pressure goes from value − variation at the lightest pen pressure to value + variation at the heaviest). scatter: size [a, b] 1..10000%, spacing [a, b] 1..10000%, scatter [a, b] −1000..1000%, rotation [a, b] −180..180°, modes: [fixed|random|pressure for size, spacing, scatter, rotation] (fixed: a; random: between a and b; pressure: a at the lightest pen pressure to b at the heaviest), rotation_relative_to_path. art: width 1..1000%, scale: {mode: proportional|stretch|betweenGuides, start, end: 0..1 of the art length}, direction: leftToRight|rightToLeft|topToBottom|bottomToTop, flip_along, flip_across, overlap. pattern: scale 1..10000%, spacing 0..10000%, fit: stretch|addSpace|approximate, flip_along, flip_across. scatter, art and pattern: colorization: {method: none|tints|tintsAndShades|hueShift, key: colour (hueShift: the art colour that becomes the stroke colour; without a key: the solid color the art's fills and strokes use most, black when they use none)}; colorization and the art brush's scale change only the fields given}, newName? (trimmed; blank: the name is kept; a new bristle brush name has at most 31 characters, and a longer name the brush has is kept)} edit a brush definition (strokes using it update) → {name}",
             has_doc,
             brush_options
         ),
@@ -278,6 +296,12 @@ fn brush_get(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(serde_json::to_value(b).unwrap_or_default())
 }
 
+/// The art `brush.new` takes from `ids` or `id`, else from the selection ([`selection_art`]).
+fn brush_selection_art(s: &mut Session, p: &Value) -> Result<Value> {
+    let art = selection_art(s, p)?;
+    Ok(json!({ "art": art.map(|n| serde_json::to_value(&n).unwrap_or_default()) }))
+}
+
 fn brush_apply(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "brush.apply";
     let name = name_param(p, C)?.to_string();
@@ -380,30 +404,78 @@ fn merge(base: &mut Value, patch: &Value) {
     }
 }
 
-fn save_library(s: &mut Session, label: &str, lib: Vec<Brush>, renames: &[(String, Option<String>)]) -> Result<()> {
+/// Sets brush `to` on the strokes in `items` that paint with brush `from`.
+fn set_stroke_brush(items: &mut [AppearanceItem], from: &str, to: Option<&str>) {
+    for it in items {
+        if let AppearanceItem::Stroke(st) = it
+            && st.brush.as_deref() == Some(from)
+        {
+            st.brush = to.map(str::to_string);
+        }
+    }
+}
+
+/// Whether a stroke in `n` (its opacity masks included) paints with brush `name`.
+fn paints_with(n: &Node, name: &str) -> bool {
+    let mut hit = false;
+    vectorcraft_doc::swatches::walk_with_masks(n, &mut |m| {
+        hit |= m.appearance.items.iter().any(|i| matches!(i, AppearanceItem::Stroke(st) if st.brush.as_deref() == Some(name)));
+    });
+    hit
+}
+
+/// Applies [`set_stroke_brush`] to every stroke in `n` and its opacity masks. Only the objects that
+/// hold such a stroke, and those that hold them, are copied.
+fn set_brush_in(n: &mut Node, from: &str, to: Option<&str>) {
+    set_stroke_brush(&mut n.appearance.items, from, to);
+    if let Some(mask) = n.extras_if_any().and_then(|e| e.mask.as_mut())
+        && paints_with(&mask.art, from)
+    {
+        set_brush_in(Arc::make_mut(&mut mask.art), from, to);
+    }
+    for c in n.children_mut().into_iter().flatten() {
+        if paints_with(c, from) {
+            set_brush_in(Arc::make_mut(c), from, to);
+        }
+    }
+}
+
+/// Returns the art a brush is made of ([`Brush::art`]) for editing.
+fn brush_art_mut(b: &mut Brush) -> Vec<&mut Node> {
+    use vectorcraft_brush::BrushKind;
+    match &mut b.kind {
+        BrushKind::Scatter(s) => vec![&mut s.art],
+        BrushKind::Art(a) => vec![&mut a.art],
+        BrushKind::Pattern(p) => {
+            std::iter::once(&mut p.side).chain([&mut p.outer_corner, &mut p.inner_corner, &mut p.start, &mut p.end].into_iter().flatten()).collect()
+        }
+        BrushKind::Calligraphic(_) | BrushKind::Bristle(_) => vec![],
+    }
+}
+
+/// Sets brush `to` (`None`: no brush) on every stroke that paints with brush `from`: in the art
+/// (opacity masks included), symbols, graph designs, pattern tiles and the tiles that pattern
+/// editing's Cancel puts back, graphic styles and the art of the brushes in `lib`.
+fn rename_brush_strokes(d: &mut Document, lib: &mut [Brush], from: &str, to: Option<&str>) {
+    let trees = d.layers.iter_mut().chain(d.symbols.iter_mut().map(|s| &mut s.art)).chain(d.graph_designs.iter_mut().map(|g| &mut g.art));
+    let patterns = d.patterns.iter_mut().chain(d.pattern_edit.iter_mut().filter_map(|pe| pe.original.as_mut()));
+    for n in trees.chain(patterns.flat_map(|p| &mut p.art)) {
+        if paints_with(n, from) {
+            set_brush_in(Arc::make_mut(n), from, to);
+        }
+    }
+    for g in &mut d.graphic_styles {
+        set_stroke_brush(&mut g.appearance.items, from, to);
+    }
+    for n in lib.iter_mut().flat_map(brush_art_mut) {
+        set_brush_in(n, from, to);
+    }
+}
+
+fn save_library(s: &mut Session, label: &str, mut lib: Vec<Brush>, renames: &[(String, Option<String>)]) -> Result<()> {
     s.edit(label, |d, _| {
-        brush::store(d, &lib);
         for (from, to) in renames {
-            let ids: Vec<NodeId> = {
-                let mut v = vec![];
-                d.walk(|n| {
-                    if n.appearance.items.iter().any(|i| matches!(i, AppearanceItem::Stroke(st) if st.brush.as_deref() == Some(from.as_str()))) {
-                        v.push(n.id);
-                    }
-                });
-                v
-            };
-            for id in ids {
-                if let Some(n) = d.node_mut(id) {
-                    for it in &mut n.appearance.items {
-                        if let AppearanceItem::Stroke(st) = it
-                            && st.brush.as_deref() == Some(from.as_str())
-                        {
-                            st.brush = to.clone();
-                        }
-                    }
-                }
-            }
+            rename_brush_strokes(d, &mut lib, from, to.as_deref());
             if brush::current(d).as_deref() == Some(from.as_str()) {
                 match to {
                     Some(t) => d.unknown.insert(brush::CURRENT_KEY.into(), json!(t)),
@@ -411,6 +483,7 @@ fn save_library(s: &mut Session, label: &str, lib: Vec<Brush>, renames: &[(Strin
                 };
             }
         }
+        brush::store(d, &lib);
         Ok(())
     })
 }
@@ -428,6 +501,9 @@ fn brush_new(s: &mut Session, p: &Value) -> Result<Value> {
     let given = str_param(p, "name").map(str::trim).filter(|n| !n.is_empty());
     let base_name = given.map_or_else(|| format!("New {} Brush", ty[..1].to_uppercase() + &ty[1..]), str::to_string);
     let name = brush::unique_name(&lib, &base_name);
+    if ty == "bristle" {
+        bristle_name_fits(C, &name)?;
+    }
     let mut v = json!({"name": name, "type": ty});
     if let Some(params) = p.get("params") {
         merge(&mut v, params);
@@ -448,6 +524,15 @@ fn brush_new(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "name": name }))
 }
 
+/// Refuses `name` for a bristle brush when it has more than [`Bristle::MAX_NAME_CHARS`] characters.
+fn bristle_name_fits(cmd: &str, name: &str) -> Result<()> {
+    let (count, max) = (name.chars().count(), Bristle::MAX_NAME_CHARS);
+    if count > max {
+        return Err(bad(cmd, format!("a bristle brush name can have at most {max} characters: `{name}` has {count}")));
+    }
+    Ok(())
+}
+
 /// A brush definition from command params, its values kept within their ranges ([`Brush::from_json`]).
 fn parse_brush(cmd: &str, v: Value) -> Result<Brush> {
     Brush::from_json(v).map_err(|e| bad(cmd, format!("invalid brush: {e}")))
@@ -464,6 +549,54 @@ fn brush_delete(s: &mut Session, p: &Value) -> Result<Value> {
     let renames: Vec<(String, Option<String>)> = names.into_iter().map(|n| (n, None)).collect();
     save_library(s, "Delete Brush", lib, &renames)?;
     ok()
+}
+
+/// Moves the brushes in `name` or `names`, in that order, to index `to` among the brushes of their
+/// type in library order: before the first brush of that type at or after `to` that isn't moving,
+/// else after the last brush of that type that isn't moving. Brushes of different types, or a `type`
+/// that isn't theirs, are an error. A move that leaves the order as it was records no undo step.
+fn brush_move(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "brush.move";
+    const WITHIN: &str = "brushes move only within their type";
+    let names = names_param(p, C)?;
+    check_numbers(p, &["to"], C)?;
+    let to = match p.get("to").filter(|v| !v.is_null()) {
+        Some(v) => Some(v.as_u64().map(|i| usize::try_from(i).unwrap_or(usize::MAX)).ok_or_else(|| bad(C, "`to` must be a whole number"))?),
+        None => None,
+    };
+    let old = brush::library(&s.doc()?.doc);
+    let mut lib = old.clone();
+    // `names_param` refuses an empty list, so the loop sets `kind`.
+    let mut kind = "";
+    for name in &names {
+        let b = lib.iter().find(|b| &b.name == name).ok_or_else(|| bad(C, format!("no brush named `{name}`")))?;
+        if !kind.is_empty() && kind != b.kind.type_id() {
+            return Err(bad(C, WITHIN));
+        }
+        kind = b.kind.type_id();
+    }
+    if p.get("type").filter(|v| !v.is_null()).is_some_and(|t| t.as_str() != Some(kind)) {
+        return Err(bad(C, WITHIN));
+    }
+    let same: Vec<&Brush> = lib.iter().filter(|b| b.kind.type_id() == kind).collect();
+    let before = anchor(&same, to, &names, |b| &b.name);
+    let first = lib.iter().position(|b| names.contains(&b.name)).unwrap_or(lib.len());
+    let mut items = vec![];
+    for name in &names {
+        if let Some(i) = lib.iter().position(|b| &b.name == name) {
+            items.push(lib.remove(i));
+        }
+    }
+    let at = match before {
+        Some(a) => lib.iter().position(|b| b.name == a),
+        None => lib.iter().rposition(|b| b.kind.type_id() == kind).map(|i| i + 1),
+    };
+    let at = at.unwrap_or(first).min(lib.len());
+    lib.splice(at..at, items);
+    if lib != old {
+        save_library(s, "Move Brush", lib, &[])?;
+    }
+    Ok(json!({ "moved": names.len() }))
 }
 
 /// Adds a copy of each brush in `name` or `names` at the end of the library. `newName`, given
@@ -538,6 +671,10 @@ fn brush_options(s: &mut Session, p: &Value) -> Result<Value> {
         if lib.iter().any(|b| &b.name == nn) {
             return Err(bad(C, format!("a brush named `{nn}` exists")));
         }
+        // A `newName` that only trims the white space around the saved name is taken at any length.
+        if matches!(lib[i].kind, BrushKind::Bristle(_)) && nn != name.trim() {
+            bristle_name_fits(C, nn)?;
+        }
         v["name"] = json!(nn);
     } else {
         v["name"] = json!(name);
@@ -590,7 +727,7 @@ fn brush_freehand(s: &mut Session, p: &Value) -> Result<Value> {
 
 // ---------- symbols ----------
 
-fn natural_size(d: &Document, name: &str) -> (f64, f64) {
+pub(crate) fn natural_size(d: &Document, name: &str) -> (f64, f64) {
     d.unknown
         .get(SIZES_KEY)
         .and_then(|m| m.get(name))
@@ -598,7 +735,7 @@ fn natural_size(d: &Document, name: &str) -> (f64, f64) {
         .unwrap_or((2.0 * HALF, 2.0 * HALF))
 }
 
-fn set_natural_size(d: &mut Document, name: &str, size: Option<(f64, f64)>) {
+pub(crate) fn set_natural_size(d: &mut Document, name: &str, size: Option<(f64, f64)>) {
     let m = d.unknown.entry(SIZES_KEY.to_string()).or_insert_with(|| json!({}));
     if let Some(o) = m.as_object_mut() {
         match size {
@@ -609,7 +746,7 @@ fn set_natural_size(d: &mut Document, name: &str, size: Option<(f64, f64)>) {
 }
 
 /// Instance transform for a symbol of natural size `(w, h)` whose registration point is at `at`.
-fn place_xf(at: Point, (w, h): (f64, f64), reg: SymbolRegistration) -> Affine {
+pub(crate) fn place_xf(at: Point, (w, h): (f64, f64), reg: SymbolRegistration) -> Affine {
     let c = at - reg.offset_from_center(w, h);
     Affine::translate(c.to_vec2()) * Affine::scale_non_uniform(w / (2.0 * HALF), h / (2.0 * HALF))
 }
@@ -669,7 +806,7 @@ fn rename_natural_size(d: &mut Document, from: &str, to: &str) {
 }
 
 /// Normalise art for a symbol definition: returns (art, natural size, centre in the document).
-fn normalize(mut art: Node) -> Result<(Node, (f64, f64), Point)> {
+pub(crate) fn normalize(mut art: Node) -> Result<(Node, (f64, f64), Point)> {
     let b = art.geometric_bounds().ok_or_else(|| EngineError::Other("the art has no bounds".into()))?;
     let (w, h) = (b.width().max(1.0), b.height().max(1.0));
     let c = b.center();
@@ -833,7 +970,7 @@ fn symbol_place(s: &mut Session, p: &Value) -> Result<Value> {
     let d = &s.doc()?.doc;
     let name = resolve_symbol(d, p, "symbol.place")?;
     let centre = d.artboards.first().map(|a| a.rect.center()).unwrap_or(Point::ZERO);
-    let at = Point::new(f64_or(p, "x", centre.x), f64_or(p, "y", centre.y));
+    let at = Point::new(number_or(p, "x", centre.x, "symbol.place")?, number_or(p, "y", centre.y, "symbol.place")?);
     let size = natural_size(d, &name);
     let reg = d.symbol_registration(&name);
     let parent = s.doc()?.target_parent()?;
@@ -962,7 +1099,7 @@ fn symbol_delete(s: &mut Session, p: &Value) -> Result<Value> {
     if !s.doc()?.doc.symbols.iter().any(|x| x.name == name) {
         return Err(bad(C, format!("no symbol named `{name}`")));
     }
-    let expand = bool_or(p, "expandInstances", true);
+    let expand = switch_or(p, "expandInstances", true, C)?;
     s.edit("Delete Symbol", |d, _| {
         let inst = instances_of(d, Some(&name));
         if expand {
@@ -1079,10 +1216,10 @@ fn symbol_spray(s: &mut Session, p: &Value) -> Result<Value> {
     let pts = points(p, C)?;
     let st = s.doc()?;
     let name = resolve_symbol(&st.doc, p, C)?;
-    let radius = f64_or(p, "radius", 40.0).clamp(1.0, 2000.0);
-    let density = f64_or(p, "density", 5.0).clamp(1.0, 10.0);
-    let scale = f64_or(p, "scale", 1.0).clamp(0.01, 100.0);
-    let alt = bool_or(p, "alt", false);
+    let radius = number_or(p, "radius", 40.0, C)?.clamp(1.0, 2000.0);
+    let density = number_or(p, "density", 5.0, C)?.clamp(1.0, 10.0);
+    let scale = number_or(p, "scale", 1.0, C)?.clamp(0.01, 100.0);
+    let alt = switch_or(p, "alt", false, C)?;
     let size = natural_size(&st.doc, &name);
     let set = st.selection.objects.first().copied().filter(|id| st.selection.len() == 1 && st.doc.node(*id).is_some_and(is_symbol_set));
     // Only a new Symbol Set needs a layer that takes new art.
@@ -1164,10 +1301,11 @@ fn symbol_adjust(s: &mut Session, p: &Value) -> Result<Value> {
     if !["shift", "scrunch", "size", "spin", "stain", "screen", "style"].contains(&tool.as_str()) {
         return Err(bad(C, format!("unknown tool `{tool}`")));
     }
+    super::paint::check_keep_model(p, C)?;
     let pts = points(p, C)?;
-    let radius = f64_or(p, "radius", 40.0).clamp(1.0, 2000.0);
-    let intensity = f64_or(p, "intensity", 5.0).clamp(1.0, 10.0) / 10.0;
-    let alt = bool_or(p, "alt", false);
+    let radius = number_or(p, "radius", 40.0, C)?.clamp(1.0, 2000.0);
+    let intensity = number_or(p, "intensity", 5.0, C)?.clamp(1.0, 10.0) / 10.0;
+    let alt = switch_or(p, "alt", false, C)?;
     let st = s.doc()?;
     let color = match p.get("color").and_then(color_value) {
         Some(c) => super::paint::new_color(s, p, c),
@@ -1193,7 +1331,8 @@ fn symbol_adjust(s: &mut Session, p: &Value) -> Result<Value> {
                 }
             }
         }
-        v.retain(|id| d.is_editable(*id));
+        let editable = d.editable();
+        v.retain(|id| editable(*id));
         v
     };
     let label = match tool.as_str() {

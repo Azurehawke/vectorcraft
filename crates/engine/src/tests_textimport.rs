@@ -209,7 +209,7 @@ const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main
 
 /// A Word document's package: its main part `body` (the inside of `w:body`), with a styles part
 /// and a theme part named through the main part's relationships.
-fn docx(body: &str, styles: &str) -> Vec<u8> {
+pub(super) fn docx(body: &str, styles: &str) -> Vec<u8> {
     let rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
     let rels = "http://schemas.openxmlformats.org/package/2006/relationships";
     let types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>"#;
@@ -237,7 +237,7 @@ fn docx(body: &str, styles: &str) -> Vec<u8> {
 /// Document defaults in the theme's minor font at 11 pt with 8 pt after each paragraph, a default
 /// Normal style, a centered, bold Heading 1 in the theme's major font at 16 pt and in a color, a
 /// bold character style and a default character style in all caps.
-const STYLES: &str = concat!(
+pub(super) const STYLES: &str = concat!(
     r#"<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:asciiTheme="minorHAnsi" w:hAnsiTheme="minorHAnsi"/><w:sz w:val="22"/></w:rPr></w:rPrDefault>"#,
     r#"<w:pPrDefault><w:pPr><w:spacing w:after="160"/></w:pPr></w:pPrDefault></w:docDefaults>"#,
     r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>"#,
@@ -363,6 +363,47 @@ fn docx_tables_breaks_and_fields_place_as_paragraphs_and_tabs() {
     assert_eq!(
         (last.justify, last.left_indent, last.right_indent, last.direction),
         (vectorcraft_doc::Justify::Left, 0.0, 20.0, Some(vectorcraft_doc::ParaDirection::RightToLeft))
+    );
+}
+
+#[test]
+fn docx_kashida_justification_places_with_insert_kashidas() {
+    use vectorcraft_doc::Justify;
+    use vectorcraft_doc::text::Kashida;
+    // The document holds right-to-left paragraphs justified with each kashida length and with `both`, a paragraph style
+    // that sets `mediumKashida`, that style under direct formatting, and a left-to-right paragraph.
+    let styles = r#"<w:style w:type="paragraph" w:styleId="Kashidas"><w:pPr><w:bidi/><w:jc w:val="mediumKashida"/></w:pPr></w:style>"#;
+    let para = |ppr: &str| format!(r#"<w:p><w:pPr>{ppr}</w:pPr><w:r><w:t>كتاب جميل</w:t></w:r></w:p>"#);
+    let body: String = [
+        r#"<w:bidi/><w:jc w:val="lowKashida"/>"#,
+        r#"<w:bidi/><w:jc w:val="mediumKashida"/>"#,
+        r#"<w:bidi/><w:jc w:val="highKashida"/>"#,
+        r#"<w:bidi/><w:jc w:val="both"/>"#,
+        r#"<w:pStyle w:val="Kashidas"/>"#,
+        r#"<w:pStyle w:val="Kashidas"/><w:jc w:val="both"/>"#,
+        r#"<w:jc w:val="highKashida"/>"#,
+        r#"<w:pStyle w:val="Kashidas"/><w:jc w:val="center"/>"#,
+    ]
+    .map(para)
+    .concat();
+    let mut s = session();
+    let r = s.execute("file.place", &json!({"name": "kashida.docx", "dataBase64": vectorcraft_format::base64_encode(&docx(&body, styles))})).unwrap();
+    let n = s.doc().unwrap().doc.node(NodeId(r["ids"][0].as_u64().unwrap())).unwrap().clone();
+    let NodeKind::Text(t) = &n.kind else { panic!("not type") };
+    let paras: Vec<_> = t.paragraph_styles().iter().map(|p| (p.justify, p.kashida)).collect();
+    assert_eq!(
+        paras,
+        [
+            (Justify::JustifyRight, Kashida::Short),
+            (Justify::JustifyRight, Kashida::Medium),
+            (Justify::JustifyRight, Kashida::Long),
+            (Justify::JustifyRight, Kashida::None),
+            (Justify::JustifyRight, Kashida::Medium),
+            (Justify::JustifyRight, Kashida::None),
+            (Justify::JustifyLeft, Kashida::Long),
+            (Justify::Center, Kashida::None),
+        ],
+        "low, medium and high kashida lengths are Short, Medium and Long; other alignments have none"
     );
 }
 

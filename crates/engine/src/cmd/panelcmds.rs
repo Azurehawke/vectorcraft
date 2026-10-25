@@ -34,7 +34,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Cut Artboard",
             [],
             None,
-            "{index? | indices?, art?} artboard.copy, then delete the artboards and that art in one undo step (one artboard is always left: the cut fails when it names every artboard); edit.cut runs this while the Artboard tool is chosen → {copied: objects}",
+            "{index? | indices?, art?} artboard.copy, then delete the artboards and that art in one undo step (one artboard is always left: the cut fails when it names every artboard, or a locked one; art also on another locked artboard stays, and is left off the clipboard, unless prefs moveLockedWithArtboard); edit.cut runs this while the Artboard tool is chosen → {copied: objects}",
             has_doc,
             |s, p| artboard_copy(s, p, true)
         ),
@@ -43,7 +43,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Character / Paragraph",
             [],
             None,
-            "{ids?|id?, kerning?: 1/1000 em|\"auto\", baselineShift?: pt, hScale?: %, vScale?: %, rotation?: deg, underline?, strikethrough?, allCaps?, smallCaps?: bool, position?: \"normal\"|\"superscript\"|\"subscript\" (sizes from Document Setup), leftIndent?, rightIndent?, firstLineIndent?, spaceBefore?, spaceAfter?: pt (±1296), hyphenate?: bool, wordsLongerThan?: letters 1..25 (5), afterFirst?, beforeLast?: letters 1..15 (3), hyphenLimit?: lines 0..25 (0: no limit), hyphenationZone?: pt 0..1296 (0; Single-line Composer only), hyphenateCapitalized?: bool (true) (Paragraph panel menu › Hyphenation…: only words longer than wordsLongerThan break, keeping afterFirst letters before the hyphen and beforeLast after it; at most hyphenLimit lines in a row end with a hyphen; a line whose text already ends within hyphenationZone of its right edge breaks before the next word instead of hyphenating it; the counts are rounded, and every value is clamped to its range), wordSpacing?: % 0..1000 (80, 100, 133), letterSpacing?: % of a word space -100..500 (0, 0, 0), glyphScaling?: % 50..200 (100, 100, 100): each [min, desired, max] or {min?, desired?, max?} (Paragraph panel menu › Justification…: Desired applies to every line, Minimum and Maximum bound what justified lines may use; values are clamped to their range, and Minimum ≤ Desired ≤ Maximum must hold afterwards or nothing changes), autoLeading?: % of the size 0..500 (120; the leading of characters whose leading is Auto), singleWordJustification?: \"fullJustify\"|\"alignLeft\"|\"alignCenter\"|\"alignRight\" (a justified line holding one word), mojikumi?: \"none\"|\"lineEndHalf\" (Japanese punctuation spacing), kinsoku?: \"none\"|\"hard\"|\"soft\" (Kinsoku Set: Soft lets 々, ー and small kana start a line), direction?: \"auto\"|\"leftToRight\"|\"rightToLeft\" (paragraph direction; auto: from each paragraph's first strong character), leadingModel?: \"romanBaseline\"|\"emBoxTop\" (leading measured baseline to baseline, or em box top to top), charAlign?: \"romanBaseline\"|\"emBoxTop\"|\"emBoxCenter\"|\"emBoxBottom\"|\"icfTop\"|\"icfBottom\" (where characters smaller than the largest on their line line up with it), proportionalMetrics?: bool (full-width glyphs on the font's proportional widths: `palt` in horizontal type, `vpal` in vertical type), digits?: \"default\"|\"arabic\"|\"hindi\"|\"farsi\" (Character panel menu › Digits: the numeral system every digit is drawn in, whatever was typed), fontAxes?: {\"wght\": 650, …} (Character panel › Variable Font, as text.setRangeStyle: each axis named set in its units and clamped to its range, null back to the style's own setting), burasagari?: \"none\"|\"standard\"|\"forced\" (Paragraph panel menu › Burasagari None/Regular/Force: an East Asian comma or full stop ending an area type line hangs outside it: when it doesn't fit, or always; new type: \"standard\"), romanHangingPunctuation?: bool (Paragraph panel menu › Roman Hanging Punctuation: quotation marks, hyphens, full stops and commas starting or ending a line hang outside the margin, asterisks, tildes, ellipses, dashes, colons and semicolons by half; off by default), kashida?: \"none\"|\"short\"|\"medium\"|\"long\"|\"stylistic\" (Paragraph panel › Insert Kashidas: justified lines of horizontal area type lengthen each Arabic word with a kashida between its last pair of joined letters, at most a quarter, half or whole em long, or whole tatweels up to an em for stylistic, before they widen their word spaces; none by default), composer?: \"singleLine\"|\"everyLine\" (line breaking, Every-line by default), start?: byte, end?: byte} (baselineShift is in document points and hScale includes the object transform; groups include their text descendants; with a range: the character attributes style that range and the paragraph attributes apply to the paragraphs it touches; without: all the text)",
+            "{ids?|id?, kerning?: 1/1000 em|\"auto\", baselineShift?: pt, hScale?: %, vScale?: %, rotation?: deg, underline?, strikethrough?, allCaps?, smallCaps?: bool, position?: \"normal\"|\"superscript\"|\"subscript\" (sizes from Document Setup), leftIndent?, rightIndent?, firstLineIndent?, spaceBefore?, spaceAfter?: pt (±1296), list?: \"none\"|\"bullet\"|\"number\", bullet?: \"none\"|\"dot\"|\"dash\"|\"circle\"|\"square\", number?: \"none\"|\"arabic\"|\"upperLetters\"|\"lowerLetters\"|\"upperRoman\"|\"lowerRoman\"|\"twoDigits\"|\"threeDigits\" (Paragraph panel › Bullets and Numbered List: each paragraph of a list starts with its marker, drawn in the font, size and color of the paragraph's first character, and its text starts at the next tab stop after the marker, the left indent counting as a stop; a bulleted list's marker is its bullet, and a numbered list's is the paragraph's number and a period: 1, 2, 3; A to Z, then AA, BB; a to z, then aa, bb; I, II, III; i, ii, iii; 01 to 99, then 100; 001 to 999, then 1000; letters and roman numerals past 3999 in Arabic digits; the numbers count the story's numbered paragraphs, its threaded frames included, from 1 after a paragraph in no list, and an empty or bulleted paragraph is not counted; list \"bullet\" keeps a list's bullet, else a dot, and list \"number\" keeps a numbered list's style, else arabic; without list, a number style makes a numbered list and a bullet makes a bulleted one; \"none\" in any of the three turns the list off; a paragraph that joins a list with left and first-line indents of 0 gets 18 and -18 unless the call sets an indent; a horizontal right-to-left list paragraph has its indents mirrored, measured from the right), hyphenate?: bool, wordsLongerThan?: letters 1..25 (5), afterFirst?, beforeLast?: letters 1..15 (3), hyphenLimit?: lines 0..25 (0: no limit), hyphenationZone?: pt 0..1296 (0; Single-line Composer only), hyphenateCapitalized?: bool (true) (Paragraph panel menu › Hyphenation…: only words longer than wordsLongerThan break, keeping afterFirst letters before the hyphen and beforeLast after it; at most hyphenLimit lines in a row end with a hyphen; a line whose text already ends within hyphenationZone of its right edge breaks before the next word instead of hyphenating it; the counts are rounded, and every value is clamped to its range), wordSpacing?: % 0..1000 (80, 100, 133), letterSpacing?: % of a word space -100..500 (0, 0, 0), glyphScaling?: % 50..200 (100, 100, 100): each [min, desired, max] or {min?, desired?, max?} (Paragraph panel menu › Justification…: Desired applies to every line, Minimum and Maximum bound what justified lines may use; values are clamped to their range, and Minimum ≤ Desired ≤ Maximum must hold afterwards or nothing changes), autoLeading?: % of the size 0..500 (120; the leading of characters whose leading is Auto), singleWordJustification?: \"fullJustify\"|\"alignLeft\"|\"alignCenter\"|\"alignRight\" (a justified line holding one word), mojikumi?: \"none\"|\"lineEndHalf\" (Japanese punctuation spacing), kinsoku?: \"none\"|\"hard\"|\"soft\" (Kinsoku Set: Soft lets 々, ー and small kana start a line), direction?: \"auto\"|\"leftToRight\"|\"rightToLeft\" (paragraph direction; auto: from each paragraph's first strong character), leadingModel?: \"romanBaseline\"|\"emBoxTop\" (leading measured baseline to baseline, or em box top to top), charAlign?: \"romanBaseline\"|\"emBoxTop\"|\"emBoxCenter\"|\"emBoxBottom\"|\"icfTop\"|\"icfBottom\" (where characters smaller than the largest on their line line up with it), proportionalMetrics?: bool (full-width glyphs on the font's proportional widths: `palt` in horizontal type, `vpal` in vertical type), tateChuYoko?: bool (Character panel menu › Tate-chu-yoko, with Show East Asian Options: in vertical type those characters stand side by side across one em of the column; kept on the characters and ignored in horizontal type), noBreak?: bool (Character panel menu › No Break: these characters stay on one line, including across a space inside the run), charDirection?: \"default\"|\"leftToRight\"|\"rightToLeft\" (Character panel menu › Character Direction: the characters are set left to right or right to left inside their paragraph, as a Unicode bidi embedding; default: as the bidi algorithm sets them), digits?: \"default\"|\"arabic\"|\"hindi\"|\"farsi\" (Character panel menu › Digits: the numeral system every digit is drawn in, whatever was typed), fontAxes?: {\"wght\": 650, …} (Character panel › Variable Font, as text.setRangeStyle: each axis named set in its units and clamped to its range, null back to the style's own setting), burasagari?: \"none\"|\"standard\"|\"forced\" (Paragraph panel menu › Burasagari None/Regular/Force: an East Asian comma or full stop ending an area type line hangs outside it: when it doesn't fit, or always; new type: \"standard\"), romanHangingPunctuation?: bool (Paragraph panel menu › Roman Hanging Punctuation: quotation marks, hyphens, full stops and commas starting or ending a line hang outside the margin, asterisks, tildes, ellipses, dashes, colons and semicolons by half; off by default), kashida?: \"none\"|\"short\"|\"medium\"|\"long\"|\"stylistic\" (Paragraph panel › Insert Kashidas: justified lines of horizontal area type lengthen each Arabic word with a kashida between its last pair of joined letters, at most a quarter, half or whole em long, or whole tatweels up to an em for stylistic, before they widen their word spaces; none by default), composer?: \"singleLine\"|\"everyLine\" (line breaking, Every-line by default), start?: byte, end?: byte} (baselineShift is in document points and hScale includes the object transform; groups include their text descendants; with a range: the character attributes style that range and the paragraph attributes apply to the paragraphs it touches; without: all the text)",
             has_doc,
             set_format
         ),
@@ -55,7 +55,7 @@ pub fn specs() -> Vec<CommandSpec> {
 fn artboard_reorder(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "artboard.reorder";
     let i = artboard_index(&s.doc()?.doc, p, C)?;
-    let to = p.get("to").and_then(Value::as_u64).ok_or_else(|| bad(C, "missing to"))? as usize;
+    let to = p.get("to").and_then(Value::as_u64).map(index).ok_or_else(|| bad(C, "missing to"))?;
     s.edit("Reorder Artboards", |d, _| {
         if i >= d.artboards.len() {
             return Err(EngineError::Other("no such artboard".into()));
@@ -72,6 +72,7 @@ fn artboard_reorder(s: &mut Session, p: &Value) -> Result<Value> {
 /// copy commands: by default the artboards the Artboard tool has selected (its active one when none
 /// of them is in the document) and its Move/Copy Artwork with Artboard option.
 fn boards_and_art(s: &Session, p: &Value, cmd: &str) -> Result<(Vec<usize>, bool)> {
+    check_switches(p, &["art"], cmd)?;
     let t = s.tool_options_of("artboard");
     let d = &s.doc()?.doc;
     let indices = if p.get("index").is_some() || p.get("indices").is_some() {
@@ -114,21 +115,37 @@ pub(crate) fn artboard_indices(d: &vectorcraft_doc::Document, p: &Value, cmd: &s
     Ok(indices)
 }
 
+/// An error when one of artboards `indices` of `d` is locked: a locked artboard isn't moved,
+/// resized or deleted.
+pub(crate) fn refuse_locked(d: &vectorcraft_doc::Document, indices: &[usize]) -> Result<()> {
+    match indices.iter().any(|i| d.artboards.get(*i).is_some_and(|a| a.locked)) {
+        true => Err(EngineError::Other("the artboard is locked".into())),
+        false => Ok(()),
+    }
+}
+
 /// The art that goes with artboard `i` when `art`: the objects fully inside it (locked and hidden
-/// ones only with prefs moveLockedWithArtboard), in paint order.
-pub(crate) fn artboard_art(s: &Session, i: usize, art: bool) -> Result<Vec<NodeId>> {
+/// ones only with prefs moveLockedWithArtboard), in paint order. With `moving` (a move or a cut),
+/// the art also on another locked artboard stays unless prefs moveLockedWithArtboard
+/// ([`vectorcraft_doc::Document::art_moving_with`]); a copy takes it.
+pub(crate) fn artboard_art(s: &Session, i: usize, art: bool, moving: bool) -> Result<Vec<NodeId>> {
     let d = &s.doc()?.doc;
     let rect = d.artboards.get(i).map(|a| a.rect).ok_or_else(|| EngineError::Other("no such artboard".into()))?;
-    Ok(if art { d.art_on_artboard(rect, s.prefs.move_locked_with_artboard) } else { vec![] })
+    let all = s.prefs.move_locked_with_artboard;
+    Ok(match (art, moving) {
+        (false, _) => vec![],
+        (true, false) => d.art_on_artboard(rect, all),
+        (true, true) => d.art_moving_with(i, all),
+    })
 }
 
 /// Each of `indices` with the art that goes with it when `art` ([`artboard_art`]), an object
 /// counted once, with the first of them it is on (artboards can overlap).
-pub(crate) fn artboards_art(s: &Session, indices: &[usize], art: bool) -> Result<Vec<(usize, Vec<NodeId>)>> {
+pub(crate) fn artboards_art(s: &Session, indices: &[usize], art: bool, moving: bool) -> Result<Vec<(usize, Vec<NodeId>)>> {
     let mut seen = std::collections::HashSet::new();
     let mut arts = vec![];
     for &i in indices {
-        let art = artboard_art(s, i, art)?.into_iter().filter(|id| seen.insert(*id)).collect();
+        let art = artboard_art(s, i, art, moving)?.into_iter().filter(|id| seen.insert(*id)).collect();
         arts.push((i, art));
     }
     Ok(arts)
@@ -143,8 +160,9 @@ pub(crate) fn beside_artboards(d: &vectorcraft_doc::Document, rect: Rect) -> Vec
 /// Duplicate Artboards: a copy of each artboard with its art, in one undo step. The copies keep
 /// their places relative to each other, together right of the last artboard.
 fn artboard_duplicate(s: &mut Session, p: &Value) -> Result<Value> {
+    check_switches(p, &["patterns"], "artboard.duplicate")?;
     let (indices, art) = boards_and_art(s, p, "artboard.duplicate")?;
-    let arts = artboards_art(s, &indices, art)?;
+    let arts = artboards_art(s, &indices, art, false)?;
     let all: Vec<NodeId> = arts.iter().flat_map(|(_, a)| a.iter().copied()).collect();
     let sc = Scaling { patterns: super::object::transform_patterns(s, p, &all)?, ..Scaling::default() };
     let (index, ids) = s.edit("Duplicate Artboard", |d, _| {
@@ -170,10 +188,13 @@ fn artboard_duplicate(s: &mut Session, p: &Value) -> Result<Value> {
 /// a cut then deletes them.
 pub(crate) fn artboard_copy(s: &mut Session, p: &Value, cut: bool) -> Result<Value> {
     let (indices, art) = boards_and_art(s, p, if cut { "artboard.cut" } else { "artboard.copy" })?;
-    let arts = artboards_art(s, &indices, art)?;
+    let arts = artboards_art(s, &indices, art, cut)?;
     let st = s.doc()?;
     if cut && st.doc.artboards.len() <= indices.len() {
         return Err(EngineError::Other("a document needs at least one artboard".into()));
+    }
+    if cut {
+        refuse_locked(&st.doc, &indices)?;
     }
     let art = st.doc.paint_order(arts.into_iter().flat_map(|(_, a)| a));
     let boards: Vec<_> = indices.iter().filter_map(|i| st.doc.artboards.get(*i).cloned()).collect();
@@ -187,6 +208,7 @@ pub(crate) fn artboard_copy(s: &mut Session, p: &Value, cut: bool) -> Result<Val
             // The last first, so the others keep their places; their guides go with them.
             for &i in indices.iter().rev() {
                 let gone = d.artboards.remove(i).id;
+                d.retire_artboard_id(gone);
                 d.retain_guides(sel, |_, g| g.artboard != Some(gone));
             }
             d.remove_many(&art)?;
@@ -215,11 +237,12 @@ pub(crate) fn copy_artboard(d: &mut vectorcraft_doc::Document, i: usize, dv: Vec
     Ok((index, copies))
 }
 
-/// Add a copy of artboard `src` at `rect`, with an id of its own and its name, or `<name> copy`
-/// (`<name> copy 2`…) when that is taken → its index.
+/// Add a copy of artboard `src` at `rect`, unlocked, with an id of its own and its name, or
+/// `<name> copy` (`<name> copy 2`…) when that is taken → its index.
 pub(crate) fn push_artboard_copy(d: &mut vectorcraft_doc::Document, src: &vectorcraft_doc::Artboard, rect: Rect) -> usize {
     let mut a = src.clone();
     a.id = d.next_artboard_id();
+    a.locked = false;
     let taken = |name: &str| d.artboards.iter().any(|a| a.name == name);
     a.name = [src.name.clone(), format!("{} copy", src.name)]
         .into_iter()
@@ -235,6 +258,25 @@ pub(crate) fn push_artboard_copy(d: &mut vectorcraft_doc::Document, src: &vector
 
 /// Largest indent or paragraph spacing (points; Illustrator's limit).
 const MAX_PARA: f64 = 1296.0;
+
+/// `text.setFormat`'s `bullet` values and the bullets they pick.
+const BULLETS: [(&str, vectorcraft_doc::text::Bullet); 4] = [
+    ("dot", vectorcraft_doc::text::Bullet::Dot),
+    ("dash", vectorcraft_doc::text::Bullet::Dash),
+    ("circle", vectorcraft_doc::text::Bullet::Circle),
+    ("square", vectorcraft_doc::text::Bullet::Square),
+];
+
+/// `text.setFormat`'s `number` values and the number styles they pick.
+const NUMBERS: [(&str, vectorcraft_doc::text::NumberStyle); 7] = [
+    ("arabic", vectorcraft_doc::text::NumberStyle::Arabic),
+    ("upperLetters", vectorcraft_doc::text::NumberStyle::UpperLetters),
+    ("lowerLetters", vectorcraft_doc::text::NumberStyle::LowerLetters),
+    ("upperRoman", vectorcraft_doc::text::NumberStyle::UpperRoman),
+    ("lowerRoman", vectorcraft_doc::text::NumberStyle::LowerRoman),
+    ("twoDigits", vectorcraft_doc::text::NumberStyle::TwoDigits),
+    ("threeDigits", vectorcraft_doc::text::NumberStyle::ThreeDigits),
+];
 
 /// A justification spacing of `text.setFormat` (`wordSpacing`, `letterSpacing`, `glyphScaling`):
 /// `[min, desired, max]` or `{min?, desired?, max?}`, in percent. The values not given are kept.
@@ -290,6 +332,9 @@ fn set_format(s: &mut Session, p: &Value) -> Result<Value> {
         "firstLineIndent",
         "spaceBefore",
         "spaceAfter",
+        "list",
+        "bullet",
+        "number",
         "hyphenate",
         "wordsLongerThan",
         "afterFirst",
@@ -307,7 +352,10 @@ fn set_format(s: &mut Session, p: &Value) -> Result<Value> {
         "direction",
         "leadingModel",
         "charAlign",
+        "charDirection",
         "proportionalMetrics",
+        "tateChuYoko",
+        "noBreak",
         "digits",
         "fontAxes",
         "burasagari",
@@ -328,6 +376,7 @@ fn set_format(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let (position, small_caps) = super::docsetup::script_params(p, &s.doc()?.doc.setup, C)?;
     let char_align = super::textedit::char_align_param(p, C)?;
+    let char_direction = super::textedit::char_direction_param(p, C)?;
     let digits = super::textedit::digits_param(p, C)?;
     let font_axes = super::textedit::font_axes_param(p, C)?;
     let mojikumi = match p.get("mojikumi") {
@@ -384,6 +433,19 @@ fn set_format(s: &mut Session, p: &Value) -> Result<Value> {
             _ => return Err(bad(C, "`kashida` must be \"none\", \"short\", \"medium\", \"long\" or \"stylistic\"")),
         }),
     };
+    // Bullets and numbers: `list` turns a bulleted or numbered list on or off, `bullet` picks the
+    // bullet and `number` the number style; "none" in any of them turns the list off.
+    let list = super::object::choice(p, C, "list", &["none", "bullet", "number"])?;
+    let bullet = super::object::choice(p, C, "bullet", &["none", "dot", "dash", "circle", "square"])?
+        .map(|b| BULLETS.iter().find(|(k, _)| *k == b).map(|&(_, bullet)| bullet));
+    let number = super::object::choice(
+        p,
+        C,
+        "number",
+        &["none", "arabic", "upperLetters", "lowerLetters", "upperRoman", "lowerRoman", "twoDigits", "threeDigits"],
+    )?
+    .map(|n| NUMBERS.iter().find(|(k, _)| *k == n).map(|&(_, style)| style));
+    let indents_given = num("leftIndent").is_some() || num("firstLineIndent").is_some();
     let spacing = |k: &str| spacing_param(p, k, C);
     let (word_spacing, letter_spacing, glyph_scaling) = (spacing("wordSpacing")?, spacing("letterSpacing")?, spacing("glyphScaling")?);
     let single_word = match p.get("singleWordJustification") {
@@ -438,11 +500,20 @@ fn set_format(s: &mut Session, p: &Value) -> Result<Value> {
         if let Some(v) = char_align {
             st.char_align = v;
         }
+        if let Some(v) = char_direction {
+            st.char_direction = v;
+        }
         if let Some(v) = digits {
             st.digits = v;
         }
         if let Some(v) = flag("proportionalMetrics") {
             st.proportional_metrics = v;
+        }
+        if let Some(v) = flag("tateChuYoko") {
+            st.tate_chu_yoko = v;
+        }
+        if let Some(v) = flag("noBreak") {
+            st.no_break = v;
         }
         if let Some(v) = &font_axes {
             super::textedit::change_font_axes(st, v);
@@ -470,6 +541,22 @@ fn set_format(s: &mut Session, p: &Value) -> Result<Value> {
                 }
                 if let Some(v) = num("spaceAfter") {
                     para.space_after = v.clamp(-MAX_PARA, MAX_PARA);
+                }
+                if list.is_some() || bullet.is_some() || number.is_some() {
+                    let on = list != Some("none") && bullet != Some(None) && number != Some(None);
+                    let had = para.list;
+                    // A numbered list for list "number", or without `list` for a number style.
+                    let numbered = list == Some("number") || (list.is_none() && number.is_some());
+                    para.list = on.then(|| vectorcraft_doc::text::ParaList {
+                        bullet: bullet.flatten().or(had.map(|l| l.bullet)).unwrap_or_default(),
+                        number: numbered.then(|| number.flatten().or(had.and_then(|l| l.number)).unwrap_or_default()),
+                    });
+                    // A paragraph that joins a list with no left or first-line indent gets a
+                    // hanging indent, unless the call sets an indent.
+                    if on && had.is_none() && !indents_given && para.left_indent == 0.0 && para.first_line_indent == 0.0 {
+                        para.left_indent = vectorcraft_doc::text::LIST_HANGING_INDENT;
+                        para.first_line_indent = -vectorcraft_doc::text::LIST_HANGING_INDENT;
+                    }
                 }
                 if let Some(v) = flag("hyphenate") {
                     para.hyphenate = v;

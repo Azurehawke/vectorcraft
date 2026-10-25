@@ -248,7 +248,8 @@ impl ReshapeTool {
     /// The selected path under `p` (Reshape works on selected paths only, like Illustrator).
     fn hit(cx: &ToolContext, p: Point) -> Option<(vectorcraft_doc::NodeId, Point)> {
         let tol = cx.tol(4.0);
-        cx.selection.objects.iter().copied().filter(|id| cx.doc.is_editable(*id)).find_map(|id| {
+        let editable = cx.doc.editable();
+        cx.selection.objects.iter().copied().filter(|id| editable(*id)).find_map(|id| {
             let pd = cx.doc.node(id)?.path_data()?;
             let (_, _, _, q, d) = pd.nearest(p)?;
             (d <= tol).then_some((id, q))
@@ -275,7 +276,7 @@ impl Tool for ReshapeTool {
                 let Some((id, at)) = self.grab else { return vec![] };
                 let mut d: Vec2 = ev.pos - at;
                 if ev.mods.shift {
-                    d = vectorcraft_geom::constrain_angle(d, 45.0);
+                    d = vectorcraft_geom::constrain_angle_from(d, 45.0, cx.constrain_angle);
                 }
                 let mut out = vec![];
                 if !self.began {

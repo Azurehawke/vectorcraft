@@ -222,13 +222,16 @@ fn load_profile_asks_off_the_ui_thread() {
 }
 
 /// The Variables panel menu's Import Data Sets… and Export Data Sets… ask off the UI thread: the
-/// data sets in the file picked are loaded, and the data sets are written to the path the dialog
-/// answers.
+/// data sets in the file picked are loaded, and the header and data set `B` are written to the
+/// path the dialog answers.
 #[test]
 fn variables_panel_data_sets_ask_off_the_ui_thread() {
     let (mut app, shown, _) = app();
     app.run("file.new", json!({"width": 100, "height": 80})).unwrap();
-    let dir = std::env::temp_dir().join(format!("vc-picks-data-sets-{}", std::process::id()));
+    let dir = vectorcraft_testkit::temp_dir("picks-data-sets");
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "cannot empty {}: {e}", dir.display());
+    }
     std::fs::create_dir_all(&dir).unwrap();
     let (csv, out) = (dir.join("sets.csv"), dir.join("out.csv"));
     std::fs::write(&csv, "name,Name\nB,y\n").unwrap();
@@ -244,7 +247,7 @@ fn variables_panel_data_sets_ask_off_the_ui_thread() {
     assert!(matches!(shown.requests().as_slice(), [PickRequest::Save(_)]));
     shown.answer(&[&out.to_string_lossy()]);
     poll(&mut app);
-    assert!(std::fs::read_to_string(&out).is_ok_and(|text| text.starts_with("name,Name\n")), "{}", app.ui.status);
+    assert_eq!(std::fs::read_to_string(&out).ok().as_deref(), Some("name,Name\nB,y\n"), "{}", app.ui.status);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -257,7 +260,10 @@ fn other_swatch_library_asks_off_the_ui_thread() {
     app.run("swatch.new", json!({"name": "Signal", "color": "#ff3300"})).unwrap();
     let (dir, file) = saved_document(&mut app, "swatches");
     click(&mut app, "Other Library…", library_menu::<SwatchLibraries>);
-    assert!(matches!(shown.requests().as_slice(), [PickRequest::Open(_)]));
+    assert!(matches!(
+        shown.requests().as_slice(),
+        [PickRequest::Open(p)] if p.filters.first().is_some_and(|(label, exts)| label == "Swatch libraries" && exts.iter().any(|e| e == "ase"))
+    ));
     poll(&mut app);
     assert!(library_panel::last_open(&app.ui).is_none() && app.ui.status.is_empty(), "{}", app.ui.status);
     shown.answer(&[&file]);
@@ -289,13 +295,36 @@ fn other_graphic_style_library_asks_off_the_ui_thread() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The Variables panel menu's Load Variable Library… asks off the UI thread: the library picked
+/// loads when the dialog answers.
+#[test]
+fn load_variable_library_asks_off_the_ui_thread() {
+    let (mut app, shown, _) = app();
+    app.run("file.new", json!({"width": 100, "height": 80})).unwrap();
+    let dir = std::env::temp_dir().join(format!("vc-picks-variables-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let library = dir.join("library.xml");
+    let xml = r#"<variableSets><variableSet><variables><variable varName="Name" trait="textcontent"/></variables>
+        <sampleDataSets><sampleDataSet dataSetName="A"><Name><p>x</p></Name></sampleDataSet></sampleDataSets></variableSet></variableSets>"#;
+    std::fs::write(&library, xml).unwrap();
+    let sets = |app: &VectorcraftApp| app.session.doc().unwrap().doc.variables.datasets.iter().map(|d| d.name.clone()).collect::<Vec<_>>();
+
+    click(&mut app, "Load Variable Library…", crate::panels::variables::menu);
+    assert!(matches!(shown.requests().as_slice(), [PickRequest::Open(_)]));
+    assert!(sets(&app).is_empty(), "nothing loads before the dialog answers");
+    shown.answer(&[&library.to_string_lossy()]);
+    poll(&mut app);
+    assert_eq!(sets(&app), ["A"], "{}", app.ui.status);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// The Keyboard Shortcuts dialog's Import… and Export… ask off the UI thread: the set imported
 /// replaces the dialog's working set (kept on OK), Export… writes it where the dialog answers, and
 /// an answer once the dialog is closed does nothing.
 #[test]
 fn keyboard_shortcuts_import_and_export_ask_off_the_ui_thread() {
     let (mut app, shown, written) = app();
-    let set = crate::shortcut_editor::export_json("Custom", &BTreeMap::from([("view.grid".to_string(), "Ctrl+Alt+G".to_string())]));
+    let set = crate::shortcut_editor::export_json("Custom", &crate::keymap::overrides_from(&[("view.grid", "Ctrl+Alt+G")]));
     let (_, want) = crate::shortcut_editor::import_json(&set).unwrap();
     let bytes = serde_json::to_vec(&set).unwrap();
     app.services.read = Some(Box::new(move |_: &str| Ok(bytes.clone())));
@@ -618,6 +647,33 @@ fn an_import_shortcut_set_answer_goes_on_after_the_active_document_closes() {
     shown.answer(&[&path]);
     poll(&mut app);
     assert_eq!(dialog_kind(&app), Some(crate::dialogs::shortcut_import::KIND), "{}", app.ui.status);
+    assert_ne!(app.ui.status, CLOSED);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Locate Library… acts on no document either: its answer shows the picked file's library in the
+/// missing library's panel even when the document active at the time closed meanwhile (Linux).
+#[test]
+fn a_locate_library_answer_goes_on_after_the_active_document_closes() {
+    let (mut app, shown, _) = with_dialogs(false);
+    let dir = std::env::temp_dir().join(format!("vc-picks-locate-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (gone, found) = (dir.join("Gone.gpl"), dir.join("Found.gpl"));
+    std::fs::write(&found, "GIMP Palette\nName: Found\n#\n255   0   0\tRed\n").unwrap();
+    let id = format!("loaded/{}", gone.to_string_lossy());
+    let path = Some(gone.to_string_lossy().into_owned());
+    let missing = library_panel::LibraryPanel { kind: "swatches".into(), id: id.clone(), path, view: None, hide_find: false, persistent: true };
+    app.ui.library_panels.push(missing);
+    let panel = library_panel::panel_id("swatches", &id);
+    app.run("window.panel", json!({"panel": panel})).unwrap();
+    app.run("file.new", json!({"width": 100, "height": 80})).unwrap();
+    assert!(app.run("ui.libraryPanel.locate", json!({"panel": panel})).is_err());
+    app.run("file.close", json!({})).unwrap();
+    assert!(app.session.documents().is_empty());
+    shown.answer(&[&found.to_string_lossy()]);
+    poll(&mut app);
+    let located = library_panel::panel_id("swatches", &format!("loaded/{}", found.to_string_lossy()));
+    assert!(library_panel::is_open(&app.ui, &located) && !library_panel::is_open(&app.ui, &panel), "{}", app.ui.status);
     assert_ne!(app.ui.status, CLOSED);
     let _ = std::fs::remove_dir_all(dir);
 }

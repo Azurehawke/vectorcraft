@@ -112,6 +112,24 @@ fn justified_lines_use_word_then_letter_spacing_then_glyph_scaling() {
     assert!((at(&l, 2).advance - (space + 10.0 - letters)).abs() < 1e-6);
 }
 
+/// Full Justify spreads a right-to-left word between its letters as they are drawn: the word runs
+/// from the left edge to the right edge, with the same gap between each two letters.
+#[test]
+fn a_justified_right_to_left_word_is_spread_between_its_drawn_letters() {
+    let text = "שלום";
+    let natural = layout(db(), &point(text, JustificationOptions::default()));
+    let l = layout(db(), &area(text, 300.0, Justify::JustifyAll, JustificationOptions::default()));
+    // The letters from left to right: ם, ו, ל, ש.
+    let mut drawn: Vec<&PositionedGlyph> = l.glyphs.iter().collect();
+    drawn.sort_by(|a, b| a.origin.x.total_cmp(&b.origin.x));
+    assert!(drawn.len() == 4 && drawn.iter().all(|g| g.rtl), "{drawn:?}");
+    let gaps: Vec<f64> = drawn.windows(2).map(|p| p[1].origin.x - p[0].origin.x - at(&natural, p[0].byte).advance).collect();
+    let last = drawn[3];
+    assert!(drawn[0].origin.x.abs() < 1e-6, "{:?}", drawn[0].origin);
+    assert!((last.origin.x + at(&natural, last.byte).advance - 300.0).abs() < 1e-6, "{:?}", last.origin);
+    assert!(gaps.iter().all(|&g| g > 1.0 && (g - gaps[0]).abs() < 1e-6), "{gaps:?}");
+}
+
 /// Single Word Justification: a justified line holding one word is spread between its letters
 /// (Full Justify, the default) or aligned as chosen.
 #[test]

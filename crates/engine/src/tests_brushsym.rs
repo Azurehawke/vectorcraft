@@ -123,6 +123,136 @@ fn new_brushes_from_params_and_selection() {
     assert!(s.execute("brush.new", &json!({"type": "nope"})).is_err());
 }
 
+/// The brush of every stroke in symbol "Mark", graph design "Bar", pattern `pattern`, graphic style
+/// "Linked", the opacity mask in the layers and the art of brush "Holder", each as "<place>:
+/// <brush>" ("-" for a stroke without one).
+fn brushes_outside_the_layers(s: &Session, pattern: &str) -> Vec<String> {
+    let d = &s.doc().unwrap().doc;
+    let mut out = vec![];
+    let mut items = |place: &str, items: &[vectorcraft_doc::AppearanceItem]| {
+        for it in items {
+            if let vectorcraft_doc::AppearanceItem::Stroke(st) = it {
+                out.push(format!("{place}: {}", st.brush.as_deref().unwrap_or("-")));
+            }
+        }
+    };
+    let mut tree = |place: &str, n: &Node| n.walk(&mut |m| items(place, &m.appearance.items));
+    tree("symbol", &d.symbols.iter().find(|x| x.name == "Mark").unwrap().art);
+    tree("design", &d.graph_designs.iter().find(|x| x.name == "Bar").unwrap().art);
+    d.pattern(pattern).unwrap().art.iter().for_each(|n| tree("pattern", n));
+    let mut masks = vec![];
+    d.walk(|n| masks.extend(n.extras().mask.as_deref().map(|m| m.art.clone())));
+    masks.iter().for_each(|n| tree("mask", n));
+    let holder = vectorcraft_brush::find(d, "Holder").unwrap();
+    holder.art().into_iter().for_each(|n| tree("brush art", n));
+    items("style", &d.graphic_styles.iter().find(|x| x.name == "Linked").unwrap().appearance.items);
+    out
+}
+
+/// Renaming a brush in Brush Options and deleting it reach every stroke that paints with it, not
+/// only those in the layers: strokes in symbols, graph designs, pattern tiles, graphic styles,
+/// opacity masks and the art of other brushes are renamed, or become plain strokes, in the same
+/// undo step.
+#[test]
+fn brush_rename_and_delete_reach_strokes_outside_the_layers() {
+    let mut s = session();
+    let brushed = |s: &mut Session| {
+        let id = rect(s, 10.0, 10.0, 40.0, 20.0);
+        s.execute("brush.apply", &json!({"name": "Charcoal", "ids": [id.0]})).unwrap();
+        id
+    };
+    let clear = |s: &mut Session, id: NodeId| {
+        if s.doc().unwrap().doc.node(id).is_some() {
+            s.execute("edit.clear", &json!({"ids": [id.0]})).unwrap();
+        }
+    };
+    brushed(&mut s);
+    let sym = s.execute("symbol.new", &json!({"name": "Mark"})).unwrap();
+    clear(&mut s, NodeId(sym["id"].as_u64().unwrap()));
+    let id = brushed(&mut s);
+    s.execute("graph.design", &json!({"new": "Bar"})).unwrap();
+    clear(&mut s, id);
+    let id = brushed(&mut s);
+    let pattern = s.execute("object.pattern.make", &json!({"edit": false})).unwrap()["name"].as_str().unwrap().to_string();
+    clear(&mut s, id);
+    let id = brushed(&mut s);
+    s.execute("graphicStyle.new", &json!({"name": "Linked", "id": id.0})).unwrap();
+    clear(&mut s, id);
+    let id = brushed(&mut s);
+    s.execute("brush.new", &json!({"type": "art", "name": "Holder"})).unwrap();
+    clear(&mut s, id);
+    let masked = rect(&mut s, 100.0, 100.0, 60.0, 60.0);
+    let mask = brushed(&mut s);
+    select(&mut s, &[masked, mask]);
+    s.execute("transparency.makeOpacityMask", &json!({})).unwrap();
+    let a = brushed(&mut s);
+    let plain = rect(&mut s, 200.0, 10.0, 40.0, 20.0);
+    let shared = |s: &Session| s.doc().unwrap().doc.layers[0].children().unwrap().iter().find(|c| c.id == plain).unwrap().clone();
+    let plain_before = shared(&s);
+    let before = brushes_outside_the_layers(&s, &pattern);
+    for place in ["symbol", "design", "pattern", "mask", "brush art", "style"] {
+        assert!(before.contains(&format!("{place}: Charcoal")), "{place} in {before:?}");
+    }
+    let with = |to: &str| -> Vec<String> { before.iter().map(|e| e.replace(": Charcoal", &format!(": {to}"))).collect() };
+    let undo = s.doc().unwrap().history.undo.len();
+    s.execute("brush.options", &json!({"name": "Charcoal", "newName": "Chalk"})).unwrap();
+    assert_eq!((brush_of(&s, a).as_deref(), brushes_outside_the_layers(&s, &pattern)), (Some("Chalk"), with("Chalk")));
+    assert!(std::sync::Arc::ptr_eq(&shared(&s), &plain_before), "an object without the brush is not copied");
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo + 1);
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!((brush_of(&s, a).as_deref(), brushes_outside_the_layers(&s, &pattern)), (Some("Charcoal"), before.clone()));
+    s.execute("brush.delete", &json!({"name": "Charcoal"})).unwrap();
+    assert_eq!((brush_of(&s, a), brushes_outside_the_layers(&s, &pattern)), (None, with("-")));
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo + 1);
+    // A brush made later with the deleted brush's name does not paint the strokes that used it.
+    s.execute("brush.new", &json!({"type": "calligraphic", "name": "Charcoal"})).unwrap();
+    assert_eq!(brushes_outside_the_layers(&s, &pattern), with("-"));
+    s.execute("edit.undo", &json!({})).unwrap();
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!((brush_of(&s, a).as_deref(), brushes_outside_the_layers(&s, &pattern)), (Some("Charcoal"), before));
+}
+
+/// A brush renamed while a pattern is being edited keeps its new name in the tile that pattern
+/// editing's Cancel puts back.
+#[test]
+fn brush_rename_reaches_the_tile_that_pattern_cancel_puts_back() {
+    let mut s = session();
+    let id = rect(&mut s, 10.0, 10.0, 40.0, 20.0);
+    s.execute("brush.apply", &json!({"name": "Charcoal", "ids": [id.0]})).unwrap();
+    let pattern = s.execute("object.pattern.make", &json!({"edit": false})).unwrap()["name"].as_str().unwrap().to_string();
+    s.execute("object.pattern.edit", &json!({"name": pattern})).unwrap();
+    s.execute("brush.options", &json!({"name": "Charcoal", "newName": "Chalk"})).unwrap();
+    s.execute("object.pattern.cancel", &json!({})).unwrap();
+    let mut brushes = vec![];
+    for n in &s.doc().unwrap().doc.pattern(&pattern).unwrap().art {
+        n.walk(&mut |m| brushes.extend(m.appearance.stroke().and_then(|st| st.brush.clone())));
+    }
+    assert_eq!(brushes, ["Chalk"]);
+}
+
+/// `brush.selectionArt` gives the art `brush.new` takes: the selected object, a group of the selected
+/// objects, the object of `ids`, or null when nothing is selected. It changes nothing.
+#[test]
+fn selection_art_is_the_art_new_brush_takes() {
+    let mut s = session();
+    let art = |s: &mut Session, p: Value| s.execute("brush.selectionArt", &p).unwrap()["art"].clone();
+    s.select(|_, sel| sel.clear()).unwrap();
+    assert_eq!(art(&mut s, json!({})), Value::Null);
+    let a = rect(&mut s, 0.0, 0.0, 40.0, 8.0);
+    let b = rect(&mut s, 0.0, 20.0, 40.0, 8.0);
+    let steps = s.doc().unwrap().history.undo.len();
+    select(&mut s, &[a, b]);
+    let group: Node = serde_json::from_value(art(&mut s, json!({}))).unwrap();
+    assert!(matches!(&group.kind, NodeKind::Group { children, .. } if children.len() == 2), "{group:?}");
+    let one: Node = serde_json::from_value(art(&mut s, json!({"ids": [a.0]}))).unwrap();
+    assert_eq!(one.geometric_bounds(), Some(bounds(&s, a)));
+    // The art brush `brush.new` makes from the same selection holds the same art.
+    s.execute("brush.new", &json!({"type": "art", "name": "Two"})).unwrap();
+    let made: Node = serde_json::from_value(s.execute("brush.get", &json!({"name": "Two"})).unwrap()["art"].clone()).unwrap();
+    assert_eq!(made.geometric_bounds(), group.geometric_bounds());
+    assert_eq!(s.doc().unwrap().history.undo.len(), steps + 1, "only brush.new is an undo step");
+}
+
 #[test]
 fn brush_options_rename_duplicate_and_delete_update_strokes() {
     let mut s = session();
@@ -138,6 +268,62 @@ fn brush_options_rename_duplicate_and_delete_update_strokes() {
     assert_eq!(brush_of(&s, a), None);
     assert!(s.execute("brush.get", &json!({"name": "5 pt. Round"})).is_err());
     assert!(s.execute("brush.delete", &json!({"name": "5 pt. Round"})).is_err());
+}
+
+/// `brush.move`, which the Brushes panel runs when a brush is dragged, reorders brushes among those of
+/// their type in one undo step and refuses to move one into another type.
+#[test]
+fn brush_move_reorders_brushes_within_their_type() {
+    let mut s = session();
+    let names = |s: &mut Session, ty: &str| -> Vec<String> {
+        let list = s.execute("brush.list", &json!({})).unwrap();
+        let of_type = list["brushes"].as_array().unwrap().iter().filter(|b| ty.is_empty() || b["type"] == ty);
+        of_type.map(|b| b["name"].as_str().unwrap().to_string()).collect()
+    };
+    let undo = |s: &Session| s.doc().unwrap().history.undo.len();
+    let before = names(&mut s, "");
+    assert_eq!(names(&mut s, "calligraphic"), ["3 pt. Round", "6 pt. Flat", "10 pt. Oval"]);
+    let steps = undo(&s);
+    // To index 0 of the calligraphic brushes: before the first; the other types stay where they are.
+    let r = s.execute("brush.move", &json!({"name": "10 pt. Oval", "to": 0})).unwrap();
+    assert_eq!(r["moved"], json!(1));
+    assert_eq!(names(&mut s, "")[..3], ["10 pt. Oval", "3 pt. Round", "6 pt. Flat"]);
+    assert_eq!(names(&mut s, "")[3..], before[3..]);
+    assert_eq!(undo(&s), steps + 1);
+    // Several go in the order given, as one step.
+    s.execute("brush.move", &json!({"names": ["6 pt. Flat", "3 pt. Round"], "to": 0, "type": "calligraphic"})).unwrap();
+    assert_eq!(names(&mut s, "calligraphic"), ["6 pt. Flat", "3 pt. Round", "10 pt. Oval"]);
+    assert_eq!(undo(&s), steps + 2);
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(names(&mut s, "calligraphic"), ["10 pt. Oval", "3 pt. Round", "6 pt. Flat"]);
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(names(&mut s, ""), before);
+    // Into the scatter brushes, with a scatter brush, or with a `to` that isn't a whole number: an
+    // error, and nothing moves.
+    for (p, why) in [
+        (json!({"name": "3 pt. Round", "type": "scatter"}), "brushes move only within their type"),
+        (json!({"names": ["3 pt. Round", "Dots"], "to": 0}), "brushes move only within their type"),
+        (json!({"name": "3 pt. Round", "to": "1"}), "`to` must be a number, not \"1\""),
+        (json!({"name": "3 pt. Round", "to": 1.5}), "`to` must be a whole number"),
+        (json!({"name": "Nope", "to": 0}), "no brush named `Nope`"),
+    ] {
+        let r = s.execute("brush.move", &p);
+        assert!(matches!(&r, Err(EngineError::BadParams { msg, .. }) if msg == why), "{p}: {r:?}");
+    }
+    assert_eq!((names(&mut s, ""), undo(&s)), (before.clone(), steps));
+    // A move that keeps the order records no step.
+    s.execute("brush.move", &json!({"name": "3 pt. Round", "to": 0})).unwrap();
+    assert_eq!((names(&mut s, ""), undo(&s)), (before.clone(), steps));
+    // Without `to`, or past the last one: after the last brush of the type, even one listed after
+    // brushes of other types.
+    s.execute("brush.new", &json!({"type": "calligraphic", "name": "Quill"})).unwrap();
+    s.execute("brush.move", &json!({"name": "3 pt. Round"})).unwrap();
+    assert_eq!(names(&mut s, "calligraphic"), ["6 pt. Flat", "10 pt. Oval", "Quill", "3 pt. Round"]);
+    assert_eq!(names(&mut s, "").last().map(String::as_str), Some("3 pt. Round"));
+    s.execute("brush.move", &json!({"name": "6 pt. Flat", "to": 99})).unwrap();
+    assert_eq!(names(&mut s, "calligraphic"), ["10 pt. Oval", "Quill", "3 pt. Round", "6 pt. Flat"]);
+    s.execute("brush.move", &json!({"name": "Leaves", "to": 1})).unwrap();
+    assert_eq!(names(&mut s, "scatter"), ["Dots", "Leaves", "Confetti"]);
 }
 
 /// New Brush, Duplicate Brush and Brush Options trim the name they are given, as the Brush Options
@@ -164,6 +350,54 @@ fn new_duplicate_and_renamed_brushes_trim_their_names() {
     assert_eq!(s.execute("brush.duplicate", &json!({"name": " Old "})).unwrap()["name"], "Old copy");
     let names: Vec<String> = vectorcraft_brush::library(&s.doc().unwrap().doc).into_iter().map(|b| b.name).collect();
     assert_eq!(names[names.len() - 6..], ["Nib", " Old ", "New Calligraphic Brush", "Quill", "Nib copy", "Old copy"]);
+}
+
+/// New Brush and Bristle Brush Options take a bristle brush name of at most 31 characters, counted
+/// in Unicode characters (31 é's fit). A longer name that a document already holds is kept, and the
+/// other brush types take a name of any length.
+#[test]
+fn bristle_brush_names_have_at_most_31_characters() {
+    let mut s = session();
+    let library = |s: &Session| vectorcraft_brush::library(&s.doc().unwrap().doc);
+    let refused = |s: &mut Session, cmd: &str, p: Value| s.execute(cmd, &p).unwrap_err().to_string();
+    let (long, fits) = ("b".repeat(32), "é".repeat(31));
+    let e = refused(&mut s, "brush.new", json!({"type": "bristle", "name": long}));
+    assert!(e.contains("a bristle brush name can have at most 31 characters: `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb` has 32"), "{e}");
+    assert!(!library(&s).iter().any(|b| b.name == long));
+    assert_eq!(s.execute("brush.new", &json!({"type": "bristle", "name": fits})).unwrap()["name"], fits.as_str());
+    // A taken name is numbered, and the numbered name is the one counted.
+    let e = refused(&mut s, "brush.new", json!({"type": "bristle", "name": fits}));
+    assert!(e.contains(&format!("`{fits} 2` has 33")), "{e}");
+    let e = refused(&mut s, "brush.options", json!({"name": "Bristle Round", "newName": long}));
+    assert!(e.contains("at most 31 characters"), "{e}");
+    let short = "c".repeat(31);
+    assert_eq!(s.execute("brush.options", &json!({"name": "Bristle Round", "newName": short})).unwrap()["name"], short.as_str());
+    // Calligraphic brushes take a longer name.
+    assert_eq!(s.execute("brush.new", &json!({"type": "calligraphic", "name": long})).unwrap()["name"], long.as_str());
+    let longer = format!("{long}x");
+    assert_eq!(s.execute("brush.options", &json!({"name": long, "newName": longer})).unwrap()["name"], longer.as_str());
+    // Bristle brushes that already have longer names, one of them with white space around it, as a
+    // saved file can hold.
+    let (old, spaced) = ("d".repeat(40), format!(" {} ", "e".repeat(40)));
+    let mut lib = library(&s);
+    lib.iter_mut().filter(|b| b.name == short).for_each(|b| b.name = old.clone());
+    lib.iter_mut().filter(|b| b.name == fits).for_each(|b| b.name = spaced.clone());
+    vectorcraft_brush::store(std::sync::Arc::make_mut(&mut s.doc_mut().unwrap().doc), &lib);
+    let l = line(&mut s);
+    s.execute("brush.apply", &json!({"name": old, "ids": [l.0]})).unwrap();
+    // Brush Options without a new name, with the same name, or with the name only trimmed keep them.
+    s.execute("brush.options", &json!({"name": old, "params": {"size": 9}})).unwrap();
+    assert_eq!(s.execute("brush.options", &json!({"name": old, "newName": old, "params": {"density": 20}})).unwrap()["name"], old.as_str());
+    assert_eq!(s.execute("brush.options", &json!({"name": spaced, "newName": spaced})).unwrap()["name"], spaced.trim());
+    assert_eq!(s.execute("brush.get", &json!({"name": old})).unwrap()["size"], json!(9.0));
+    assert_eq!(s.execute("brush.duplicate", &json!({"name": old})).unwrap()["name"], format!("{old} copy"));
+    // Saved and opened again, the brush and the stroke painted with it keep the name.
+    let back = vectorcraft_format::load(&vectorcraft_format::save(&s.doc().unwrap().doc, false)).unwrap();
+    assert!(vectorcraft_brush::find(&back, &old).is_some_and(|b| b.kind.type_id() == "bristle"));
+    assert_eq!(back.node(l).unwrap().appearance.stroke().unwrap().brush.as_deref(), Some(old.as_str()));
+    let mut s2 = Session::new();
+    s2.add_document(back, None);
+    assert_eq!(s2.execute("brush.options", &json!({"name": old, "params": {"size": 4}})).unwrap()["name"], old.as_str());
 }
 
 /// The Brushes panel's multi-selection: `names` deletes or duplicates several brushes in one undo
@@ -810,6 +1044,66 @@ fn symbol_stainer_rgb_color_in_a_cmyk_document_separates_through_the_color_setti
     s.execute("symbol.adjust", &json!({"tool": "stain", "points": [[c.x, c.y]], "color": "#ff0000", "intensity": 10})).unwrap();
     let red = cms::active().convert(&Color::rgb(1.0, 0.0, 0.0), cms::Model::Cmyk, cms::active().settings().intent);
     assert_eq!(node(&s, inst).appearance.fill().map(|f| f.paint.clone()), Some(Paint::solid(red)));
+}
+
+/// In a CMYK document the Symbol Stainer refuses a `keepModel` given as text or as another value that
+/// is not true or false, and the instance and the undo history stay as they were. Null is read as
+/// `keepModel` left out.
+#[test]
+fn symbol_stainer_refuses_a_keep_model_given_as_text() {
+    use vectorcraft_color::{Color, Paint, cms};
+    let mut s = Session::new();
+    s.execute("file.new", &json!({"width": 400, "height": 300, "colorMode": "cmyk"})).unwrap();
+    let (inst, _, b) = make_symbol(&mut s);
+    let at = json!([[b.center().x, b.center().y]]);
+    let state = |s: &Session| (node(s, inst), s.doc().unwrap().history.undo.len());
+    let before = state(&s);
+    for keep in [json!("true"), json!(1), json!("false"), json!([true])] {
+        let p = json!({"tool": "stain", "points": at, "color": "#ff0000", "intensity": 10, "keepModel": keep});
+        let r = s.execute("symbol.adjust", &p);
+        assert!(matches!(&r, Err(EngineError::BadParams { msg, .. }) if msg == "`keepModel` must be true or false"), "{p}: {r:?}");
+        assert_eq!(state(&s), before, "{p}");
+    }
+    s.execute("symbol.adjust", &json!({"tool": "stain", "points": at, "color": "#ff0000", "intensity": 10, "keepModel": null})).unwrap();
+    let red = cms::active().convert(&Color::rgb(1.0, 0.0, 0.0), cms::Model::Cmyk, cms::active().settings().intent);
+    assert_eq!(node(&s, inst).appearance.fill().map(|f| f.paint.clone()), Some(Paint::solid(red)));
+}
+
+/// Place Symbol Instance, Delete Symbol, the Symbol Sprayer and the symbolism tools refuse a number
+/// or an on/off option given as text or as another value of the wrong kind, naming the key; the
+/// document and the undo history stay as they were. Numbers, true, false and null still work.
+#[test]
+fn symbol_commands_refuse_a_number_or_boolean_given_as_text() {
+    use super::tests::{not_a_number, not_a_switch, not_refused};
+    let mut s = session();
+    let (_, name, b) = make_symbol(&mut s);
+    let at = json!([[b.center().x, b.center().y]]);
+    let mut calls: Vec<_> = [
+        ("symbol.place", json!({"name": name, "x": "200"}), "x"),
+        ("symbol.place", json!({"name": name, "x": 200, "y": [100]}), "y"),
+        ("symbol.spray", json!({"name": name, "points": at, "radius": "40"}), "radius"),
+        ("symbol.spray", json!({"name": name, "points": at, "density": "5"}), "density"),
+        ("symbol.spray", json!({"name": name, "points": at, "scale": true}), "scale"),
+        ("symbol.adjust", json!({"tool": "size", "points": at, "radius": "40"}), "radius"),
+        ("symbol.adjust", json!({"tool": "size", "points": at, "intensity": "10"}), "intensity"),
+    ]
+    .into_iter()
+    .map(|(cmd, p, key)| not_a_number(cmd, p, key))
+    .collect();
+    calls.extend(
+        [
+            ("symbol.spray", json!({"name": name, "points": at, "alt": "true"}), "alt"),
+            ("symbol.adjust", json!({"tool": "size", "points": at, "alt": 1}), "alt"),
+            ("symbol.delete", json!({"name": name, "expandInstances": "false"}), "expandInstances"),
+        ]
+        .map(|(cmd, p, key)| not_a_switch(cmd, p, key)),
+    );
+    let wrong = not_refused(&mut s, &calls);
+    assert!(wrong.is_empty(), "not refused: {wrong:#?}");
+    s.execute("symbol.place", &json!({"name": name, "x": 200, "y": null})).unwrap();
+    s.execute("symbol.spray", &json!({"name": name, "points": at, "radius": 40, "alt": false})).unwrap();
+    s.execute("symbol.delete", &json!({"name": name, "expandInstances": true})).unwrap();
+    assert!(s.doc().unwrap().doc.symbols.is_empty());
 }
 
 #[test]

@@ -40,6 +40,7 @@ mod clip;
 mod distort;
 mod group;
 mod lighting;
+mod lighting_presets;
 mod live;
 mod marks;
 pub mod pixel;
@@ -50,6 +51,7 @@ mod revolve;
 mod solids;
 pub mod stroke;
 mod stylize;
+pub mod trap;
 mod util;
 mod warp;
 
@@ -57,6 +59,8 @@ mod warp;
 mod tests;
 #[cfg(test)]
 mod tests_scale;
+#[cfg(test)]
+mod tests_transformfx;
 
 use serde_json::{Map, Value, json};
 use vectorcraft_doc::{Appearance, AppearanceItem, Effect, Node, NodeKind, StrokeLayer};
@@ -72,16 +76,21 @@ pub use group::{
     OutlineHook, PATHFINDER_EFFECTS, evaluate_container, has_container_appearance, has_pathfinder, is_pathfinder, member_shapes, paints,
     pathfinder_children,
 };
+pub use lighting_presets::{LIGHTING_PRESETS, LightingPreset, lighting_preset_params, matching_lighting_preset};
 pub use live::{expand_live, expand_live_deep, expanded_live_group, text_outliner};
 pub use marks::{CROP_MARKS, crop_marks_art, has_crop_marks};
 pub use pixel::{PIXEL_EFFECTS, PixelFx, PixelSpace};
 pub use raster::{RASTERIZE, RasterFx, Rasterize, outset, raster_effects};
-pub use reshape::{expand_outlined, has_gradient_copies, has_item_geometry, image_paint, needs_outline, outline_art, outline_text, reshape};
+pub use reshape::{
+    expand_outlined, has_gradient_copies, has_item_geometry, has_transform_art, has_transform_options, image_paint, needs_outline, outline_art,
+    outline_text, reshape,
+};
 pub use revolve::{REVOLVE, has_revolve, revolve_art, revolve_options, validate_revolve};
 pub use solids::{
     EXTRUDE, INFLATE, ROTATE, ROTATION_PRESETS, SOLIDS, extrude_options, has_solid, inflate_options, is_three_d, solid_art, validate_solid,
-    view_options,
+    validate_three_d, view_options,
 };
+pub use trap::TRAP;
 pub use warp::{WarpStyle, warp_point};
 
 /// Catalogue entry for one effect.
@@ -146,6 +155,7 @@ fn lengths_of(id: &str) -> Lengths {
         "stylize.innerGlow" | "stylize.outerGlow" => always(&["blur"]),
         "stylize.glowingEdges" => always(&["edgeWidth", "smoothness"]),
         "brushStrokes.accentedEdges" => always(&["edgeWidth"]),
+        "artistic.paletteKnife" => always(&["strokeSize"]),
         "brushStrokes.angledStrokes" | "brushStrokes.crosshatch" | "brushStrokes.inkOutlines" => always(&["strokeLength"]),
         "brushStrokes.spatter" => always(&["sprayRadius"]),
         "brushStrokes.sprayedStrokes" => always(&["strokeLength", "sprayRadius"]),
@@ -159,7 +169,9 @@ fn lengths_of(id: &str) -> Lengths {
         "sketch.graphicPen" => always(&["strokeLength"]),
         "sketch.halftonePattern" => always(&["size"]),
         "sketch.notePaper" => always(&["relief"]),
+        "sketch.tornEdges" => always(&["smoothness"]),
         "sketch.waterPaper" => always(&["fiberLength"]),
+        TRAP => always(&["thickness", "precision"]),
         RASTERIZE => always(&["addAround"]),
         _ => Lengths::default(),
     }
@@ -277,8 +289,8 @@ pub fn effect_catalog() -> Vec<EffectInfo> {
             "distort.transform",
             "Transform…",
             DT,
-            "{scaleH: % (100), scaleV: % (100), moveH: pt (0; right = +), moveV: pt (0; down = +), rotate: deg (0; counter-clockwise), copies: 0..1000 (0; each copy transforms the last again), reflectX: bool (false; flips left to right), reflectY: bool (false; flips top to bottom), reference: 0..8 (4; the point of the bounds' 9-point grid it scales, rotates and reflects about: 0 top left, 4 centre, 8 bottom right), random: bool (false; each scale goes a random share of the way from 100 % to its value, each move and the angle a random share of theirs, differently for each object and the same on every redraw)}",
-            json!({"scaleH": 100.0, "scaleV": 100.0, "moveH": 0.0, "moveV": 0.0, "rotate": 0.0, "copies": 0, "reflectX": false, "reflectY": false, "reference": 4, "random": false}),
+            "{scaleH: % (100), scaleV: % (100), moveH: pt (0; right = +), moveV: pt (0; down = +), rotate: deg (0; counter-clockwise), copies: 0..1000 (0; each copy transforms the last again), reflectX: bool (false; flips left to right), reflectY: bool (false; flips top to bottom), reference: 0..8 (4; the point of the bounds' 9-point grid it scales, rotates and reflects about: 0 top left, 4 centre, 8 bottom right), random: bool (false; each scale goes a random share of the way from 100 % to its value, each move and the angle a random share of theirs, differently for each object and the same on every redraw), objects: bool (true; Transform Objects: off, the geometry stays where it is and makes no copies, and only the two options below apply, once), patterns: bool (false; Transform Patterns: pattern fills and strokes transform along; with copies the original keeps its pattern and copy k takes the transformation k times), strokes: bool (false; Scale Strokes & Effects: stroke weights and dashes, and the distances of the effects on the fills and strokes, scale by the mean scale √|scaleH·scaleV|, copy k by its k-th power)}",
+            json!({"scaleH": 100.0, "scaleV": 100.0, "moveH": 0.0, "moveV": 0.0, "rotate": 0.0, "copies": 0, "reflectX": false, "reflectY": false, "reference": 4, "random": false, "objects": true, "patterns": false, "strokes": false}),
         ),
         g(
             "distort.tweak",
@@ -348,11 +360,25 @@ pub fn effect_catalog() -> Vec<EffectInfo> {
         r("stylize.feather", "Feather…", STYLIZE, "{radius: pt (5)}", json!({"radius": 5.0})),
         r("blur.gaussian", "Gaussian Blur…", BLUR, "{radius: pt (5)}", json!({"radius": 5.0})),
         r(
+            "artistic.coloredPencil",
+            "Colored Pencil…",
+            ARTISTIC,
+            "{pencilWidth: 1..24 (5; stroke spacing in document units), strokePressure: 0..15 (5; how heavily the strokes darken), paperBrightness: 0..50 (25; lifts lighter areas toward the paper)} redraws the object in coloured pencil strokes along its edges, keeping its hues and coverage. Original visual approximation; chosen VectorCraft defaults.",
+            json!({"pencilWidth": 5.0, "strokePressure": 5.0, "paperBrightness": 25.0}),
+        ),
+        r(
             "artistic.cutout",
             "Cutout…",
             ARTISTIC,
             "{levels: 2..8 (4; steps per colour channel: more levels, more flat colours), edgeSimplicity: 0..10 (4; simpler, smoother edges), edgeFidelity: 1..3 (2; keeps more of the edges' detail)} redraws the object as flat pieces of coloured paper, each piece painted in the average colour that falls into it, keeping its coverage. Original visual approximation; chosen VectorCraft defaults.",
             json!({"levels": 4.0, "edgeSimplicity": 4.0, "edgeFidelity": 2.0}),
+        ),
+        r(
+            "artistic.dryBrush",
+            "Dry Brush…",
+            ARTISTIC,
+            "{brushSize: 1..10 (2; length of the brush strokes), brushDetail: 0..10 (10; more detail keeps finer structure), texture: 1..3 (1; stronger edges and bristle grain at 3)} repaints the object with short strokes along its form and darkens its edges, keeping its coverage. Original visual approximation; chosen VectorCraft defaults.",
+            json!({"brushSize": 2.0, "brushDetail": 10.0, "texture": 1.0}),
         ),
         r(
             "artistic.filmGrain",
@@ -362,11 +388,32 @@ pub fn effect_catalog() -> Vec<EffectInfo> {
             json!({"grain": 4.0, "highlightArea": 0.0, "intensity": 10.0}),
         ),
         r(
+            "artistic.fresco",
+            "Fresco…",
+            ARTISTIC,
+            "{brushSize: 1..10 (2; wider brush dabs), brushDetail: 0..10 (10; sharper edges and less smoothing), texture: 1..3 (1; deeper plaster relief)} repaints the object as coarse pigment on a textured wall, keeping its coverage. Original visual approximation; chosen VectorCraft defaults.",
+            json!({"brushSize": 2.0, "brushDetail": 10.0, "texture": 1.0}),
+        ),
+        r(
             "artistic.neonGlow",
             "Neon Glow…",
             ARTISTIC,
             "{glowSize: -24..24 (5; above 0 the light areas glow, below 0 the dark ones; farther from 0 spreads the glow wider), glowBrightness: 0..50 (15; a stronger glow over dimmer greys), color: \"#rrggbb\" (\"#4da6ff\"; the glow's colour)} redraws the object in greys lit by a coloured glow, keeping its coverage. Original visual approximation; chosen VectorCraft defaults.",
             json!({"glowSize": 5.0, "glowBrightness": 15.0, "color": "#4da6ff"}),
+        ),
+        r(
+            "artistic.paintDaubs",
+            "Paint Daubs…",
+            ARTISTIC,
+            "{brushSize: 1..50 (10; dab centres farther apart), sharpness: 0..40 (25; harder dab edges), brushType: \"simple\"|\"lightRough\"|\"darkRough\"|\"wideSharp\"|\"wideBlurry\"|\"sparkle\" (\"simple\")} repaints the object with thick round brush dabs in the local colours, keeping its coverage. Original visual approximation; chosen VectorCraft defaults.",
+            json!({"brushSize": 10.0, "sharpness": 25.0, "brushType": "simple"}),
+        ),
+        r(
+            "artistic.paletteKnife",
+            "Palette Knife…",
+            ARTISTIC,
+            "{strokeSize: 1..50 (10; length of the knife strokes in document units), strokeDetail: 1..3 (2; more detail keeps more of the original), softness: 0..10 (3; softens the strokes)} smears the object's colours with short angled knife strokes, keeping its coverage. Original visual approximation; chosen VectorCraft defaults.",
+            json!({"strokeSize": 10.0, "strokeDetail": 2.0, "softness": 3.0}),
         ),
         r(
             "artistic.plasticWrap",
@@ -383,6 +430,21 @@ pub fn effect_catalog() -> Vec<EffectInfo> {
             json!({"edgeThickness": 2.0, "edgeIntensity": 1.0, "posterization": 2.0}),
         ),
         r(
+            "artistic.roughPastels",
+            "Rough Pastels…",
+            ARTISTIC,
+            "{strokeLength: 0..40 (6; longer pastel strokes), strokeDetail: 1..20 (10; bristle texture along the strokes), texture: \"brick\"|\"burlap\"|\"canvas\"|\"sandstone\" (\"canvas\"), scaling: % 50..200 (100), relief: 0..50 (4), lightDirection: \"bottom\"|\"bottomLeft\"|\"left\"|\"topLeft\"|\"top\"|\"topRight\"|\"right\"|\"bottomRight\" (\"top\"), invert: bool (false)} repaints the object in soft diagonal pastel strokes over a textured surface, keeping its coverage. Slider ranges follow the documented controls; numeric defaults are chosen for VectorCraft and are not verified against proprietary defaults.",
+            json!({
+                "strokeLength": 6.0,
+                "strokeDetail": 10.0,
+                "texture": "canvas",
+                "scaling": 100.0,
+                "relief": 4.0,
+                "lightDirection": "top",
+                "invert": false
+            }),
+        ),
+        r(
             "artistic.smudgeStick",
             "Smudge Stick…",
             ARTISTIC,
@@ -395,6 +457,21 @@ pub fn effect_catalog() -> Vec<EffectInfo> {
             ARTISTIC,
             "{brushSize: 0..10 (2; size of the sponge's pores), definition: 0..25 (12; how strongly lighter and darker blobs contrast), smoothness: 1..15 (5; softer blob edges)} paints the object as if dabbed with a sponge, in highly textured areas of contrasting colour. Coverage is kept. Original visual approximation; chosen VectorCraft defaults.",
             json!({"brushSize": 2.0, "definition": 12.0, "smoothness": 5.0}),
+        ),
+        r(
+            "artistic.underpainting",
+            "Underpainting…",
+            ARTISTIC,
+            "{brushSize: 0..40 (6; wider, softer strokes), textureCoverage: 0..40 (16; more of the relief texture on the strokes), texture: \"brick\"|\"burlap\"|\"canvas\"|\"sandstone\" (\"canvas\"; surfaces made in code), scaling: % 50..200 (100), relief: 0..50 (4), lightDirection: \"bottom\"|\"bottomLeft\"|\"left\"|\"topLeft\"|\"top\"|\"topRight\"|\"right\"|\"bottomRight\" (\"top\"), invert: bool (false; turns the surface's heights over)} paints the object with broad strokes over a textured ground, keeping its coverage. Slider ranges follow the documented controls; numeric defaults are chosen for VectorCraft and are not verified against proprietary defaults. Original visual approximation.",
+            json!({
+                "brushSize": 6.0,
+                "textureCoverage": 16.0,
+                "texture": "canvas",
+                "scaling": 100.0,
+                "relief": 4.0,
+                "lightDirection": "top",
+                "invert": false
+            }),
         ),
         r(
             "artistic.watercolor",
@@ -530,6 +607,21 @@ pub fn effect_catalog() -> Vec<EffectInfo> {
             json!({"detail": 4.0, "smoothness": 4.0}),
         ),
         r(
+            "sketch.conteCrayon",
+            "Conté Crayon…",
+            SKETCH,
+            "{foregroundLevel: 0..20 (12; how far the black crayon reaches from the shadows into the midtones), backgroundLevel: 0..20 (10; how far the white crayon reaches from the highlights into the midtones), texture: \"brick\"|\"burlap\"|\"canvas\"|\"sandstone\" (\"canvas\"; the paper's surface, made in code), scaling: % 50..200 (100), relief: 0..50 (4), lightDirection: \"bottom\"|\"bottomLeft\"|\"left\"|\"topLeft\"|\"top\"|\"topRight\"|\"right\"|\"bottomRight\" (\"top\"), invert: bool (false; turns the surface's heights over)} redraws the object in a dense black crayon in its dark areas and a pure white crayon in its light areas, on mid-grey paper whose texture breaks the strokes and stands in relief, keeping its coverage. Public help names Foreground Level, Background Level and the texture options but not slider ranges or dialog defaults; ranges and defaults here are unverified VectorCraft choices. Original visual approximation, not a proprietary reproduction.",
+            json!({
+                "foregroundLevel": 12.0,
+                "backgroundLevel": 10.0,
+                "texture": "canvas",
+                "scaling": 100.0,
+                "relief": 4.0,
+                "lightDirection": "top",
+                "invert": false
+            }),
+        ),
+        r(
             "sketch.graphicPen",
             "Graphic Pen…",
             SKETCH,
@@ -577,6 +669,13 @@ pub fn effect_catalog() -> Vec<EffectInfo> {
             SKETCH,
             "{lightDarkBalance: 0..50 (25; the larger, the more of the object prints black), smoothness: 1..50 (5; rounds the shapes)} simplifies the object to solid black and white, as a rubber stamp would print it. Coverage is kept. Original visual approximation; chosen VectorCraft defaults.",
             json!({"lightDarkBalance": 25.0, "smoothness": 5.0}),
+        ),
+        r(
+            "sketch.tornEdges",
+            "Torn Edges…",
+            SKETCH,
+            "{imageBalance: 0..50 (25; lower leaves more midtones as ink, higher as paper), smoothness: 0..15 (11; softens tones and the ragged edges), contrast: 0..20 (17; 20 is pure black and white)} redraws the object in high-contrast black and white with torn, ragged edges along its tones, keeping its coverage. Original visual approximation; chosen VectorCraft defaults.",
+            json!({"imageBalance": 25.0, "smoothness": 11.0, "contrast": 17.0}),
         ),
         r(
             "sketch.waterPaper",
@@ -659,7 +758,7 @@ pub fn effect_catalog() -> Vec<EffectInfo> {
             "texture.texturizer",
             "Texturizer…",
             TEXTURE,
-            "{texture: \"brick\"|\"burlap\"|\"canvas\"|\"sandstone\" (\"canvas\"; surfaces made in code), scaling: % 50..200 (100), relief: 0..50 (4), lightDirection: \"bottom\"|\"bottomLeft\"|\"left\"|\"topLeft\"|\"top\"|\"topRight\"|\"right\"|\"bottomRight\" (\"top\"), invert: bool (false; turns the surface's heights over)} paints the object on a surface in relief",
+            "{texture: \"brick\"|\"burlap\"|\"canvas\"|\"sandstone\"|\"loaded\" (\"canvas\"; \"loaded\" draws the image in textureImage and draws Canvas when there is none; the others are surfaces made in code), textureImage?: {path} | {name?, dataBase64} | string (Load Texture…: an image file that File › Place reads, within the renderer's pixel allowance, stored as its gray levels in a grayscale PNG in base64; a file sets texture to \"loaded\" unless texture is given, and the stored string, as effect.list gives it, is kept as it is), scaling: % 50..200 (100), relief: 0..50 (4), lightDirection: \"bottom\"|\"bottomLeft\"|\"left\"|\"topLeft\"|\"top\"|\"topRight\"|\"right\"|\"bottomRight\" (\"top\"), invert: bool (false; turns the surface's heights over)} paints the object on a surface in relief. A loaded texture lies one image pixel per point at 100 %, centered on the object's center and repeated; each pixel's luma is the surface's height, from 0 for black to 1 pt for white, and a transparent pixel counts as middle gray",
             json!({"texture": "canvas", "scaling": 100.0, "relief": 4.0, "lightDirection": "top", "invert": false}),
         ),
         r(
@@ -742,8 +841,19 @@ pub fn effect_catalog() -> Vec<EffectInfo> {
         v.push(g(id, label, WARP, WARP_DOC, json!({"bend": 50.0, "horizontal": 0.0, "vertical": 0.0, "orientation": "horizontal"})));
     }
     for (id, label, _) in PATHFINDER_EFFECTS {
-        v.push(g(id, label, PATHFINDER, "{} (groups and layers: live Pathfinder over the members)", json!({})));
+        if id == "pathfinder.softMix" {
+            v.push(g(
+                id,
+                label,
+                PATHFINDER,
+                "{mixingRate?: 1..100 % (50)} blend overlapping fills in CMYK bottom to top (groups and layers: live Pathfinder over the members)",
+                json!({"mixingRate": 50.0}),
+            ));
+        } else {
+            v.push(g(id, label, PATHFINDER, "{} (groups and layers: live Pathfinder over the members)", json!({})));
+        }
     }
+    v.push(g(TRAP, "Trap…", PATHFINDER, trap::EFFECT_PARAMS_DOC, trap::effect_defaults()));
     v.push(g(
         CROP_MARKS,
         "Crop Marks",
@@ -982,15 +1092,80 @@ impl<'a> GeomContext<'a> {
     }
 }
 
+/// Most anchors a chain of geometry effects makes of one path, or of all the paths of a type,
+/// symbol or image art together; a path that already has more keeps its own count as the limit.
+/// Roughen resamples each segment into up to 2000 points, Zig Zag into up to 101 and the warps
+/// into up to 64, so stacked effects multiply: three Roughens of a rectangle needed tens of
+/// gigabytes (#3578). Each effect builds within it, and one whose result would still pass it is
+/// left out.
+pub(crate) const MAX_EFFECT_ANCHORS: usize = 2_000_000;
+
+/// Most lines the renderer is estimated to draw a chain of geometry effects' result with at
+/// 1 px/pt ([`util::line_estimate`]), or the path's own estimate when that is more. A large
+/// Roughen or Zig Zag makes segments thousands of points long, each drawn as up to hundreds of
+/// lines: two million anchors of them came to 141 million lines, 7 GB in the renderer and past
+/// the 2²⁷ lines vello takes of one path (#3578). Art of small curves draws its anchors as a few
+/// lines each, so this rarely binds before [`MAX_EFFECT_ANCHORS`] does.
+pub(crate) const MAX_EFFECT_LINES: usize = 8_000_000;
+
+/// What geometry effects may make of a path, or what a path costs: its anchors and the lines the
+/// renderer is estimated to draw it with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Budget {
+    pub anchors: usize,
+    pub lines: usize,
+}
+
+impl Budget {
+    /// The budget of a chain of geometry effects.
+    pub(crate) const EFFECTS: Self = Self { anchors: MAX_EFFECT_ANCHORS, lines: MAX_EFFECT_LINES };
+
+    /// What `path` costs.
+    pub(crate) fn of(path: &PathData) -> Self {
+        Self { anchors: path.anchor_count(), lines: util::line_estimate(path) }
+    }
+
+    /// This budget, raised to `cost` where that is more.
+    pub(crate) fn at_least(self, cost: Self) -> Self {
+        Self { anchors: self.anchors.max(cost.anchors), lines: self.lines.max(cost.lines) }
+    }
+
+    /// Does `cost` fit this budget?
+    pub(crate) fn fits(self, cost: Self) -> bool {
+        cost.anchors <= self.anchors && cost.lines <= self.lines
+    }
+
+    /// What is left of this budget once `cost` is spent.
+    pub(crate) fn minus(self, cost: Self) -> Self {
+        Self { anchors: self.anchors.saturating_sub(cost.anchors), lines: self.lines.saturating_sub(cost.lines) }
+    }
+
+    /// This cost and `cost` together.
+    pub(crate) fn plus(self, cost: Self) -> Self {
+        Self { anchors: self.anchors.saturating_add(cost.anchors), lines: self.lines.saturating_add(cost.lines) }
+    }
+}
+
 /// Evaluate the visible geometry effects of `effects` on `path`, in order. `bounds` is the
 /// reference box of the first effect (usually the object's geometric bounds); each later effect
-/// uses the bounds of its input. Raster and unknown effects are skipped.
+/// uses the bounds of its input. Raster and unknown effects are skipped, and so is an effect
+/// whose result would pass 2 million anchors or 8 million lines drawn (or the path's own counts,
+/// when they are more).
 pub fn apply_geometry(effects: &[Effect], path: &PathData, bounds: Rect) -> PathData {
     apply_geometry_with(effects, path, bounds, &GeomContext::default())
 }
 
 /// [`apply_geometry`] with an explicit [`GeomContext`].
 pub fn apply_geometry_with(effects: &[Effect], path: &PathData, bounds: Rect, ctx: &GeomContext) -> PathData {
+    apply_geometry_within(effects, path, bounds, ctx, Budget::EFFECTS)
+}
+
+/// [`apply_geometry_with`] whose effects keep to `budget`, raised to what `path` costs where that
+/// is more.
+pub(crate) fn apply_geometry_within(effects: &[Effect], path: &PathData, bounds: Rect, ctx: &GeomContext, budget: Budget) -> PathData {
+    // `budget` raised to what `path` costs, measured once, and only for a path that has geometry
+    // effects.
+    let mut limit = None;
     let mut cur = path.clone();
     let mut b = bounds;
     let mut first = true;
@@ -1003,7 +1178,10 @@ pub fn apply_geometry_with(effects: &[Effect], path: &PathData, bounds: Rect, ct
             break;
         }
         let p = merged_params(&e.id, &e.params);
-        cur = apply_one(&e.id, &p, &cur, b, ctx);
+        let limit = *limit.get_or_insert_with(|| budget.at_least(Budget::of(path)));
+        if let Some(next) = apply_one(&e.id, &p, &cur, b, ctx, limit) {
+            cur = next;
+        }
     }
     cur
 }
@@ -1013,20 +1191,44 @@ pub fn apply_geometry_bez(effects: &[Effect], path: &BezPath, bounds: Rect, ctx:
     apply_geometry_with(effects, &PathData::from_bezpath(path), bounds, ctx).to_bezpath()
 }
 
-pub(crate) fn apply_one(id: &str, p: &Value, path: &PathData, b: Rect, ctx: &GeomContext) -> PathData {
+/// Geometry effect `id` with params `p` on `path`, whose reference box is `b`; `None` when its
+/// result would not fit `budget` (the effects that multiply anchors build within its anchors).
+pub(crate) fn apply_one(id: &str, p: &Value, path: &PathData, b: Rect, ctx: &GeomContext, budget: Budget) -> Option<PathData> {
+    let out = apply_unchecked(id, p, path, b, ctx, budget.anchors);
+    let cost = Budget::of(&out);
+    if budget.fits(cost) {
+        return Some(out);
+    }
+    if cost.lines <= budget.lines || !builds_within(id) {
+        return None;
+    }
+    // Anchors drawn as many lines each (a large Roughen or Zig Zag): once more with as many fewer
+    // anchors as there were lines too many, and a tenth to spare, as segments vary in their lines.
+    let fewer = (cost.anchors as f64 * 0.9 * (budget.lines as f64 / cost.lines as f64)) as usize;
+    let out = apply_unchecked(id, p, path, b, ctx, fewer.min(budget.anchors));
+    budget.fits(Budget::of(&out)).then_some(out)
+}
+
+/// Does geometry effect `id` build within the anchors it is given?
+fn builds_within(id: &str) -> bool {
+    matches!(id, "distort.freeDistort" | "distort.roughen" | "distort.transform" | "distort.twist" | "distort.zigZag") || id.starts_with("warp.")
+}
+
+/// [`apply_one`] whose result may pass `max` when the effect doesn't build within it.
+fn apply_unchecked(id: &str, p: &Value, path: &PathData, b: Rect, ctx: &GeomContext, max: usize) -> PathData {
     use util::*;
     if let Some(plugin) = vectorcraft_plugins::effect::plugin_id(id) {
         let paints = vectorcraft_plugins::effect::Paints { appearance: ctx.appearance, item: ctx.item };
         return vectorcraft_plugins::effect::apply(plugin, p, path, b, ctx.rule, paints).unwrap_or_else(|| path.clone());
     }
     match id {
-        "distort.freeDistort" => distort::free_distort(path, b, p),
+        "distort.freeDistort" => distort::free_distort(path, b, p, max),
         "distort.puckerBloat" => distort::pucker_bloat(path, b, num(p, "amount", 0.0)),
-        "distort.roughen" => distort::roughen(path, b, p),
-        "distort.transform" => distort::transform(path, b, p, ctx.seed),
+        "distort.roughen" => distort::roughen(path, b, p, max),
+        "distort.transform" => distort::transform_within(path, b, p, ctx.seed, max),
         "distort.tweak" => distort::tweak(path, b, p),
-        "distort.twist" => distort::twist(path, b, num(p, "angle", 10.0)),
-        "distort.zigZag" => distort::zig_zag(path, b, p),
+        "distort.twist" => distort::twist(path, b, num(p, "angle", 10.0), max),
+        "distort.zigZag" => distort::zig_zag(path, b, p, max),
         "path.offsetPath" => {
             let off = num(p, "offset", 10.0).clamp(-1e5, 1e5);
             if off.abs() < 1e-9 {
@@ -1059,7 +1261,7 @@ pub(crate) fn apply_one(id: &str, p: &Value, path: &PathData, b: Rect, ctx: &Geo
         "stylize.roundCorners" => stylize::round_corners(path, num(p, "radius", 10.0)),
         "stylize.scribble" => stylize::scribble(path, b, p),
         _ => match id.strip_prefix("warp.").and_then(WarpStyle::from_id) {
-            Some(style) => warp::warp(path, b, style, p),
+            Some(style) => warp::warp(path, b, style, p, max),
             None => path.clone(),
         },
     }

@@ -1,7 +1,7 @@
 //! Tabs panel: tab-stop alignment, X position (Y in vertical type), leader and "align on", and a
 //! ruler numbered in the General unit on which a click adds a stop, dragging moves one and dragging
-//! it off the ruler deletes it. With Snap to Unit on, or Shift held, a stop placed or dragged on the
-//! ruler lands on the ruler's nearest tick.
+//! it off the ruler deletes it. A stop placed or dragged on the ruler lands on the nearest whole
+//! point. With Snap to Unit on, or Shift held, it lands on the ruler's nearest tick.
 
 use egui::{Sense, Stroke, Ui, vec2};
 use serde_json::{Value, json};
@@ -225,9 +225,10 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
             );
         }
     }
-    // Snap to Unit, or Shift held: a stop placed or dragged on the ruler lands on its nearest tick.
+    // A stop placed or dragged on the ruler lands on the nearest whole point. With Snap to Unit on,
+    // or Shift held, it lands on the ruler's nearest tick, which can be a fraction of a point.
     let snap = pstate::<bool>(ui.ctx(), "tabs-snap") || ui.input(|i| i.modifiers.shift);
-    let place = |x: f32| if snap { unit.snap_to_ruler_tick(to_pt(x), scale).max(0.0) } else { to_pt(x) };
+    let place = |x: f32| if snap { unit.snap_to_ruler_tick(to_pt(x), scale).max(0.0) } else { to_pt(x).round() };
     for (i, s) in stops.iter().enumerate() {
         let x = to_x(s.position);
         let c = if i == sel { t.accent } else { t.text };
@@ -278,7 +279,8 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
             Some(i) => set_pstate(ui.ctx(), "tabs-sel", i),
             None => {
                 let position = place(pos.x);
-                // A snapped click onto a stop's tick selects that stop and records no undo step.
+                // A click that lands on a stop's whole point or tick selects that stop and records no
+                // undo step.
                 let added = !stops.iter().any(|s| s.position == position);
                 if added {
                     stops.push(TabStop { position, align: ALIGNS[align_idx.min(3)].0, leader: String::new(), align_on: '.' });
@@ -617,15 +619,15 @@ mod tests {
         drag_on_ruler(&ctx, &mut app, 33.4, 33.4, false);
         assert_eq!(positions(&app), [15.0, 35.0]);
         assert_eq!(row(&mut app).0, "✓ Snap to Unit");
-        // Chosen again, Snap to Unit turns off and the stop stays where it is dropped.
+        // Chosen again, Snap to Unit turns off and the stop lands on the whole point nearest where it
+        // is dropped.
         let at = row(&mut app).1.center();
         let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
         menu_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(at), button(true)]);
         menu_frame(&ctx, &mut app, vec![button(false)]);
         assert_eq!(row(&mut app).0.trim_start(), "Snap to Unit");
         drag_on_ruler(&ctx, &mut app, 35.0, 23.4, false);
-        let p = positions(&app);
-        assert!((p[1] - 23.4).abs() < 1.0 && p[1] != 25.0, "{p:?}");
+        assert_eq!(positions(&app), [15.0, 23.0]);
     }
 
     /// A snapped click more than 5 px from a stop, nearest to the tick that stop is on, selects the
@@ -708,6 +710,38 @@ mod tests {
         let shown = app.session.general_unit().format(stops[0].position);
         let texts = panel_frame(&ctx, &mut app, vec![]);
         assert!(texts.iter().any(|(t, _)| *t == shown), "{shown} in {texts:?}");
+    }
+
+    /// A stop placed by a click on the ruler or dragged on it lands on the nearest whole point, and
+    /// the moved stop stays selected. A position typed in the X field keeps its hundredths of a point.
+    #[test]
+    fn the_ruler_places_and_moves_stops_on_whole_points() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.session.execute("file.new", &json!({})).unwrap();
+        app.session.execute("text.create", &json!({"x": 10, "y": 20, "text": "a	b", "area": {"width": 300, "height": 100}})).unwrap();
+        app.session.execute("text.tabs.set", &json!({"stops": [{"position": 50}]})).unwrap();
+        let ctx = egui::Context::default();
+        let positions = |app: &VectorcraftApp| current(app).unwrap().1.iter().map(|s| s.position).collect::<Vec<_>>();
+        // A click at 33.4 pt adds a stop at 33 pt and selects it.
+        drag_on_ruler(&ctx, &mut app, 33.4, 33.4, false);
+        assert_eq!(positions(&app), [33.0, 50.0]);
+        assert_eq!(pstate::<usize>(&ctx, "tabs-sel"), 0);
+        // The stop at 50 pt dragged to 13.6 pt lands on 14 pt, left of the stop at 33 pt, and stays selected.
+        drag_on_ruler(&ctx, &mut app, 50.0, 13.6, false);
+        assert_eq!(positions(&app), [14.0, 33.0]);
+        assert_eq!(pstate::<usize>(&ctx, "tabs-sel"), 0);
+        // 13.47 typed in the X field keeps its hundredths.
+        let texts = panel_frame(&ctx, &mut app, vec![]);
+        let at = texts.iter().find(|(t, _)| t == "14 pt").unwrap_or_else(|| panic!("14 pt in {texts:?}")).1.center();
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        let key = |key, modifiers| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+        panel_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(at), button(true)]);
+        panel_frame(&ctx, &mut app, vec![button(false)]);
+        panel_frame(&ctx, &mut app, vec![key(egui::Key::A, egui::Modifiers::COMMAND)]);
+        panel_frame(&ctx, &mut app, vec![egui::Event::Text("13.47".into())]);
+        panel_frame(&ctx, &mut app, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
+        assert_eq!(positions(&app), [13.47, 33.0]);
+        assert_eq!(pstate::<usize>(&ctx, "tabs-sel"), 0);
     }
 
     /// An X typed past the next stop keeps the stop selected once the stops are sorted. An X the

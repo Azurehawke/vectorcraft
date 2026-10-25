@@ -27,8 +27,11 @@ fn artboard(id: u32, x: f64) -> Artboard {
         id,
         name: format!("Artboard {id}"),
         rect: Rect::new(x, 0.0, x + 100.0, 100.0),
+        locked: false,
         show_center_mark: false,
         show_cross_hairs: false,
+        show_video_safe_areas: false,
+        video_ruler_pixel_aspect_ratio: 1.0,
         color: None,
     }
 }
@@ -99,6 +102,75 @@ fn defaults_and_json() {
         assert!(matches!(settings(bad.clone()).check(), Err(PdfError::BadSetting(_))), "{bad}");
     }
     assert_eq!(Media::A4.size().map(|(w, h)| (w.round(), h.round())), Some((595.0, 842.0)));
+}
+
+#[test]
+fn japanese_paper_sizes() {
+    // The Japanese papers: JIS B4, B5 and B6 are the sizes Japanese printing uses (JIS X 6310),
+    // a little larger than ISO's; the others are はがき, 往復はがき, 封筒 and 四六判.
+    let near = |m: Media, w: f64, h: f64| {
+        let (mw, mh) = m.size().unwrap();
+        assert!((mw - w).abs() < 0.01 && (mh - h).abs() < 0.01, "{m:?} is {mw} × {mh}, not {w} × {h}");
+    };
+    near(Media::B4Jis, 728.50, 1031.81);
+    near(Media::B5Jis, 515.91, 728.50);
+    near(Media::B6Jis, 362.83, 515.91);
+    near(Media::A6, 297.64, 419.53);
+    near(Media::JapanesePostcard, 283.46, 419.53);
+    near(Media::JapaneseDoublePostcard, 419.53, 566.93);
+    near(Media::JapaneseEnvelope3, 340.16, 666.14);
+    near(Media::JapaneseEnvelope4, 255.12, 637.80);
+    near(Media::Kaku2, 680.31, 941.10);
+    near(Media::Kaku3, 612.28, 785.20);
+    near(Media::YonrokuBan, 360.0, 532.91);
+    // The ISO B sizes keep the dimensions settings and presets saved before the Japanese papers
+    // existed: they are not the JIS sizes.
+    near(Media::B4, 708.66, 1000.63);
+    near(Media::B5, 498.90, 708.66);
+
+    // A paper is named by its JSON id or its dialog label, any case and spacing.
+    for (name, want) in [
+        ("b4 (jis)", Media::B4Jis),
+        ("B4 (JIS)", Media::B4Jis),
+        ("b4jis", Media::B4Jis),
+        ("b5", Media::B5),
+        ("B5 (ISO)", Media::B5),
+        ("b5 (jis)", Media::B5Jis),
+        ("japanese postcard", Media::JapanesePostcard),
+        ("Japanese Postcard", Media::JapanesePostcard),
+        ("Japanese Envelope #3", Media::JapaneseEnvelope3),
+        ("kaku #2", Media::Kaku2),
+        ("yonroku-ban", Media::YonrokuBan),
+    ] {
+        assert_eq!(Media::from_name(name), Some(want), "{name}");
+    }
+    assert_eq!(Media::from_name("b7"), None);
+    assert_eq!(Media::from_name("  "), None);
+    for m in Media::ALL {
+        assert_eq!(Media::from_name(m.id()), Some(*m), "id {:?}", m.id());
+        assert_eq!(Media::from_name(m.label()), Some(*m), "label {:?}", m.label());
+        assert_eq!(serde_json::to_value(m).unwrap(), json!(m.id()));
+        assert_eq!(serde_json::from_value::<Media>(json!(m.id())).unwrap(), *m);
+    }
+    assert!(serde_json::from_value::<Media>(json!("b7")).is_err(), "an unknown paper is refused");
+
+    // Every paper prints as a page of its own size, the added ones included.
+    let d = doc(50.0, 50.0, &[(Rect::new(0.0, 0.0, 50.0, 50.0), rgb(0.0, 0.0, 0.0))]);
+    for (media, w, h) in [
+        ("japanese postcard", 283.46, 419.53),
+        ("japanese double postcard", 419.53, 566.93),
+        ("B5 (JIS)", 515.91, 728.50),
+        ("kaku #2", 680.31, 941.10),
+        ("yonroku-ban", 360.0, 532.91),
+        // The ISO B sizes keep their page size.
+        ("b5", 498.90, 708.66),
+    ] {
+        let r = job(&d, json!({"media": media, "autoRotate": false}));
+        assert_eq!(r.pages, 1, "{media}");
+        let p = pages(&r.bytes);
+        assert_eq!(p.len(), 1, "{media}");
+        assert!((p[0].0.0 - w).abs() < 0.01 && (p[0].0.1 - h).abs() < 0.01, "{media}: {:?}, not {w} × {h}", p[0].0);
+    }
 }
 
 #[test]
@@ -367,6 +439,60 @@ fn turns_mirror_and_negative() {
     assert_eq!(img.over_white(300, 300), [0, 0, 0]);
     let c = img.over_white(25, 50);
     assert!(c[0] < 10 && c[1] > 245 && c[2] > 245, "{c:?}");
+}
+
+#[test]
+fn for_a_printer_landscape_pages_print_upright_turned_anticlockwise() {
+    let d = doc(100.0, 100.0, &[(Rect::new(0.0, 0.0, 50.0, 100.0), rgb(1.0, 0.0, 0.0))]);
+    let s = json!({"placement": {"origin": "topLeft"}, "autoRotate": false, "orientation": "landscape"});
+    let spooled = |v| {
+        let opts = PrintOptions { settings: settings(v), created: Some(1_791_200_000), uncompressed: true, for_printer: true, ..Default::default() };
+        pages(&print(&d, &opts).unwrap().bytes).remove(0)
+    };
+    // Saved, the page stays landscape.
+    assert_eq!(pages(&job(&d, s.clone()).bytes)[0].0, (792.0, 612.0));
+    // For a printer, Letter upright: the art's top at the paper's left edge, its left half at the bottom.
+    let p = spooled(s.clone());
+    assert_eq!(p.0, (612.0, 792.0));
+    assert!(near(p.1[0].0, Rect::new(0.0, 742.0, 100.0, 792.0)), "{:?}", p.1);
+    // A portrait page and a transverse one (already upright) don't turn.
+    let p = spooled(json!({"placement": {"origin": "topLeft"}, "autoRotate": false}));
+    assert_eq!(p.0, (612.0, 792.0));
+    assert!(near(p.1[0].0, Rect::new(0.0, 0.0, 50.0, 100.0)), "{:?}", p.1);
+    let mut t = s;
+    t["transverse"] = json!(true);
+    assert_eq!(spooled(t).0, (612.0, 792.0));
+    // Transverse in Portrait is wide on purpose: it stays wide.
+    assert_eq!(spooled(json!({"autoRotate": false, "transverse": true})).0, (792.0, 612.0));
+}
+
+#[test]
+fn for_a_printer_paper_wide_in_portrait_stays_as_it_is() {
+    // A 4 × 2 in label in Portrait: the queue's media is wide too.
+    let d = doc(288.0, 144.0, &[(Rect::new(0.0, 0.0, 144.0, 144.0), rgb(1.0, 0.0, 0.0))]);
+    let v =
+        json!({"media": "custom", "width": 288, "height": 144, "orientation": "portrait", "autoRotate": false, "placement": {"origin": "topLeft"}});
+    let opts = PrintOptions { settings: settings(v), uncompressed: true, for_printer: true, ..Default::default() };
+    let p = pages(&print(&d, &opts).unwrap().bytes).remove(0);
+    assert_eq!(p.0, (288.0, 144.0));
+    assert!(near(p.1[0].0, Rect::new(0.0, 0.0, 144.0, 144.0)), "{:?}", p.1);
+}
+
+#[test]
+fn for_a_printer_auto_rotated_artboards_all_print_upright() {
+    // A wide artboard and a tall one, the paper turned to each.
+    let mut d = doc(100.0, 100.0, &[(Rect::new(0.0, 0.0, 10.0, 10.0), rgb(1.0, 0.0, 0.0))]);
+    let mut wide = artboard(1, 0.0);
+    wide.rect = Rect::new(0.0, 0.0, 300.0, 100.0);
+    let mut tall = artboard(2, 400.0);
+    tall.rect = Rect::new(400.0, 0.0, 500.0, 300.0);
+    d.artboards = vec![wide, tall];
+    let set = settings(json!({"autoRotate": true}));
+    let saved = print(&d, &PrintOptions { settings: set.clone(), ..Default::default() }).unwrap();
+    let sizes = |bytes: &[u8]| pages(bytes).into_iter().map(|p| p.0).collect::<Vec<_>>();
+    assert_eq!(sizes(&saved.bytes), [(792.0, 612.0), (612.0, 792.0)]);
+    let spooled = print(&d, &PrintOptions { settings: set, for_printer: true, ..Default::default() }).unwrap();
+    assert_eq!(sizes(&spooled.bytes), [(612.0, 792.0), (612.0, 792.0)]);
 }
 
 #[test]

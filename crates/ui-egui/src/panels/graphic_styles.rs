@@ -171,7 +171,7 @@ fn render(app: &VectorcraftApp, paints: Paints, g: &GraphicStyle, preview: Previ
     let layer = doc.layers[0].id;
     doc.insert(Some(layer), 0, app.session.styled(&shape, g)).ok()?;
     let img = RENDERER.with(|r| r.borrow_mut().render_region(&doc, vectorcraft_geom::Rect::new(0.0, 0.0, SIDE, SIDE), px as f64 / SIDE, true));
-    Some(egui::ColorImage::from_rgba_premultiplied([img.width as usize, img.height as usize], &img.pixels))
+    Some(crate::canvas::color_image(&img))
 }
 
 /// The thumbnail of style `g` (`look`: its [`look_hash`]) at `size` points.
@@ -213,7 +213,7 @@ fn paint_thumb(app: &VectorcraftApp, ui: &Ui, r: Rect, paints: Paints, g: &Graph
 }
 
 /// Outline thumbnail `r`: in the accent colour when selected (`on`), brighter when hovered.
-fn outline(ui: &Ui, r: Rect, on: bool, hovered: bool) {
+pub(super) fn outline(ui: &Ui, r: Rect, on: bool, hovered: bool) {
     let t = Tokens::get(ui.ctx());
     let color = if on {
         t.accent
@@ -239,7 +239,7 @@ fn object_preview(app: &VectorcraftApp, ctx: &egui::Context, g: &GraphicStyle, l
     }
     let styled = app.session.styled(n, g);
     let img = RENDERER.with(|r| r.borrow_mut().render_node_thumbnail(&st.doc, &styled, px, Some([255; 4])))?;
-    let color = egui::ColorImage::from_rgba_premultiplied([img.width as usize, img.height as usize], &img.pixels);
+    let color = crate::canvas::color_image(&img);
     let tex = ctx.load_texture("gs-large-object", color, egui::TextureOptions::LINEAR);
     ctx.data_mut(|d| d.insert_temp(slot, (key, tex.clone())));
     Some(tex)
@@ -353,6 +353,7 @@ fn zone_input(ui: &Ui, zone: &Response, d: &Document, ev: &mut Events) {
         PanelDrag::Appearance(id) => (None, Some(*id)),
         PanelDrag::Paint { .. }
         | PanelDrag::Symbol(_)
+        | PanelDrag::LibrarySymbol { .. }
         | PanelDrag::Brush { .. }
         | PanelDrag::LibraryGraphic { .. }
         | PanelDrag::LibraryItem { .. }
@@ -767,7 +768,7 @@ pub(crate) fn load_library(app: &mut VectorcraftApp, params: Value) -> Result<Va
 
 /// Other Library…: load the library (or document) at `path`, else one picked in an open dialog.
 pub(crate) fn other_library(app: &mut VectorcraftApp, path: Option<String>) -> Result<Value, String> {
-    match library_panel::pick_library_file(app, path)? {
+    match library_panel::pick_library_file(app, path, library_panel::library_pick_filters(GraphicStyleLibraries::KIND))? {
         Some(path) => load_library(app, json!({ "path": path })),
         None => Ok(Value::Null),
     }

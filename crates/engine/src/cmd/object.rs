@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use vectorcraft_color::{BlendMode, Paint};
-use vectorcraft_doc::corners::set_corners;
+use vectorcraft_doc::corners::{convert_radii_relative, set_corners};
 use vectorcraft_doc::{Appearance, Document, Knockout, LiveCorners, LiveShape, Node, NodeId, NodeKind, OrientedBox, Scaling};
 use vectorcraft_geom::shapes::CornerKind;
 use vectorcraft_geom::{Affine, FillRule, PathData, Point, Rect, Vec2};
@@ -87,7 +87,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Nudge",
             [],
             None,
-            "{dx: -1|0|1, dy: -1|0|1, big?: bool (×10), copy?: bool, patterns?: bool (Transform Patterns: pattern fills and strokes transform with the objects that move whole; default: prefs transformPatternTiles), typeAreas?: bool (area type: the frame is reshaped and the text reflows at its size), objects?: bool (Transform Objects, as object.move)} arrow-key nudge by the keyboard increment (the selected anchors, else objects, else ruler guides)",
+            "{dx: -1|0|1, dy: -1|0|1, big?: bool (×10), copy?: bool, patterns?: bool (Transform Patterns: pattern fills and strokes transform with the objects that move whole; default: prefs transformPatternTiles), typeAreas?: bool (area type: the frame is reshaped and the text reflows at its size), objects?: bool (Transform Objects, as object.move)} arrow-key nudge by the keyboard increment (the selected anchors, else objects, along the x and y axes turned by the constrainAngle preference; else ruler guides, along the page axes)",
             has_selection_or_guides,
             nudge
         ),
@@ -252,8 +252,8 @@ pub fn specs() -> Vec<CommandSpec> {
             "Align",
             ["Window", "Align"],
             None,
-            "{horizontal?: \"left\"|\"center\"|\"right\", vertical?: \"top\"|\"center\"|\"bottom\", to?: \"selection\"|\"artboard\"|\"key\" (default: the key object when the selection has one, select.key, else the selection; a key guide, select.key {guide}, stays put and the objects line up on its line: a vertical guide sets where left, center and right go and vertical alignment leaves them, a horizontal one the other way round; aligning to the key, the other selected ruler guides move too: a vertical guide to the key's left edge, center or right edge, a horizontal one to its top, center or bottom), artboard?: index (0-based; with to: \"artboard\", the artboard to align to; the app passes the active one; default: the artboard under the center of the selection, else the first), bounds?: \"preview\"|\"geometric\" (default: the Use Preview Bounds preference; preview bounds take in strokes), patterns?: bool (Transform Patterns: pattern fills and strokes transform with the art; default: prefs transformPatternTiles)} With anchor points selected (Direct Selection), the points align instead: to their own bounds, or to the artboard (#1180)",
-            has_selection,
+            "{horizontal?: \"left\"|\"center\"|\"right\", vertical?: \"top\"|\"center\"|\"bottom\", to?: \"selection\"|\"artboard\"|\"key\" (default: the key object when the selection has one, select.key, else the selection; a key guide, select.key {guide}, stays put and the objects line up on its line: a vertical guide sets where left, center and right go and vertical alignment leaves them, a horizontal one the other way round; aligning to the key, the other selected ruler guides move too: a vertical guide to the key's left edge, center or right edge, a horizontal one to its top, center or bottom; aligning to the artboard moves selected guides to its edges too (#3463), and with only guides selected aligning to the selection moves them to their collective bounds), artboard?: index (0-based; with to: \"artboard\", the artboard to align to; the app passes the active one; default: the artboard under the center of the selection, else the first), bounds?: \"preview\"|\"geometric\" (default: the Use Preview Bounds preference; preview bounds take in strokes), patterns?: bool (Transform Patterns: pattern fills and strokes transform with the art; default: prefs transformPatternTiles)} With anchor points selected (Direct Selection), the points align instead: to their own bounds, or to the artboard (#1180)",
+            has_selection_or_guides,
             align
         ),
         cmd!(
@@ -279,7 +279,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set Bounds",
             [],
             None,
-            "{x?, y?, width?, height?, reference?: 0..8 (9-point grid), proportional?, strokes?, corners?, copy?: bool, patterns?: bool (Transform Patterns), typeAreas?: bool (area type: the frame is reshaped and the text reflows at its size), objects?: bool (Transform Objects, as object.move)} (Transform panel; width/height and the reference point follow the bounding box, rotated with rotated objects; x, y are page coordinates; with Use Preview Bounds the values measure the visual bounds; strokes/corners as object.scale; with anchor points selected (Direct Selection) and no copy, the values are the box around those points, square to the page, and only they move or scale, as with object.move (#1824))",
+            "{x?, y?, width?, height?, reference?: 0..8 (9-point grid; a number past 8 is read as 8), proportional?, strokes?, corners?, copy?: bool, patterns?: bool (Transform Patterns), typeAreas?: bool (area type: the frame is reshaped and the text reflows at its size), objects?: bool (Transform Objects, as object.move)} (Transform panel; width/height and the reference point follow the bounding box, rotated with rotated objects; x, y are page coordinates; with Use Preview Bounds the values measure the visual bounds; strokes/corners as object.scale; with anchor points selected (Direct Selection) and no copy, the values are the box around those points, square to the page, and only they move or scale, as with object.move (#1824))",
             has_selection,
             set_bounds
         ),
@@ -289,7 +289,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Live Shape Properties",
             [],
             None,
-            "{id?, ids?, radius?: pt, kind?: \"round\"|\"invertedRound\"|\"chamfer\", corners?: [i…], items?: [{id, corners?: [i…]}] (several objects, each with its own corners, in place of ids and corners: the canvas's corner widgets across a selection), sides?: n, polygonAngle?: degrees (counterclockwise from its first vertex straight up), polygonRadius?: pt (centre to vertex), sideLength?: pt (sets the radius), makeSidesEqual?: true (a polygon scaled unevenly: drops the uneven scale and shear, keeping its centre, angle and mean radius), pieStart?, pieEnd?: degrees (an ellipse's pie, counterclockwise from 3 o'clock; 0 to 360 is the whole ellipse), invertPie?: true (swaps them: the other part of the ellipse)} (Live Corners on any path: radius and kind set its corners (anchors that aren't smooth, where two sides, straight or curved (#1144), meet at an angle): `corners` (anchor indices of the path with its corners uncut, counting every subpath's anchors in order: a rectangle's 0 top-left, 1 top-right, 2 bottom-right, 3 bottom-left; a polygon's from the first vertex clockwise), else the corners with a Direct-Selected anchor, else every corner; each radius is drawn no larger than half the corner's shorter side allows; a path that isn't a live shape keeps its uncut outline so its corners stay editable, and is plain again once none is cut; sides: a polygon's, which keep the radius they shared; the polygon params apply in that order: sides, makeSidesEqual, polygonAngle, then sideLength or else polygonRadius)",
+            "{id?, ids?, radius?: pt (or % of each corner's maximum when `relativeRadii` is true), kind?: \"round\"|\"invertedRound\"|\"chamfer\", relativeRadii?: bool (Relative rounding, as in the reference app: store radii as fractions of each corner's maximum so they scale with the shape), corners?: [i…], items?: [{id, corners?: [i…]}] (several objects, each with its own corners, in place of ids and corners: the canvas's corner widgets across a selection), sides?: n, polygonAngle?: degrees (counterclockwise from its first vertex straight up), polygonRadius?: pt (centre to vertex), sideLength?: pt (sets the radius), makeSidesEqual?: true (a polygon scaled unevenly: drops the uneven scale and shear, keeping its centre, angle and mean radius), pieStart?, pieEnd?: degrees (an ellipse's pie, counterclockwise from 3 o'clock; 0 to 360 is the whole ellipse), invertPie?: true (swaps them: the other part of the ellipse)} (Live Corners on any path: radius and kind set its corners (anchors that aren't smooth, where two sides, straight or curved (#1144), meet at an angle): `corners` (anchor indices of the path with its corners uncut, counting every subpath's anchors in order: a rectangle's 0 top-left, 1 top-right, 2 bottom-right, 3 bottom-left; a polygon's from the first vertex clockwise), else the corners with a Direct-Selected anchor, else every corner; each radius is drawn no larger than half the corner's shorter side allows; a path that isn't a live shape keeps its uncut outline so its corners stay editable, and is plain again once none is cut; sides: a polygon's, which keep the radius they shared; the polygon params apply in that order: sides, makeSidesEqual, polygonAngle, then sideLength or else polygonRadius)",
             has_selection,
             set_live_shape
         ),
@@ -356,6 +356,11 @@ pub(crate) fn transforms_objects(p: &Value) -> bool {
     bool_or(p, "objects", true)
 }
 
+/// The on/off params of the transform commands that [`apply_transform`], [`scaling`],
+/// [`transform_patterns`] and [`transforms_objects`] read. The transform commands in this file
+/// check them with [`check_switches`] before they change anything.
+const TRANSFORM_SWITCHES: [&str; 6] = ["copy", "strokes", "corners", "patterns", "objects", "typeAreas"];
+
 /// `xf` on `n` with Transform Objects (`objects`, see [`transforms_objects`]) on or off.
 pub(crate) fn transform_node(n: &mut Node, xf: Affine, sc: Scaling, objects: bool) {
     if objects {
@@ -375,6 +380,21 @@ pub(crate) fn transform_node(n: &mut Node, xf: Affine, sc: Scaling, objects: boo
 /// `anchors` (`ids` being the selection): with anchors selected with Direct Selection and no
 /// copy, only those anchors transform, their handles with them, and the objects selected whole.
 pub(crate) fn apply_transform(s: &mut Session, label: &str, ids: Vec<NodeId>, xf: Affine, p: &Value, anchors: bool) -> Result<Value> {
+    apply_transform_moving_guides(s, label, ids, xf, p, anchors, None)
+}
+
+/// [`apply_transform`], with the selected ruler guides moved by `guides` instead of by the
+/// translation `xf` when given (a nudge along a turned Constrain Angle moves the art along it and
+/// the guides along the page's axes).
+fn apply_transform_moving_guides(
+    s: &mut Session,
+    label: &str,
+    ids: Vec<NodeId>,
+    xf: Affine,
+    p: &Value,
+    anchors: bool,
+    guides: Option<Vec2>,
+) -> Result<Value> {
     let copy = bool_or(p, "copy", false);
     let areas = bool_or(p, "typeAreas", false);
     let objects = transforms_objects(p);
@@ -382,7 +402,7 @@ pub(crate) fn apply_transform(s: &mut Session, label: &str, ids: Vec<NodeId>, xf
     sc.patterns = transform_patterns(s, p, &ids)?;
     let c = xf.as_coeffs();
     let is_translation = (c[0] - 1.0).abs() < 1e-9 && c[1].abs() < 1e-9 && c[2].abs() < 1e-9 && (c[3] - 1.0).abs() < 1e-9;
-    let delta = Vec2::new(c[4], c[5]);
+    let delta = guides.unwrap_or(Vec2::new(c[4], c[5]));
     let with_guides = objects && ids_param(p, "ids").is_none() && is_translation;
     let has_guides = with_guides && !s.doc()?.selection.guides.is_empty();
     // A transform of ids that name no object, or an identity transform without a copy, moves
@@ -505,6 +525,8 @@ fn resize_type_area(n: &mut Node, xf: Affine) -> bool {
 }
 
 fn transform(s: &mut Session, p: &Value) -> Result<Value> {
+    check_switches(p, &TRANSFORM_SWITCHES, "object.transform")?;
+    check_switches(p, &["anchors"], "object.transform")?;
     let m = matrix_param(p, "matrix").ok_or_else(|| bad("object.transform", "missing matrix [a,b,c,d,e,f]"))?;
     let (ids, anchors) = match ids_param(p, "ids") {
         Some(v) => (outermost(&s.doc()?.doc, v), false),
@@ -515,15 +537,32 @@ fn transform(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn move_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     check_numbers(p, &["dx", "dy"], "object.move")?;
+    check_switches(p, &TRANSFORM_SWITCHES, "object.move")?;
     let ids = selected_roots_to_transform(s)?;
     apply_transform(s, "Move", ids, Affine::translate((f64_or(p, "dx", 0.0), f64_or(p, "dy", 0.0))), p, true)
 }
 
+/// The arrow keys' step `(dx, dy)` (page axes, y down) along the x and y axes turned by General ›
+/// Constrain Angle (`deg`, counter-clockwise on the page): with 30°, → moves 30° up from the
+/// horizontal, as the reference app's arrow keys follow the constrain angle (users set it to −90°
+/// to nudge along a view rotated by 90°:
+/// <https://community.adobe.com/t5/illustrator-discussions/arrow-keys-and-ruler-guides-not-adjusted-when-using-rotate-view/m-p/12489564>).
+pub(crate) fn along_constrain_angle(dx: f64, dy: f64, deg: f64) -> (f64, f64) {
+    // Whole turns are the page's axes, exactly; quarter turns are exact too.
+    let Some(axes) = vectorcraft_geom::constrain_axes(deg) else { return (dx, dy) };
+    let v = axes * Point::new(dx, dy);
+    (v.x, v.y)
+}
+
 fn nudge(s: &mut Session, p: &Value) -> Result<Value> {
     check_numbers(p, &["dx", "dy"], "object.nudge")?;
+    check_switches(p, &TRANSFORM_SWITCHES, "object.nudge")?;
+    check_switches(p, &["big"], "object.nudge")?;
     let k = s.prefs.keyboard_increment * if bool_or(p, "big", false) { 10.0 } else { 1.0 };
-    let dx = f64_or(p, "dx", 0.0) * k;
-    let dy = f64_or(p, "dy", 0.0) * k;
+    let (dx, dy) = (f64_or(p, "dx", 0.0) * k, f64_or(p, "dy", 0.0) * k);
+    // Guides keep to the page's axes; art and anchors move along the constrain angle's.
+    let (gx, gy) = (dx, dy);
+    let (dx, dy) = along_constrain_angle(dx, dy, s.prefs.constrain_angle);
     if !s.doc()?.selection.anchors.is_empty() {
         // When the anchors move by 0, the document and its undo history stay as they are.
         if dx == 0.0 && dy == 0.0 {
@@ -534,13 +573,13 @@ fn nudge(s: &mut Session, p: &Value) -> Result<Value> {
     if s.doc()?.selection.is_empty() {
         let copy = bool_or(p, "copy", false);
         // When guides move by 0 without a copy, the document and its undo history stay as they are.
-        if dx == 0.0 && dy == 0.0 && !copy {
+        if gx == 0.0 && gy == 0.0 && !copy {
             return ok();
         }
-        return super::docmenu::guide_move(s, &json!({ "dx": dx, "dy": dy, "copy": copy }));
+        return super::docmenu::guide_move(s, &json!({ "dx": gx, "dy": gy, "copy": copy }));
     }
     let ids = selected_roots_to_transform(s)?;
-    apply_transform(s, "Move", ids, Affine::translate((dx, dy)), p, true)
+    apply_transform_moving_guides(s, "Move", ids, Affine::translate((dx, dy)), p, true, Some(Vec2::new(gx, gy)))
 }
 
 fn about(o: Point, a: Affine) -> Affine {
@@ -549,6 +588,8 @@ fn about(o: Point, a: Affine) -> Affine {
 
 fn rotate(s: &mut Session, p: &Value) -> Result<Value> {
     check_numbers(p, &["angle"], "object.rotate")?;
+    check_switches(p, &TRANSFORM_SWITCHES, "object.rotate")?;
+    check_switches(p, &["absolute"], "object.rotate")?;
     let ids = selected_roots_to_transform(s)?;
     let o = origin_of(s, p, &ids)?;
     let mut angle = f64_or(p, "angle", 0.0);
@@ -562,6 +603,7 @@ fn rotate(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn scale(s: &mut Session, p: &Value) -> Result<Value> {
     check_numbers(p, &["sy"], "object.scale")?;
+    check_switches(p, &TRANSFORM_SWITCHES, "object.scale")?;
     let ids = selected_roots_to_transform(s)?;
     let o = origin_of(s, p, &ids)?;
     let sx = f64_req(p, "sx", "object.scale")? / 100.0;
@@ -573,6 +615,7 @@ fn scale(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn reflect(s: &mut Session, p: &Value) -> Result<Value> {
+    check_switches(p, &TRANSFORM_SWITCHES, "object.reflect")?;
     let ids = selected_roots_to_transform(s)?;
     let o = origin_of(s, p, &ids)?;
     let m = match p.get("axis") {
@@ -593,6 +636,7 @@ fn reflect(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn shear(s: &mut Session, p: &Value) -> Result<Value> {
     check_numbers(p, &["angle"], "object.shear")?;
+    check_switches(p, &TRANSFORM_SWITCHES, "object.shear")?;
     let ids = selected_roots_to_transform(s)?;
     let o = origin_of(s, p, &ids)?;
     let t = f64_or(p, "angle", 0.0).clamp(-89.0, 89.0).to_radians().tan();
@@ -605,6 +649,7 @@ fn shear(s: &mut Session, p: &Value) -> Result<Value> {
 /// that `p` sets to true or false (a recorded Transform Again's) takes precedence. A Transform
 /// Each is repeated by running it again (its transform is per object, about each one's bounds).
 fn transform_again(s: &mut Session, p: &Value) -> Result<Value> {
+    check_switches(p, &TRANSFORM_SWITCHES, "object.transformAgain")?;
     if let Some(again) = s.doc()?.last_perspective.clone() {
         return super::distortcmds::transform_again(s, &again);
     }
@@ -1087,21 +1132,23 @@ fn isolate(s: &mut Session, p: &Value) -> Result<Value> {
     }
     st.isolation = Some(isolation);
     st.selection.clear();
+    // New art on a locked artboard, now deselected, is protected.
+    st.sync_new_art();
     st.revision += 1;
     ok()
 }
 
 fn exit_isolation(s: &mut Session, _: &Value) -> Result<Value> {
-    let guides_locked = s.menu.guides_locked;
+    let menu = s.menu.clone();
     let st = s.doc_mut()?;
     if let Some(i) = st.isolation.take() {
         super::distortcmds::finish_edit_text(st, i);
         let target = st.doc.parent_of(i).filter(|p| st.doc.node(*p).is_some_and(|n| n.extras().shaper.is_some())).unwrap_or(i);
         st.selection.set([target]);
         // A guide path isolated while Lock Guides is on isn't selected (#1534).
-        if guides_locked {
-            crate::deselect_guides(&st.doc, &mut st.selection);
-        }
+        crate::deselect_hidden(&menu, &st.doc, &mut st.selection);
+        // The art on a locked artboard can't be selected.
+        st.protect_locked_artboards(&[], &Default::default(), None);
     }
     st.revision += 1;
     ok()
@@ -1134,6 +1181,8 @@ fn data_param(m: &serde_json::Map<String, Value>) -> Result<Vec<(String, Option<
 }
 
 fn set_props(s: &mut Session, p: &Value) -> Result<Value> {
+    check_switches(p, &["visible", "locked", "isolate", "knockoutShape"], "object.setProps")?;
+    check_numbers(p, &["opacity"], "object.setProps")?;
     let ids = targets(s, p)?;
     let opacity = p.get("opacity").and_then(Value::as_f64).map(percent);
     let blend = match str_param(p, "blend") {
@@ -1254,9 +1303,9 @@ fn preview_bounds(s: &Session, p: &Value, cmd: &str) -> Result<bool> {
     }
 }
 
-/// Param `key` of the Align commands and Shear: one of `values`, or `None` when it is missing or
-/// null. Any other value is an error that lists `values`.
-fn choice<'a>(p: &'a Value, cmd: &str, key: &str, values: &[&str]) -> Result<Option<&'a str>> {
+/// Param `key` of the Align commands, Shear and `text.setFormat`'s lists: one of `values`, or
+/// `None` when it is missing or null. Any other value is an error that lists `values`.
+pub(crate) fn choice<'a>(p: &'a Value, cmd: &str, key: &str, values: &[&str]) -> Result<Option<&'a str>> {
     let Some(v) = p.get(key).filter(|v| !v.is_null()) else { return Ok(None) };
     match v.as_str() {
         Some(s) if values.contains(&s) => Ok(Some(s)),
@@ -1340,11 +1389,22 @@ fn align_reference(s: &Session, p: &Value, ids: &[NodeId], preview: bool, own: O
     Ok((r, true, true))
 }
 
+/// Bounds of the selected ruler guides (each guide is a zero-thickness line), for Align to
+/// Selection when no objects are selected.
+fn selected_guides_bounds(st: &crate::DocState) -> Option<Rect> {
+    st.selection.guides.iter().filter_map(|&i| st.doc.guides.get(i)).fold(None, |acc: Option<Rect>, g| {
+        let r = if g.vertical { Rect::new(g.pos, 0.0, g.pos, 0.0) } else { Rect::new(0.0, g.pos, 0.0, g.pos) };
+        Some(acc.map(|a| a.union(r)).unwrap_or(r))
+    })
+}
+
 fn reference_rect(s: &Session, p: &Value, ids: &[NodeId], preview: bool) -> Result<Rect> {
     let st = s.doc()?;
     match align_to(s, p) {
         Some("artboard") => {
-            let b = effects::preview::bounds_of(&st.doc, ids, preview).unwrap_or_default();
+            let b = effects::preview::bounds_of(&st.doc, ids, preview)
+                .or_else(|| ids.is_empty().then(|| selected_guides_bounds(st)).flatten())
+                .unwrap_or_default();
             // Align to Artboard uses artboard `artboard` (the app passes the active one). Without
             // it, or with an index the document doesn't have, it uses the artboard under the center
             // of the selection, or the first one when no artboard is there.
@@ -1356,7 +1416,13 @@ fn reference_rect(s: &Session, p: &Value, ids: &[NodeId], preview: bool) -> Resu
             let k = st.selection.key.ok_or_else(|| EngineError::Other("no key object".into()))?;
             effects::preview::bounds_of(&st.doc, &[k], preview).ok_or(EngineError::NoNode(k))
         }
-        _ => effects::preview::bounds_of(&st.doc, ids, preview).ok_or_else(|| EngineError::Other("nothing to align".into())),
+        _ => {
+            if ids.is_empty() {
+                selected_guides_bounds(st).ok_or_else(|| EngineError::Other("nothing to align".into()))
+            } else {
+                effects::preview::bounds_of(&st.doc, ids, preview).ok_or_else(|| EngineError::Other("nothing to align".into()))
+            }
+        }
     }
 }
 
@@ -1385,6 +1451,8 @@ fn align(s: &mut Session, p: &Value) -> Result<Value> {
     let preview = preview_bounds(s, p, "object.align")?;
     let (h, v) = direction(p, "object.align")?;
     choice(p, "object.align", "to", &["selection", "artboard", "key"])?;
+    check_switches(p, &["patterns"], "object.align")?;
+    check_numbers(p, &["artboard"], "object.align")?;
     if h.is_none() && v.is_none() {
         return Err(bad("object.align", "give horizontal or vertical"));
     }
@@ -1421,15 +1489,22 @@ fn align(s: &mut Session, p: &Value) -> Result<Value> {
     apply_moves(s, "Align", p, &ids, &moves, &guides)
 }
 
-/// The selected ruler guides that Align to the key object (or key guide) moves, and where: a
-/// vertical guide goes to the left edge, centre or right edge of `r` that `h` names, a horizontal
-/// one to the top, centre or bottom that `v` names. The key guide stays put, and so do guides
-/// when aligning to the selection or the artboard.
+/// The selected ruler guides that Align moves, and where: a vertical guide goes to the left edge,
+/// centre or right edge of `r` that `h` names, a horizontal one to the top, centre or bottom that
+/// `v` names. Align to the key object (or key guide) moves them too, and the key guide stays put.
+/// Align to the artboard moves them (#3463). Align to the selection moves them when only guides are
+/// selected; with objects in the selection they stay put.
 fn guide_moves(s: &Session, p: &Value, r: Rect, h: Option<&str>, v: Option<&str>) -> Result<Vec<(usize, f64)>> {
-    if align_to(s, p) != Some("key") {
+    let st = s.doc()?;
+    let to = align_to(s, p);
+    let move_guides = match to {
+        Some("key" | "artboard") => true,
+        Some("selection") => st.selection.is_empty(),
+        _ => false,
+    };
+    if !move_guides {
         return Ok(vec![]);
     }
-    let st = s.doc()?;
     let at = |vertical: bool| match (vertical, h, v) {
         (true, Some("left"), _) => Some(r.x0),
         (true, Some("center"), _) => Some(r.center().x),
@@ -1439,11 +1514,12 @@ fn guide_moves(s: &Session, p: &Value, r: Rect, h: Option<&str>, v: Option<&str>
         (false, _, Some("bottom")) => Some(r.y1),
         _ => None,
     };
+    let skip_key = to == Some("key");
     Ok(st
         .selection
         .guides
         .iter()
-        .filter(|&&i| Some(i) != st.selection.key_guide)
+        .filter(|&&i| !skip_key || Some(i) != st.selection.key_guide)
         .filter_map(|&i| Some((i, at(st.doc.guides.get(i)?.vertical)?)))
         .collect())
 }
@@ -1603,6 +1679,8 @@ fn distribute_anchors(s: &mut Session, label: &str, horiz: bool, gap: Option<f64
 }
 
 fn distribute(s: &mut Session, p: &Value) -> Result<Value> {
+    check_switches(p, &["patterns"], "object.distribute")?;
+    check_numbers(p, &["artboard"], "object.distribute")?;
     let ids = selected_roots(s)?;
     let preview = preview_bounds(s, p, "object.distribute")?;
     let board = distribute_to(s, p, &ids, preview, "object.distribute")?;
@@ -1676,6 +1754,8 @@ fn distribute(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn distribute_spacing(s: &mut Session, p: &Value) -> Result<Value> {
+    check_switches(p, &["patterns"], "object.distributeSpacing")?;
+    check_numbers(p, &["artboard"], "object.distributeSpacing")?;
     let ids = selected_roots(s)?;
     let horiz = choice(p, "object.distributeSpacing", "axis", &["horizontal", "vertical"])? != Some("vertical");
     let preview = preview_bounds(s, p, "object.distributeSpacing")?;
@@ -1762,8 +1842,10 @@ pub(crate) fn bounds_rewrite(s: &Session, cmd: &str, params: &Value) -> Option<(
 /// How `object.setBounds` with params `p` changes the objects `ids`. A scale that would leave the
 /// art with a width or height below `least` of the one it has keeps `least` of it.
 fn bounds_transform(s: &Session, p: &Value, ids: Vec<NodeId>, least: f64) -> Result<Bounds> {
-    check_numbers(p, &["x", "y", "width", "height"], "object.setBounds")?;
+    check_numbers(p, &["x", "y", "width", "height", "reference"], "object.setBounds")?;
     let st = s.doc()?;
+    check_switches(p, &TRANSFORM_SWITCHES, "object.setBounds")?;
+    check_switches(p, &["proportional"], "object.setBounds")?;
     if transforms_objects(p)
         && !bool_or(p, "copy", false)
         && let Some(b) = effects::preview::anchor_bounds(&st.selection, &st.doc, s.prefs.use_preview_bounds)
@@ -1787,7 +1869,7 @@ fn bounds_transform(s: &Session, p: &Value, ids: Vec<NodeId>, least: f64) -> Res
     let margins = |b: Rect| [g.x0 - b.x0, g.y0 - b.y0, b.x1 - g.x1, b.y1 - g.y1];
     let (m, all) = (margins(vs), margins(v));
     let fixed = [all[0] - m[0], all[1] - m[1], all[2] - m[2], all[3] - m[3]];
-    let refi = p.get("reference").and_then(Value::as_u64).unwrap_or(4) as usize;
+    let refi = p.get("reference").and_then(Value::as_u64).unwrap_or(4).min(8) as usize;
     let rp = vectorcraft_geom::reference_point(v, refi);
     let (w, h) = wanted_size(p, v);
     // The geometric scale that gives the visual size: margins grow by the strokes' scale `f`. It is
@@ -1950,7 +2032,7 @@ fn wanted_size(p: &Value, b: Rect) -> (f64, f64) {
 /// `b`, the box around the anchors (and the objects selected whole) square to the page, and only
 /// the anchors, their handles with them, and those objects move or scale.
 fn set_anchor_bounds(s: &mut Session, p: &Value, ids: Vec<NodeId>, b: Rect) -> Result<Value> {
-    let refi = p.get("reference").and_then(Value::as_u64).unwrap_or(4) as usize;
+    let refi = p.get("reference").and_then(Value::as_u64).unwrap_or(4).min(8) as usize;
     let rp = vectorcraft_geom::reference_point(b, refi);
     let (w, h) = wanted_size(p, b);
     // A single anchor, or anchors in a line, have no size to scale on that side.
@@ -2295,6 +2377,8 @@ fn corners_param(p: &Value) -> Result<Option<BTreeSet<usize>>> {
 }
 
 fn set_live_shape(s: &mut Session, p: &Value) -> Result<Value> {
+    check_switches(p, &["invertPie", "makeSidesEqual", "relativeRadii"], "object.setLiveShape")?;
+    check_numbers(p, &["radius", "sides"], "object.setLiveShape")?;
     // `items`: objects each with its own `corners`; else `ids` (or the selection) sharing them.
     let items = match p.get("items").filter(|v| !v.is_null()) {
         None => None,
@@ -2330,6 +2414,7 @@ fn set_live_shape(s: &mut Session, p: &Value) -> Result<Value> {
         })
         .transpose()?;
     let radius = p.get("radius").and_then(Value::as_f64);
+    let relative_radii = p.get("relativeRadii").and_then(Value::as_bool);
     let sides = p.get("sides").and_then(Value::as_u64);
     // A number that must be `what` (None when absent).
     let number = |k: &str, ok: fn(f64) -> bool, what: &str| -> Result<Option<f64>> {
@@ -2374,6 +2459,9 @@ fn set_live_shape(s: &mut Session, p: &Value) -> Result<Value> {
             Some(LiveShape::Ellipse { pie, .. }) if pie_of(*pie) != *pie => return false,
             _ => {}
         }
+        if relative_radii.is_some_and(|on| live.as_deref().map(|l| l.radii_relative()) != Some(on)) {
+            return false;
+        }
         if radius.is_none() && kind.is_none() {
             return true;
         }
@@ -2382,9 +2470,11 @@ fn set_live_shape(s: &mut Session, p: &Value) -> Result<Value> {
         // Setting corners folds a scale left in a rectangle's transform into its size, which
         // changes it.
         live.as_deref().is_none_or(|l| l.folded() == *l)
-            && picked
-                .iter()
-                .all(|k| *k < c.base.anchor_count() && radius.is_none_or(|r| c.radius(*k) == r.max(0.0)) && kind.is_none_or(|kd| c.kind(*k) == kd))
+            && picked.iter().all(|k| {
+                *k < c.base.anchor_count()
+                    && radius.is_none_or(|r| (c.drawn_radius(*k) - r.max(0.0)).abs() < 1e-9)
+                    && kind.is_none_or(|kd| c.kind(*k) == kd)
+            })
     };
     if ids.iter().all(has_values) {
         return ok();
@@ -2416,6 +2506,12 @@ fn set_live_shape(s: &mut Session, p: &Value) -> Result<Value> {
                 if let LiveShape::Ellipse { pie, .. } = l {
                     *pie = pie_of(*pie);
                 }
+                *path = l.to_path();
+            }
+            if let Some(on) = relative_radii
+                && let Some(l) = live.as_deref_mut()
+            {
+                convert_radii_relative(l, on);
                 *path = l.to_path();
             }
             if radius.is_none() && kind.is_none() {

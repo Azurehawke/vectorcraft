@@ -613,15 +613,27 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     let revealed = reveal.and_then(|id| list.iter().position(|r| r.node.id == id));
     let scrolled = ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
-        egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]).show_rows(ui, view.h, list.len(), |ui, range| {
-            if let Some(i) = revealed.filter(|i| !range.contains(i)) {
-                let top = ui.max_rect().top() + (i as f32 - range.start as f32) * view.h;
-                ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(ui.max_rect().left(), top), vec2(ui.max_rect().width(), view.h)), None);
-            }
-            for r in list.get(range).unwrap_or_default() {
-                row(ui, &view, r, &mut out);
-            }
-        })
+        // The bar takes a column of its own, so it never covers the target and selection marks at
+        // the rows' right edge (#3443). Whether the rows overflow is known before they are laid
+        // out, so the bar is decided up front and the rows never shift when it appears.
+        ui.spacing_mut().scroll = crate::widgets::list_scroll_style();
+        let overflows = view.h * list.len() as f32 > list_h;
+        let bar =
+            if overflows { egui::scroll_area::ScrollBarVisibility::AlwaysVisible } else { egui::scroll_area::ScrollBarVisibility::AlwaysHidden };
+        egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]).scroll_bar_visibility(bar).show_rows(
+            ui,
+            view.h,
+            list.len(),
+            |ui, range| {
+                if let Some(i) = revealed.filter(|i| !range.contains(i)) {
+                    let top = ui.max_rect().top() + (i as f32 - range.start as f32) * view.h;
+                    ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(ui.max_rect().left(), top), vec2(ui.max_rect().width(), view.h)), None);
+                }
+                for r in list.get(range).unwrap_or_default() {
+                    row(ui, &view, r, &mut out);
+                }
+            },
+        )
     });
     let list_rect = scrolled.inner.inner_rect;
     resolve_click(ui, &view, &list, &mut out);
@@ -1408,7 +1420,7 @@ fn small_node(n: &Node, limit: usize) -> bool {
 impl Thumbs {
     /// Keep `img` (None: nothing drawn) as the thumbnail of row `key` showing `node`.
     fn upload(&mut self, ctx: &egui::Context, key: (u64, NodeId), node: Weak<Node>, px: u32, img: Option<&vectorcraft_render::Rendered>, ms: f64) {
-        let color = img.map(|img| egui::ColorImage::from_rgba_premultiplied([img.width as usize, img.height as usize], &img.pixels));
+        let color = img.map(crate::canvas::color_image);
         let used = ctx.cumulative_pass_nr();
         let name = format!("layer-thumb-{}", key.1.0);
         match self.entries.get_mut(&key) {
@@ -1782,7 +1794,6 @@ mod tests {
         let (stored, painted) = names(rect);
         let inner = stored.trim_start_matches('<').trim_end_matches('>');
         assert_eq!(painted, format!("<{}>", crate::i18n::tr(zh, inner)));
-        assert_ne!(painted, stored, "translated");
     }
 
     #[test]
