@@ -19,6 +19,10 @@ const SHARED: &str = "/storage/emulated/0";
 /// Entries listed at most: a folder is still untrusted input.
 const MAX_ENTRIES: usize = 5000;
 const ROW_HEIGHT: f32 = 34.0;
+/// Rows on a phone: room for a fingertip.
+const ROW_HEIGHT_COMPACT: f32 = 44.0;
+/// Narrower than this (points), the browser takes the whole screen (a phone).
+const COMPACT_WIDTH: f32 = 700.0;
 
 /// The browser showing now, if any, shared by the app's services and the window.
 #[derive(Clone, Default)]
@@ -213,8 +217,31 @@ impl Browser {
         let mut answer: Option<Vec<String>> = None;
         let mut go_to: Option<PathBuf> = None;
         let screen = ctx.content_rect();
+        // A phone: the browser fills the screen, the shortcuts scroll sideways in one row and the
+        // list takes the height that's left, so the buttons below it stay in sight (also with the
+        // on-screen keyboard up, which shrinks the content rect).
+        let compact = screen.width() < COMPACT_WIDTH;
+        let row_height = if compact { ROW_HEIGHT_COMPACT } else { ROW_HEIGHT };
+        // Everything but the list: title, shortcuts, path, filter, name, buttons, margins.
+        let mut reserved = if compact { 300.0 } else { 330.0 };
+        if !self.access {
+            reserved += 190.0;
+        }
+        if self.mode == Mode::Save {
+            reserved += 50.0;
+        }
+        if self.confirm_replace.is_some() {
+            reserved += 26.0;
+        }
+        let list_height =
+            if compact { (screen.height() - reserved).max(120.0) } else { (screen.height() * 0.5).max(200.0).min(screen.height() - reserved) };
         let modal = egui::Modal::new(egui::Id::new("android-file-browser")).show(ctx, |ui| {
-            ui.set_width((screen.width() * 0.7).clamp(320.0, 900.0));
+            if compact {
+                ui.set_width((screen.width() - 40.0).max(240.0));
+            } else {
+                ui.set_width((screen.width() * 0.7).clamp(320.0, 900.0));
+            }
+            ui.spacing_mut().interact_size.y = row_height;
             ui.heading(self.title);
             ui.add_space(6.0);
             if !self.access {
@@ -234,22 +261,44 @@ impl Browser {
                 });
                 ui.add_space(6.0);
             }
-            ui.horizontal_wrapped(|ui| {
-                for (label, path) in places() {
+            let places = places();
+            let place_buttons = |ui: &mut egui::Ui, go_to: &mut Option<PathBuf>| {
+                for (label, path) in &places {
                     if ui.button(label).clicked() {
-                        go_to = Some(path);
+                        *go_to = Some(path.clone());
                     }
                 }
-            });
+            };
+            if compact {
+                egui::ScrollArea::horizontal().id_salt("browser-places").show(ui, |ui| ui.horizontal(|ui| place_buttons(ui, &mut go_to)));
+            } else {
+                ui.horizontal_wrapped(|ui| place_buttons(ui, &mut go_to));
+            }
             ui.horizontal(|ui| {
                 let up = self.dir.parent().map(Path::to_path_buf);
-                if ui.add_enabled(up.is_some(), egui::Button::new("⬆")).on_hover_text("Up one folder").clicked() {
+                let up_button = egui::Button::new(egui::RichText::new("⬆").size(18.0)).min_size(egui::vec2(row_height, row_height));
+                if ui.add_enabled(up.is_some(), up_button).on_hover_text("Up one folder").clicked() {
                     go_to = up;
                 }
-                ui.label(egui::RichText::new(self.dir.display().to_string()).monospace());
+                // Where we are, each folder a button that goes there.
+                egui::ScrollArea::horizontal().id_salt("browser-path").stick_to_right(true).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let parts = crumbs(&self.dir, &places);
+                        let last = parts.len().saturating_sub(1);
+                        for (i, (label, path)) in parts.into_iter().enumerate() {
+                            if i > 0 {
+                                ui.weak("›");
+                            }
+                            let text = if i == last { egui::RichText::new(label).strong() } else { egui::RichText::new(label) };
+                            if ui.add(egui::Button::new(text).frame(i != last)).clicked() && i != last {
+                                go_to = Some(path);
+                            }
+                        }
+                    });
+                });
             });
             ui.separator();
-            egui::ScrollArea::vertical().max_height((screen.height() * 0.5).max(200.0)).auto_shrink([false, false]).show(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(list_height).auto_shrink([false, false]).show(ui, |ui| {
                 if let Some(e) = &self.error {
                     ui.colored_label(ui.visuals().error_fg_color, e);
                 }
@@ -260,7 +309,9 @@ impl Browser {
                 for e in shown {
                     let icon = if e.dir { "📁" } else { "📄" };
                     let picked = self.selected.contains(&e.path);
-                    let row = ui.add_sized([ui.available_width(), ROW_HEIGHT], egui::Button::selectable(picked, format!("{icon}  {}", e.name)));
+                    // A long name ends in "…" rather than wrapping.
+                    let button = egui::Button::selectable(picked, format!("{icon}  {}", e.name)).wrap_mode(egui::TextWrapMode::Truncate);
+                    let row = ui.add_sized([ui.available_width(), row_height], button);
                     if row.double_clicked() && !e.dir && matches!(self.mode, Mode::File | Mode::Files) {
                         answer = Some(vec![e.path.to_string_lossy().to_string()]);
                     } else if row.clicked() {
@@ -383,6 +434,24 @@ impl Browser {
     }
 }
 
+/// The folders from a shortcut's root down to `dir`, each with where it goes: the root named as
+/// its shortcut is ("Internal storage"), a folder outside every shortcut from "/".
+fn crumbs(dir: &Path, places: &[(String, PathBuf)]) -> Vec<(String, PathBuf)> {
+    let root = places.iter().filter(|(_, p)| dir.starts_with(p)).max_by_key(|(_, p)| p.components().count());
+    let (mut out, base) = match root {
+        Some((label, path)) => (vec![(label.clone(), path.clone())], path.clone()),
+        None => (vec![("/".to_string(), PathBuf::from("/"))], PathBuf::from("/")),
+    };
+    let mut at = base.clone();
+    if let Ok(rest) = dir.strip_prefix(&base) {
+        for part in rest.components() {
+            at.push(part);
+            out.push((part.as_os_str().to_string_lossy().into_owned(), at.clone()));
+        }
+    }
+    out
+}
+
 fn default_dir() -> PathBuf {
     let shared = PathBuf::from(SHARED);
     let docs = shared.join("Documents");
@@ -428,4 +497,26 @@ fn list(dir: &Path) -> Result<Vec<Entry>, String> {
         .collect();
     entries.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::crumbs;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn the_path_is_a_trail_from_its_shortcut() {
+        let places = vec![
+            ("Internal storage".to_string(), PathBuf::from("/storage/emulated/0")),
+            ("Documents".to_string(), PathBuf::from("/storage/emulated/0/Documents")),
+        ];
+        let c = crumbs(Path::new("/storage/emulated/0/Documents/Jobs/2026"), &places);
+        let labels: Vec<&str> = c.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["Documents", "Jobs", "2026"]);
+        assert_eq!(c[1].1, PathBuf::from("/storage/emulated/0/Documents/Jobs"));
+        let c = crumbs(Path::new("/storage/emulated/0/Download"), &places);
+        assert_eq!(c.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(), ["Internal storage", "Download"]);
+        let c = crumbs(Path::new("/mnt/x"), &places);
+        assert_eq!(c.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(), ["/", "mnt", "x"]);
+    }
 }
