@@ -10,6 +10,7 @@
 //!   finger on the canvas scrolls it.
 //! - Crash reports (`crash_log`): the log and stderr go to files, and a run that ended badly
 //!   leaves a report in Download.
+//! - Updates: new builds of the `android-latest` release are offered in the app (`updater`).
 //! - No system clipboard for images, no printing, no control channel.
 //!
 //! Elsewhere the crate is empty, so `cargo build --workspace` on a desktop still works.
@@ -19,6 +20,7 @@ mod crash_log;
 mod file_access;
 mod picker;
 mod tablet;
+mod updater;
 
 use std::path::PathBuf;
 
@@ -95,6 +97,7 @@ fn android_main(android: AndroidApp) {
         }
         log::info!("VectorCraft {} data folder {}", env!("CARGO_PKG_VERSION"), dir.display());
     }
+    file_access::set_app(android.clone());
     log::info!("All files access: {}", if file_access::granted() { "granted" } else { "not granted" });
     vectorcraft_ui_egui::i18n::detect_system_lang_in_background();
     // VectorCraft's own Fonts folder, which text.addFontFiles copies fonts into.

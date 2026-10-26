@@ -45,12 +45,19 @@ cp -r "$HERE/res/." "$OUT/res/"
     --version-code "$VERSION_CODE" --version-name "$VERSION" \
     "$OUT/res.zip"
 
+echo "== activity class"
+# VectorCraftActivity: NativeActivity plus the updater's download and install (java/).
+mkdir -p "$OUT/classes" "$OUT/dex"
+javac --release 11 -classpath "$PLATFORM" -d "$OUT/classes" $(find "$HERE/java" -name '*.java')
+"$BUILD_TOOLS/d8" --release --min-api "$MIN_API" --lib "$PLATFORM" --output "$OUT/dex" $(find "$OUT/classes" -name '*.class')
+cp "$OUT/dex/classes.dex" "$OUT/apk/"
+
 echo "== native library"
 # Only VectorCraft's library: cargo-ndk also copies dependencies' own dylib builds (ocrs, boa_engine),
 # which libvectorcraft_android.so doesn't load.
 mkdir -p "$OUT/apk/lib/arm64-v8a"
 cp "$OUT/jniLibs/arm64-v8a/libvectorcraft_android.so" "$OUT/apk/lib/arm64-v8a/"
-(cd "$OUT/apk" && zip -qr "$OUT/unaligned.apk" lib)
+(cd "$OUT/apk" && zip -qr "$OUT/unaligned.apk" lib classes.dex)
 
 echo "== align and sign"
 "$BUILD_TOOLS/zipalign" -p -f 4 "$OUT/unaligned.apk" "$OUT/aligned.apk"

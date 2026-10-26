@@ -37,6 +37,12 @@ jobs:
         with:
           key: android-arm64
 
+      # javac for the activity class (packaging/android/java).
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 

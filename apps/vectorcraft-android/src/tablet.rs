@@ -26,13 +26,24 @@ pub struct TabletApp {
     focused: bool,
     /// The previous run's crash report, announced once.
     previous: Option<crate::crash_log::Previous>,
+    /// New builds from the GitHub repository the APK came from (`updater`).
+    updater: crate::updater::Updater,
 }
 
 impl TabletApp {
     pub fn new(app: VectorcraftApp, android: AndroidApp, picker: crate::picker::Shared, previous: Option<crate::crash_log::Previous>) -> Self {
         log::info!("{}", crate::crash_log::FOREGROUND);
         crate::crash_log::set_front(true);
-        Self { app, android, picker, touches: TouchRouter::default(), insets: egui::epaint::MarginF32::default(), focused: true, previous }
+        Self {
+            app,
+            android,
+            picker,
+            touches: TouchRouter::default(),
+            insets: egui::epaint::MarginF32::default(),
+            focused: true,
+            previous,
+            updater: crate::updater::Updater::default(),
+        }
     }
 
     /// Say once that the last run ended badly and where its report is.
@@ -120,6 +131,8 @@ impl eframe::App for TabletApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // At start-up, then at most hourly (`updater`).
+        self.updater.maybe_check(ctx.input(|i| i.time));
         file_access::unconfined(|| self.app.logic(ctx));
     }
 
@@ -144,6 +157,7 @@ impl eframe::App for TabletApp {
             if let Err(e) = vectorcraft_engine::guard::catch_panic(|| {
                 self.picker.show(&ctx);
                 self.crash_notice(&ctx);
+                self.updater.show(&ctx, inner);
             }) {
                 self.previous = None;
                 self.app.status(format!("Internal error: {e} (please report this bug)"));

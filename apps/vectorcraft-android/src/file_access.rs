@@ -1,14 +1,26 @@
-//! "All files access" (MANAGE_EXTERNAL_STORAGE), which the in-app file browser needs to browse
+//! "All files access" (MANAGE_EXTERNAL_STORAGE), which the in-app file picker needs to browse
 //! shared storage by path. It is a special app access, not a runtime permission: the app can't
 //! ask for it with a dialog, only open the Settings screen where the user turns it on. Both calls
 //! go through JNI to the activity that started the app.
 
+use std::sync::OnceLock;
+
 use jni::JavaVM;
 use jni::objects::{JObject, JString, JValue};
+use winit::platform::android::activity::AndroidApp;
+
+/// The running app, for its activity (`VectorCraftActivity`). ndk-context only holds the
+/// Application, which has none of the activity's methods (getIntent, the document picker).
+static APP: OnceLock<AndroidApp> = OnceLock::new();
+
+/// Called once at start-up.
+pub fn set_app(app: AndroidApp) {
+    let _ = APP.set(app);
+}
 
 /// Run `f` with the JNI environment and the activity. A Java exception is cleared (never left
 /// pending) and returned as the error, with its message.
-fn with_activity<R>(what: &str, f: impl FnOnce(&mut jni::JNIEnv, &JObject) -> jni::errors::Result<R>) -> Result<R, String> {
+pub(crate) fn with_activity<R>(what: &str, f: impl FnOnce(&mut jni::JNIEnv, &JObject) -> jni::errors::Result<R>) -> Result<R, String> {
     let ctx = ndk_context::android_context();
     if ctx.vm().is_null() || ctx.context().is_null() {
         return Err(format!("{what}: Android's JNI context isn't set"));
@@ -18,11 +30,17 @@ fn with_activity<R>(what: &str, f: impl FnOnce(&mut jni::JNIEnv, &JObject) -> jn
     // before `android_main` runs, and both live as long as the process (checked non-null above).
     let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| format!("{what}: no JavaVM ({e})"))?;
     let mut env = vm.attach_current_thread_permanently().map_err(|e| format!("{what}: can't attach to Java ({e})"))?;
+    // The activity itself (a global reference NativeActivity keeps while it exists); the
+    // Application from ndk-context only when there is none.
+    let activity_ptr = APP.get().map(AndroidApp::activity_as_ptr).filter(|p| !p.is_null()).unwrap_or(ctx.context());
     #[allow(unsafe_code)]
-    // SAFETY: a global reference to the activity, owned by android-activity; wrapping it doesn't
-    // take ownership (JObject never deletes the reference).
-    let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
-    let result = f(&mut env, &activity);
+    // SAFETY: a global reference to the activity (or the Application), owned by Android's
+    // NativeActivity and android-activity; wrapping it doesn't take ownership (JObject never
+    // deletes the reference).
+    let activity = unsafe { JObject::from_raw(activity_ptr.cast()) };
+    // In a local frame: the main thread stays attached for good, so references `f` makes would
+    // otherwise never be freed.
+    let result = env.with_local_frame(64, |env| f(env, &activity));
     let exception = java_exception(&mut env);
     result.map_err(|e| {
         let m = match exception {
@@ -35,7 +53,7 @@ fn with_activity<R>(what: &str, f: impl FnOnce(&mut jni::JNIEnv, &JObject) -> jn
 }
 
 /// Take the pending Java exception, if any, as its `toString()`.
-fn java_exception(env: &mut jni::JNIEnv) -> Option<String> {
+pub(crate) fn java_exception(env: &mut jni::JNIEnv) -> Option<String> {
     if !env.exception_check().unwrap_or(false) {
         return None;
     }
@@ -47,7 +65,7 @@ fn java_exception(env: &mut jni::JNIEnv) -> Option<String> {
     env.get_string(&JString::from(text)).ok().map(Into::into)
 }
 
-/// Whether the user has given PdfCraft All files access.
+/// Whether the user has given VectorCraft All files access.
 pub fn granted() -> bool {
     match with_activity("All files access", |env, _| env.call_static_method("android/os/Environment", "isExternalStorageManager", "()Z", &[])?.z()) {
         Ok(granted) => granted,
@@ -55,14 +73,14 @@ pub fn granted() -> bool {
     }
 }
 
-/// `Intent.FLAG_ACTIVITY_NEW_TASK`: Settings opens as its own task, on top of PdfCraft.
+/// `Intent.FLAG_ACTIVITY_NEW_TASK`: Settings opens as its own task, on top of VectorCraft.
 const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
 
-/// Open Settings on PdfCraft's All files access switch, or else on the list of apps with that
+/// Open Settings on VectorCraft's All files access switch, or else on the list of apps with that
 /// access. The error says why neither opened.
 pub fn request() -> Result<(), String> {
     log::info!("opening All files access settings");
-    let per_app = with_activity("opening PdfCraft's All files access switch", |env, activity| {
+    let per_app = with_activity("opening VectorCraft's All files access switch", |env, activity| {
         let package = env.call_method(activity, "getPackageName", "()Ljava/lang/String;", &[])?.l()?;
         let package: String = env.get_string(&JString::from(package))?.into();
         let uri_text = env.new_string(format!("package:{package}"))?;

@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- VectorCraft for Android: a NativeActivity (no Java) that loads libvectorcraft_android.so
-     (apps/vectorcraft-android). Built by build-apk.sh. -->
+<!-- VectorCraft for Android: a NativeActivity that loads libvectorcraft_android.so
+     (apps/vectorcraft-android); its subclass VectorCraftActivity (java/) adds the updater's
+     download and install. Built by build-apk.sh. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="ai.storyteller.vectorcraft">
 
@@ -10,12 +11,17 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
 
+    <!-- Updates (updater.rs): the release listing and APK from GitHub, then installing it, which
+         Android confirms with the user each time. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
 
     <application
         android:label="VectorCraft"
         android:icon="@mipmap/ic_launcher"
-        android:hasCode="false"
+        android:hasCode="true"
         android:extractNativeLibs="true"
         android:resizeableActivity="true"
         android:appCategory="image">
@@ -23,7 +29,7 @@
         <!-- configChanges: attaching the keyboard cover, rotating, or resizing in split screen
              must not recreate the activity (that would restart the app and its event loop). -->
         <activity
-            android:name="android.app.NativeActivity"
+            android:name="ai.storyteller.vectorcraft.VectorCraftActivity"
             android:exported="true"
             android:launchMode="singleTask"
             android:theme="@android:style/Theme.Material.NoActionBar"
