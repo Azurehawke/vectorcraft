@@ -1,0 +1,69 @@
+== libvectorcraft_android.so
+warning: Environment variable `ANDROID_NDK_HOME = "/usr/local/lib/android/sdk/ndk/30.0.16248370"` doesn't match `ANDROID_NDK_ROOT = "/usr/local/lib/android/sdk/ndk/27.3.13750724"`
+    Building arm64-v8a (aarch64-linux-android)
+[1m[92m    Updating[0m crates.io index
+[1m[92m     Locking[0m 19 packages to highest Rust 1.95 compatible versions
+[1m[92m      Adding[0m aho-corasick v1.1.5
+[1m[92m      Adding[0m android-activity v0.6.1 (/home/runner/work/vectorcraft/vectorcraft/vendor/android-activity)
+[1m[92m      Adding[0m android_log-sys v0.3.2
+[1m[92m      Adding[0m android_logger v0.15.1
+[1m[92m      Adding[0m cesu8 v1.1.0
+[1m[92m      Adding[0m env_filter v0.1.4
+[1m[92m      Adding[0m jni v0.21.1 [1m[33m(available: v0.22.4)[0m
+[1m[92m      Adding[0m regex v1.13.1
+[1m[92m      Adding[0m regex-automata v0.4.18
+[1m[92m      Adding[0m windows-sys v0.45.0
+[1m[92m      Adding[0m windows-targets v0.42.2
+[1m[92m      Adding[0m windows_aarch64_gnullvm v0.42.2
+[1m[92m      Adding[0m windows_aarch64_msvc v0.42.2
+[1m[92m      Adding[0m windows_i686_gnu v0.42.2
+[1m[92m      Adding[0m windows_i686_msvc v0.42.2
+[1m[92m      Adding[0m windows_x86_64_gnu v0.42.2
+[1m[92m      Adding[0m windows_x86_64_gnullvm v0.42.2
+[1m[92m      Adding[0m windows_x86_64_msvc v0.42.2
+[1m[92m      Adding[0m winit v0.30.13 (/home/runner/work/vectorcraft/vectorcraft/vendor/winit)
+[1m[92m   Compiling[0m vectorcraft-geom v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/geom)
+[1m[92m   Compiling[0m vectorcraft-color v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/color)
+[1m[92m   Compiling[0m jni-sys v0.3.1
+[1m[92m   Compiling[0m vectorcraft-text v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/text)
+[1m[92m   Compiling[0m ndk-sys v0.6.0+11769913
+[1m[92m   Compiling[0m android-activity v0.6.1 (/home/runner/work/vectorcraft/vectorcraft/vendor/android-activity)
+[1m[92m   Compiling[0m winit v0.30.13 (/home/runner/work/vectorcraft/vectorcraft/vendor/winit)
+[1m[92m   Compiling[0m vectorcraft-ui-egui v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/ui-egui)
+[1m[92m   Compiling[0m vectorcraft-pathops v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/pathops)
+[1m[92m   Compiling[0m wgpu-hal v30.0.1
+[1m[92m   Compiling[0m vectorcraft-doc v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/doc)
+[1m[92m   Compiling[0m vectorcraft-plugins v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/plugins)
+[1m[92m   Compiling[0m vectorcraft-three-d v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/three-d)
+[1m[92m   Compiling[0m vectorcraft-effects v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/effects)
+[1m[92m   Compiling[0m vectorcraft-brush v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/brush)
+[1m[92m   Compiling[0m ndk v0.9.0
+[1m[92m   Compiling[0m wgpu-core-deps-windows-linux-android v30.0.1
+[1m[92m   Compiling[0m wgpu-core v30.0.1
+[1m[92m   Compiling[0m vectorcraft-render v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/render)
+[1m[92m   Compiling[0m vectorcraft-metafile v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/metafile)
+[1m[92m   Compiling[0m vectorcraft-pdf v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/pdf)
+[1m[92m   Compiling[0m vectorcraft-eps v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/eps)
+[1m[92m   Compiling[0m wgpu v30.0.1
+[1m[92m   Compiling[0m vectorcraft-svg v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/svg)
+[1m[92m   Compiling[0m vectorcraft-cad v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/cad)
+[1m[92m   Compiling[0m vectorcraft-tools v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/tools)
+[1m[92m   Compiling[0m vectorcraft-format v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/format)
+[1m[92m   Compiling[0m vectorcraft-trace v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/trace)
+[1m[92m   Compiling[0m vectorcraft-affinity v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/affinity)
+[1m[92m   Compiling[0m vectorcraft-scriptcheck v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/scriptcheck)
+[1m[92m   Compiling[0m vectorcraft-engine v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/crates/engine)
+[1m[92m   Compiling[0m egui-wgpu v0.36.2
+[1m[92m   Compiling[0m egui-winit v0.36.2
+[1m[92m   Compiling[0m jni v0.21.1
+[1m[92m   Compiling[0m eframe v0.36.2
+[1m[92m   Compiling[0m vectorcraft-android v0.16.0 (/home/runner/work/vectorcraft/vectorcraft/apps/vectorcraft-android)
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 6m 58s
+     Copying libraries to /home/runner/work/vectorcraft/vectorcraft/target/android-apk/jniLibs
+== resources and manifest
+== activity class
+Note: /home/runner/work/vectorcraft/vectorcraft/packaging/android/java/ai/storyteller/vectorcraft/VectorCraftActivity.java uses or overrides a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+== native library
+== align and sign
+-rw-r--r-- 1 runner runner 45175674 Oct 26 03:52 /home/runner/work/vectorcraft/vectorcraft/target/android-apk/vectorcraft.apk
