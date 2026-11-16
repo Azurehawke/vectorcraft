@@ -27,4 +27,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Check the whole workspace
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --keep-going --message-format=short
