@@ -149,6 +149,15 @@ impl Document {
         }
     }
 
+    /// Does the document hold a raster ink layer anywhere?
+    pub fn has_ink(&self) -> bool {
+        let mut any = false;
+        for root in roots(self) {
+            walk_all(root, &mut |n| any |= matches!(n.kind, NodeKind::Ink { .. }));
+        }
+        any
+    }
+
     /// Does the document hold a placed document anywhere?
     pub fn has_placed(&self) -> bool {
         let mut any = false;

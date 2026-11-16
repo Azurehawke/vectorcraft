@@ -45,8 +45,10 @@ use vectorcraft_doc::{Document, ImageBlob};
 #[cfg(not(target_arch = "wasm32"))]
 pub use atomic::{write_atomic, write_atomic_with, write_new_with};
 
-/// v4: large data after the JSON (v1 to v3 files still load).
-pub const VERSION: u32 = 4;
+/// v5: raster ink layers. v4: large data after the JSON (v1 to v3 files still load).
+pub const VERSION: u32 = 5;
+/// The first version that can hold raster ink layers ([`vectorcraft_doc::NodeKind::Ink`]).
+pub const INK_SINCE: u32 = 5;
 /// Data this large or larger goes after the JSON (v4), not into it as base64.
 pub const INLINE_MAX: usize = 8 << 10;
 /// What separates the JSON from the data after it (v4).
@@ -83,6 +85,8 @@ pub enum FormatError {
     BadImage(String),
     #[error("can't save version {0}: VectorCraft writes versions {MIN_VERSION} to {VERSION}")]
     BadVersion(u32),
+    #[error("version {0} files can't hold raster ink layers: save as version {INK_SINCE} or later")]
+    InkTooOld(u32),
     #[error("version {0} files can't be compressed: only version {COMPRESSED_SINCE} and later open compressed files")]
     CompressedTooOld(u32),
     #[error("the compressed file unpacks to more than {} MB", MAX_UNPACKED >> 20)]
@@ -237,6 +241,10 @@ pub fn save_with(doc: &Document, o: &SaveOptions) -> Result<Vec<u8>, FormatError
     o.check()?;
     let pretty = o.pretty && !o.compress;
     let mut d = doc.without_edit_modes().into_owned();
+    // Older apps have no ink layers to show, so refuse rather than silently drop the ink.
+    if o.version < INK_SINCE && d.has_ink() {
+        return Err(FormatError::InkTooOld(o.version));
+    }
     // Older apps don't know placed documents: they get the art the objects show, with its
     // resources. Otherwise resources only exporting adds are never saved.
     if o.version < VERSION && d.has_placed() {

@@ -7,6 +7,7 @@ mod anchor;
 mod curvature;
 mod family;
 mod gesture;
+mod ink;
 
 use serde_json::{Value, json};
 use vectorcraft_doc::{NodeId, NodeKind};
@@ -18,6 +19,7 @@ pub use anchor::AnchorTool;
 pub use curvature::{CurvatureTool, EndCurve, curvature_close, curvature_extend, curvature_insert, curvature_move};
 pub use family::FamilyTool;
 pub use gesture::GestureTool;
+pub use ink::InkTool;
 
 /// Colour of tool feedback (Illustrator's selection blue).
 pub const FEEDBACK: [u8; 3] = [0x4f, 0x9d, 0xff];
@@ -26,6 +28,7 @@ pub const FEEDBACK: [u8; 3] = [0x4f, 0x9d, 0xff];
 pub fn create(id: &str) -> Option<Box<dyn Tool>> {
     Some(match id {
         "pencil" | "paintbrush" | "blobBrush" | "eraser" | "knife" | "smooth" | "pathEraser" | "join" => Box::new(GestureTool::new(id)),
+        "inkPencil" => Box::new(InkTool::default()),
         "curvature" => Box::new(CurvatureTool::default()),
         "addAnchor" | "deleteAnchor" | "anchorPoint" | "scissors" => Box::new(AnchorTool::new(id)),
         "arc" | "spiral" | "rectangularGrid" | "polarGrid" => Box::new(FamilyTool::new(id)),

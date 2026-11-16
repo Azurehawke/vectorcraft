@@ -8,6 +8,7 @@
 
 mod brush_fx;
 pub mod encode;
+pub mod ink_tiles;
 mod freeform;
 mod fx;
 mod group;
@@ -1023,6 +1024,14 @@ impl Renderer {
             }
             NodeKind::Layer { children, clip: false, .. } | NodeKind::Group { children, clip: false } => {
                 self.draw_children(ctx, f, children, knockout)
+            }
+            // Ink strokes are in document units, so only the view transform applies. Drawn directly for
+            // now; the tile cache in `ink_tiles` replaces this once the layer is composited.
+            NodeKind::Ink { data } => {
+                ctx.set_transform(f.view);
+                for stroke in &data.strokes {
+                    ink_tiles::draw_stroke(ctx, stroke);
+                }
             }
             NodeKind::Group { children, clip: true } | NodeKind::Layer { children, clip: true, .. } if f.opts.outline => {
                 for c in children {

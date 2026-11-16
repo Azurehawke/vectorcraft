@@ -261,6 +261,8 @@ impl<'a> Scene<'a> {
         }
         self.note_losses(n);
         match &n.kind {
+            // Ink is not written to EPS yet (a known gap; see docs/raster-ink-layer.md).
+            NodeKind::Ink { .. } => {}
             NodeKind::Layer { children, clip: false, .. } | NodeKind::Group { children, clip: false } => {
                 children.iter().for_each(|c| self.node(c, false));
             }

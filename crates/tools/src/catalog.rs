@@ -60,6 +60,7 @@ pub const TOOL_GROUPS: &[&[ToolInfo]] = &[
     &[
         t("shaper", "Shaper Tool", Some("Shift+N"), "tool-shaper"),
         t("pencil", "Pencil Tool", Some("N"), "tool-pencil"),
+        t("inkPencil", "Ink Pencil Tool", None, "tool-pencil"),
         t("smooth", "Smooth Tool", None, "tool-smooth"),
         t("pathEraser", "Path Eraser Tool", None, "tool-path-eraser"),
         t("join", "Join Tool", None, "tool-join"),

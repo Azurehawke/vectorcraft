@@ -13,6 +13,7 @@ pub mod cmyk;
 pub mod corners;
 pub mod graph;
 pub mod hit;
+pub mod ink;
 pub mod inks;
 mod inline;
 pub use inline::{SYMBOL_HALF, SYMBOL_SIZES};

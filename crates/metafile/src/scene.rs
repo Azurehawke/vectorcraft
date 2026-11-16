@@ -158,6 +158,8 @@ impl<'a> Scene<'a> {
         let opacity = self.opacity;
         self.opacity *= n.opacity.clamp(0.0, 1.0);
         match &n.kind {
+            // Ink is not written to metafiles yet (a known gap; see docs/raster-ink-layer.md).
+            NodeKind::Ink { .. } => {}
             NodeKind::Layer { children, clip, .. } | NodeKind::Group { children, clip } => self.children(children, *clip),
             NodeKind::Path { path, rule, guide, .. } => {
                 if !*guide {

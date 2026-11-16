@@ -32,6 +32,7 @@ pub(crate) mod graph;
 mod halftone;
 pub mod help;
 pub(crate) mod inline;
+mod ink;
 mod layer;
 mod layerpanel;
 pub mod library;
@@ -213,6 +214,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(layer::specs());
         v.extend(layerpanel::specs());
         v.extend(draw2::specs());
+        v.extend(ink::specs());
         v.extend(xform::specs());
         v.extend(effectcmd::specs());
         v.extend(pathops::specs());
