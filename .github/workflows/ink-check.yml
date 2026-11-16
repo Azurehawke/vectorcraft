@@ -1,4 +1,4 @@
-# Compile check for the raster ink layer branch: the whole workspace, all targets. Runs on pushes to
+# Compile, clippy and ink-crate tests for the raster ink layer branch: the whole workspace, all targets. Runs on pushes to
 # `raster-ink-layer` and on demand. Not a release job; it builds nothing for users.
 name: Ink check
 
@@ -28,3 +28,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check the whole workspace
         run: cargo check --workspace --all-targets --keep-going --message-format=short
+      - name: Clippy with the no-panic lints (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests for the ink layer crates
+        run: cargo test -p vectorcraft-doc -p vectorcraft-render
