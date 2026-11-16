@@ -4,8 +4,10 @@ Status: milestones 1, 2 and 3a landed on branch `raster-ink-layer`: the stroke s
 `crates/doc/src/ink.rs` (milestone 1), the in-memory tile cache in `crates/render/src/ink_tiles.rs`
 (milestone 2), and `NodeKind::Ink` carried through the document, bounds and transforms (milestone 3a).
 Milestone 3b adds the `ink.stroke` and `ink.erase` commands (`crates/engine/src/cmd/ink.rs`), each
-committed stroke or erase one undo step. The Pencil overlay and the file version bump are not in yet, so
-the layer is not yet drawn by the app's tile cache or saved in the file. Not a parity area; it is a proposal for hand-writing
+committed stroke or erase one undo step; the Ink Pencil tool (`inkPencil`, `crates/tools/src/draw2/ink.rs`)
+writes strokes through `ink.stroke`; and files with ink layers save at version 5, while older versions refuse
+them (`InkTooOld`). Still open: drawing the layer through the tile cache (it is drawn directly for now), and
+milestone 4's measurements. Not a parity area; it is a proposal for hand-writing
 performance on pen hardware.
 
 ## Problem
@@ -70,10 +72,13 @@ live effects.
 2. Tile cache in `crates/render`, with a headless test that a stroke is drawn and a deleted stroke is gone.
    **Done** (`ink_tiles.rs`: 512-unit tiles drawn with `vello_cpu`, invalidation by area, tests for drawn,
    deleted and untouched tiles, and a single-point dot).
-3. Add the ink layer to the document and the file: a new node kind (about 210 match sites to update),
-   format version bump and migration, and fuzz tests on the new reader. Then `ink.*` commands with undo, and
-   the Pencil overlay in `crates/ui-egui`.
-4. Perf budgets, parity table and gap entry updates (`docs/target-app-parity.md`, `docs/gaps.md`).
+3. Add the ink layer to the document and the file: a new node kind, format version 5 (older versions refuse
+   ink rather than migrating it), `ink.*` commands with undo, and the Ink Pencil tool. **Done** for the node,
+   the commands and the tool. **Open:** tile-cache compositing in the render path, and fuzz tests on the new
+   reader (`engine/tests/import_fuzz.rs`, `format/tests/prop_format.rs`), which do not yet generate ink.
+4. Perf budgets, parity table and gap entry updates (`docs/target-app-parity.md`, `docs/gaps.md`). **Open:**
+   no measurements yet. They need `vectorcraft-cli perf` and the handwriting test on an idle machine, which
+   this build environment cannot provide.
 
 ## Open questions
 

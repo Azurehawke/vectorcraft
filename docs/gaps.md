@@ -210,3 +210,17 @@ from G14 and the budget run of G15: **~170–270 h** one agent, ~50–80 h wall 
 | 2026-10-10 | minor | G9 evidence counted from the tracker (28 `.ai`/EPS issues, 20 fixed); impact narrowed to handing files back |
 | 2026-10-10 | minor | Alpha blockers checked against the core-workflow gate: none |
 | 2026-10-10 | major | Moved from the ROADMAP's "Where we're lacking"; kept ids G1–G8, added G9–G19 (file formats, stability, bugs, preferences, 30.x additions, pen hardware, performance, localization, ecosystem, AI, accessibility) and re-ranked |
+
+## G20 Raster ink layer (branch `raster-ink-layer`, not yet in `main`)
+
+Handwriting as a raster ink layer, so pen strokes stop slowing the hardware. Design and milestones in
+[raster-ink-layer.md](raster-ink-layer.md). Open items, not yet ranked:
+
+- Ink is drawn directly each frame, not through the tile cache in the render path.
+- No measured performance budget or handwriting test yet (`vectorcraft-cli perf` not run on an idle machine).
+- Ink is not written to PDF, SVG, EPS, metafile or CAD export.
+- Envelope and warp leave ink unchanged.
+- Pen pressure reaches the Ink Pencil only where the platform reports it.
+- Each ink command re-checks the whole layer, so a layer's cost grows with its stroke count.
+- The format reader has no fuzz coverage of ink data yet.
+- Older app versions refuse documents with ink layers (version 5 and later hold them).
