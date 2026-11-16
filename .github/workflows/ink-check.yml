@@ -31,4 +31,4 @@ jobs:
       - name: Clippy with the no-panic lints (warnings are errors)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests for the ink layer crates
-        run: cargo test -p vectorcraft-doc -p vectorcraft-render -p vectorcraft-tools -p vectorcraft-engine ink
+        run: cargo test -p vectorcraft-doc -p vectorcraft-render -p vectorcraft-tools -p vectorcraft-format -p vectorcraft-engine ink
