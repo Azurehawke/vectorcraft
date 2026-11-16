@@ -1253,6 +1253,8 @@ impl Writer<'_> {
         }
         match &n.kind {
             NodeKind::Layer { template: true, .. } => {}
+            // Ink is not written to SVG yet (a known gap; see docs/raster-ink-layer.md).
+            NodeKind::Ink { .. } => {}
             NodeKind::Layer { children, clip: false, .. } | NodeKind::Group { children, clip: false } => {
                 let id = self.id_attr(n);
                 let a = self.attrs(&self.group_props(n));

@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use vectorcraft_doc::ink::InkStore;
+use vectorcraft_doc::ink::{InkStore, InkStroke};
 use vello_cpu::kurbo::{Affine, BezPath, Cap, Join, Stroke};
 use vello_cpu::peniko::{self};
 use vello_cpu::{Pixmap, RasterizerSettings, RenderContext, RenderSettings, Resources};
@@ -90,32 +90,38 @@ impl InkTiles {
         let origin = key.bounds();
         ctx.set_transform(Affine::scale(self.scale) * Affine::translate((-origin[0], -origin[1])));
         for id in store.query(origin) {
-            let Some(stroke) = store.get(id) else { continue };
-            let Some((first, rest)) = stroke.points.split_first() else { continue };
-            let mut path = BezPath::new();
-            path.move_to((first.x, first.y));
-            for p in rest {
-                path.line_to((p.x, p.y));
+            if let Some(stroke) = store.get(id) {
+                draw_stroke(&mut ctx, stroke);
             }
-            // A single point still gets a dot: a zero-length segment draws nothing, so it gets
-            // a half-unit one, which round caps turn into a dot.
-            if rest.is_empty() {
-                path.line_to((first.x + 0.5, first.y));
-            }
-            let [r, g, b, a] = stroke.color;
-            ctx.set_paint(peniko::Color::from_rgba8(r, g, b, a));
-            let mut style = Stroke::new(stroke.width);
-            style.start_cap = Cap::Round;
-            style.end_cap = Cap::Round;
-            style.join = Join::Round;
-            ctx.set_stroke(style);
-            ctx.stroke_path(&path);
         }
         ctx.flush();
         let mut pixmap = Pixmap::new(px, px);
         ctx.render_with(&mut pixmap, &mut self.resources, RasterizerSettings::default());
         pixmap
     }
+}
+
+/// Strokes one ink stroke with the context's current transform, in document units. A single point
+/// gets a dot: a zero-length segment draws nothing, so it gets a half-unit one that round caps turn
+/// into a dot.
+pub fn draw_stroke(ctx: &mut RenderContext, stroke: &InkStroke) {
+    let Some((first, rest)) = stroke.points.split_first() else { return };
+    let mut path = BezPath::new();
+    path.move_to((first.x, first.y));
+    for p in rest {
+        path.line_to((p.x, p.y));
+    }
+    if rest.is_empty() {
+        path.line_to((first.x + 0.5, first.y));
+    }
+    let [r, g, b, a] = stroke.color;
+    ctx.set_paint(peniko::Color::from_rgba8(r, g, b, a));
+    let mut style = Stroke::new(stroke.width);
+    style.start_cap = Cap::Round;
+    style.end_cap = Cap::Round;
+    style.join = Join::Round;
+    ctx.set_stroke(style);
+    ctx.stroke_path(&path);
 }
 
 fn overlaps(a: [f64; 4], b: [f64; 4]) -> bool {

@@ -281,6 +281,8 @@ impl<'a> Scene<'a> {
         let opacity = self.opacity;
         self.opacity *= n.opacity.clamp(0.0, 1.0);
         match &n.kind {
+            // Ink is freehand art, not CAD geometry: it is not part of the CAD scene.
+            NodeKind::Ink { .. } => {}
             NodeKind::Layer { children, printable, clip, .. } => {
                 let outer = (self.layer.clone(), self.flags);
                 self.flags =

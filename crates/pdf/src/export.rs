@@ -956,6 +956,8 @@ impl Exporter<'_> {
             pushes += 1;
         }
         match &n.kind {
+            // Ink is not written to PDF yet (a known gap; see docs/raster-ink-layer.md).
+            NodeKind::Ink { .. } => {}
             NodeKind::Layer { children, clip: false, .. } | NodeKind::Group { children, clip: false } => self.children(s, children, page),
             NodeKind::Group { children, clip: true } | NodeKind::Layer { children, clip: true, .. } => {
                 // The region every output clips to; nothing to clip by hides the clipped art. The
