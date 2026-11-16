@@ -1,8 +1,8 @@
 # Raster ink layer (design)
 
-Status: milestone 1 landed on branch `raster-ink-layer`: the stroke store and grid index in
-`crates/doc/src/ink.rs`, with validated loading and property tests. The layer is not in the document or the
-file yet, so the format migration waits for milestone 2. Not a parity area; it is a proposal for hand-writing
+Status: milestones 1 and 2 landed on branch `raster-ink-layer`: the stroke store and grid index in
+`crates/doc/src/ink.rs` (milestone 1), and the in-memory tile cache in `crates/render/src/ink_tiles.rs`
+(milestone 2). The layer is not yet in the document or the file, so it is not yet visible in the app. Not a parity area; it is a proposal for hand-writing
 performance on pen hardware.
 
 ## Problem
@@ -65,7 +65,11 @@ live effects.
 1. Stroke store and incremental index in `crates/doc`, with fuzz tests. **Done** (`ink.rs`: stable ids, a grid
    index updated per stroke, limits, versioned data, property tests). The format migration moves to milestone 2.
 2. Tile cache in `crates/render`, with a headless test that a stroke is drawn and a deleted stroke is gone.
-3. `ink.*` commands with undo, and the Pencil overlay in `crates/ui-egui`.
+   **Done** (`ink_tiles.rs`: 512-unit tiles drawn with `vello_cpu`, invalidation by area, tests for drawn,
+   deleted and untouched tiles, and a single-point dot).
+3. Add the ink layer to the document and the file: a new node kind (about 210 match sites to update),
+   format version bump and migration, and fuzz tests on the new reader. Then `ink.*` commands with undo, and
+   the Pencil overlay in `crates/ui-egui`.
 4. Perf budgets, parity table and gap entry updates (`docs/target-app-parity.md`, `docs/gaps.md`).
 
 ## Open questions

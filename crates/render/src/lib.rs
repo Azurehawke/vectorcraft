@@ -8,6 +8,7 @@
 
 mod brush_fx;
 pub mod encode;
+pub mod ink_tiles;
 mod freeform;
 mod fx;
 mod group;
