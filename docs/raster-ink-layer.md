@@ -1,8 +1,11 @@
 # Raster ink layer (design)
 
-Status: milestones 1 and 2 landed on branch `raster-ink-layer`: the stroke store and grid index in
-`crates/doc/src/ink.rs` (milestone 1), and the in-memory tile cache in `crates/render/src/ink_tiles.rs`
-(milestone 2). The layer is not yet in the document or the file, so it is not yet visible in the app. Not a parity area; it is a proposal for hand-writing
+Status: milestones 1, 2 and 3a landed on branch `raster-ink-layer`: the stroke store and grid index in
+`crates/doc/src/ink.rs` (milestone 1), the in-memory tile cache in `crates/render/src/ink_tiles.rs`
+(milestone 2), and `NodeKind::Ink` carried through the document, bounds and transforms (milestone 3a).
+Milestone 3b adds the `ink.stroke` and `ink.erase` commands (`crates/engine/src/cmd/ink.rs`), each
+committed stroke or erase one undo step. The Pencil overlay and the file version bump are not in yet, so
+the layer is not yet drawn by the app's tile cache or saved in the file. Not a parity area; it is a proposal for hand-writing
 performance on pen hardware.
 
 ## Problem
