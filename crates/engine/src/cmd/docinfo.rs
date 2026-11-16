@@ -240,6 +240,7 @@ fn info(s: &mut Session, p: &Value) -> Result<Value> {
         r.walk(&mut |n| {
             let k = match &n.kind {
                 NodeKind::Layer { .. } => None,
+                NodeKind::Ink { .. } => Some("inkLayers"),
                 NodeKind::Group { clip: true, .. } => Some("clipGroups"),
                 NodeKind::Group { .. } => Some("groups"),
                 NodeKind::Path { guide: true, .. } => Some("guides"),
