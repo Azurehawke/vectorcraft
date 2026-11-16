@@ -1,0 +1,30 @@
+# Compile check for the raster ink layer branch: the whole workspace, all targets. Runs on pushes to
+# `raster-ink-layer` and on demand. Not a release job; it builds nothing for users.
+name: Ink check
+
+on:
+  push:
+    branches: [raster-ink-layer]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the whole workspace
+        run: cargo check --workspace --all-targets

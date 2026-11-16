@@ -1421,6 +1421,8 @@ fn map_node(n: &Node, w: &Warper) -> Node {
         m.art = Arc::new(map_node(&m.art, w));
     }
     match &mut out.kind {
+        // Ink keeps its strokes: envelope and warp effects do not reshape ink yet (a known limit).
+        NodeKind::Ink { .. } => {}
         NodeKind::Path { path, live, .. } => {
             *path = map_nonlinear(path, w.piece, w.f);
             *live = None;

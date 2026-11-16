@@ -417,6 +417,11 @@ pub enum NodeKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dim_images: Option<u8>,
     },
+    /// A raster ink layer: its strokes (see [`crate::ink`]). Drawn into tiles from these strokes and
+    /// edited one stroke at a time; the tiles are never stored.
+    Ink {
+        data: Arc<crate::ink::InkData>,
+    },
     /// A group. With `clip`, the first (bottom-most) child is the clipping path.
     Group {
         children: Vec<Arc<Node>>,
@@ -697,6 +702,7 @@ impl Node {
     pub fn kind_label(&self) -> &'static str {
         match &self.kind {
             NodeKind::Layer { .. } => "Layer",
+            NodeKind::Ink { .. } => "Ink Layer",
             NodeKind::Group { clip: true, .. } => "Clip Group",
             NodeKind::Group { .. } => "Group",
             NodeKind::Path { live: Some(l), .. } => l.label(),
@@ -767,6 +773,7 @@ impl Node {
     pub fn geometric_bounds(&self) -> Option<Rect> {
         match &self.kind {
             NodeKind::Path { path, .. } => path.bounds(),
+            NodeKind::Ink { data } => crate::ink::data_bounds(data),
             NodeKind::Group { children, clip: true } | NodeKind::Layer { children, clip: true, .. } => {
                 children.first().and_then(|c| c.geometric_bounds())
             }
@@ -859,6 +866,7 @@ impl Node {
             crate::pattern::transform_pattern_paints(self, a);
         }
         match &mut self.kind {
+            NodeKind::Ink { data } => crate::ink::transform_data(Arc::make_mut(data), a),
             NodeKind::Path { path, live, .. } => {
                 path.transform(a);
                 if let Some(l) = live {
@@ -1020,7 +1028,8 @@ impl Node {
 
     fn push_clip_shapes(&self, text: Outliner, out: &mut Vec<(BezPath, FillRule)>) {
         match &self.kind {
-            NodeKind::Path { guide: true, .. } | NodeKind::SymbolInstance { .. } => {}
+            // Ink is painted art, not outline: it cannot clip, and it is not a clip shape.
+            NodeKind::Ink { .. } | NodeKind::Path { guide: true, .. } | NodeKind::SymbolInstance { .. } => {}
             NodeKind::Path { path, rule, .. } => out.push((path.to_bezpath(), *rule)),
             NodeKind::Compound { children, rule } => {
                 let mut bp = BezPath::new();

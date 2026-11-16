@@ -116,6 +116,31 @@ fn stroke_bounds(stroke: &InkStroke) -> [f64; 4] {
     [b[0] - half, b[1] - half, b[2] + half, b[3] + half]
 }
 
+/// Bounds of every stroke in stored data, in document units. `None` if there are no strokes.
+pub fn data_bounds(data: &InkData) -> Option<vectorcraft_geom::Rect> {
+    data.strokes
+        .iter()
+        .map(|s| {
+            let b = stroke_bounds(s);
+            vectorcraft_geom::Rect::new(b[0], b[1], b[2], b[3])
+        })
+        .reduce(|a, b| a.union(b))
+}
+
+/// Applies an affine transform to every point, and scales each width by the transform's uniform scale
+/// (the square root of its determinant), so a stroke keeps its look under scaling.
+pub fn transform_data(data: &mut InkData, a: vectorcraft_geom::Affine) {
+    let scale = a.determinant().abs().sqrt();
+    for stroke in &mut data.strokes {
+        stroke.width = (stroke.width * scale).clamp(0.0, MAX_WIDTH);
+        for p in &mut stroke.points {
+            let q = a * vectorcraft_geom::Point::new(p.x, p.y);
+            p.x = q.x;
+            p.y = q.y;
+        }
+    }
+}
+
 fn overlaps(a: [f64; 4], b: [f64; 4]) -> bool {
     a[0] <= b[2] && b[0] <= a[2] && a[1] <= b[3] && b[1] <= a[3]
 }
@@ -432,5 +457,20 @@ mod tests {
                 let _ = InkStore::from_data(data);
             }
         }
+    }
+
+    #[test]
+    fn bounds_and_transforms_follow_the_strokes() {
+        let mut data = InkData {
+            version: INK_DATA_VERSION,
+            strokes: vec![stroke(&[(0.0, 0.0), (10.0, 0.0)], 2.0)],
+        };
+        let b = data_bounds(&data).unwrap();
+        assert_eq!((b.x0, b.y0, b.x1, b.y1), (-1.0, -1.0, 11.0, 1.0));
+        transform_data(&mut data, vectorcraft_geom::Affine::scale(2.0) * vectorcraft_geom::Affine::translate((5.0, 0.0)));
+        let moved = &data.strokes[0];
+        assert_eq!((moved.points[1].x, moved.points[1].y), (30.0, 0.0));
+        assert!((moved.width - 4.0).abs() < 1e-9);
+        assert_eq!(data_bounds(&InkData { version: INK_DATA_VERSION, strokes: vec![] }), None);
     }
 }
